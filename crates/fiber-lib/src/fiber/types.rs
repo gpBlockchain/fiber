@@ -48,6 +48,7 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::str::FromStr;
 use strum::{AsRefStr, EnumString};
+use subtle::ConstantTimeEq;
 use tentacle::multiaddr::MultiAddr;
 use tentacle::secio::PeerId;
 use thiserror::Error;
@@ -159,6 +160,15 @@ pub struct Hash256(#[serde_as(as = "SliceHex")] [u8; 32]);
 impl From<[u8; 32]> for Hash256 {
     fn from(value: [u8; 32]) -> Self {
         Self(value)
+    }
+}
+
+impl Hash256 {
+    /// Constant-time comparison for security-sensitive contexts (e.g., preimage verification).
+    /// Use this instead of `==` when comparing against attacker-controlled values
+    /// to prevent timing side-channel attacks.
+    pub fn ct_eq(&self, other: &Hash256) -> bool {
+        bool::from(self.0.ct_eq(&other.0))
     }
 }
 

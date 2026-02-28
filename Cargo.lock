@@ -2375,6 +2375,7 @@ dependencies = [
  "serde_with",
  "serde_yaml",
  "strum",
+ "subtle",
  "tempfile",
  "tentacle",
  "thiserror 1.0.69",
@@ -2390,6 +2391,7 @@ dependencies = [
  "wasm-bindgen-test",
  "web-sys",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]

@@ -334,10 +334,10 @@ impl SendPaymentDataBuilder {
             return Err("amount must be greater than 0".to_string());
         }
 
-        if amount
-            .checked_add(self.max_fee_amount.expect("must got max_fee_amount"))
-            .is_none()
-        {
+        let max_fee = self
+            .max_fee_amount
+            .ok_or_else(|| "max_fee_amount is required".to_string())?;
+        if amount.checked_add(max_fee).is_none() {
             return Err(format!(
                 "amount + max_fee_amount overflow: amount = {}, max_fee_amount = {:?}",
                 amount, self.max_fee_amount
