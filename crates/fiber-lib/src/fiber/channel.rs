@@ -1274,7 +1274,7 @@ where
             final_payment_preimage.or_else(|| self.store.get_preimage(&add_tlc.payment_hash));
         if let Some(preimage) = preimage {
             let filled_payment_hash: Hash256 = hash_algorithm.hash(preimage).into();
-            if add_tlc.payment_hash != filled_payment_hash {
+            if !add_tlc.payment_hash.ct_eq(&filled_payment_hash) {
                 error!(
                     "preimage is not matched for payment hash: {:?}",
                     payment_hash
@@ -5486,7 +5486,7 @@ impl ChannelActorState {
         if let RemoveTlcReason::RemoveTlcFulfill(fulfill) = &reason {
             let filled_payment_hash: Hash256 =
                 current.hash_algorithm.hash(fulfill.payment_preimage).into();
-            if current.payment_hash != filled_payment_hash {
+            if !current.payment_hash.ct_eq(&filled_payment_hash) {
                 return Err(ProcessingChannelError::FinalIncorrectPreimage);
             }
 
@@ -5979,7 +5979,7 @@ impl ChannelActorState {
             if let RemoveTlcReason::RemoveTlcFulfill(fulfill) = reason {
                 let filled_payment_hash: Hash256 =
                     tlc.hash_algorithm.hash(fulfill.payment_preimage).into();
-                if tlc.payment_hash != filled_payment_hash {
+                if !tlc.payment_hash.ct_eq(&filled_payment_hash) {
                     // actually this branch should never be reached in normal case
                     // `FinalIncorrectPreimage` will be returned in `apply_add_tlc_operation_with_peeled_onion_packet`
                     // when the preimage is incorrect

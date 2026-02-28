@@ -1489,7 +1489,8 @@ where
 
             payloads.push(TrampolineHopPayload::Forward {
                 next_node_id,
-                amount_to_forward: final_amount + (fees[idx + 1..].iter().sum::<u128>()),
+                amount_to_forward: final_amount
+                    .saturating_add(fees[idx + 1..].iter().sum::<u128>()),
                 build_max_fee_amount: fees[idx],
                 hash_algorithm: payment_data.hash_algorithm(),
                 tlc_expiry_limit: payment_data.tlc_expiry_limit,
@@ -1529,7 +1530,7 @@ where
 
         return Ok(ResolvedRoute {
             hops: route_to_trampoline,
-            amount: final_amount + remaining_fee,
+            amount: final_amount.saturating_add(remaining_fee),
             trampoline_onion: Some(trampoline_onion),
             final_hop_expiry_delta_override: Some(self.trampoline_forward_expiry_delta(
                 payment_data.final_tlc_expiry_delta,
@@ -1811,7 +1812,9 @@ where
                 amount: r.amount_received,
                 next_hop: Some(r.target),
                 hash_algorithm,
-                expiry: now + r.incoming_tlc_expiry + rand_tlc_expiry_delta,
+                expiry: now
+                    .saturating_add(r.incoming_tlc_expiry)
+                    .saturating_add(rand_tlc_expiry_delta),
                 funding_tx_hash: r.channel_outpoint.tx_hash().into(),
                 ..Default::default()
             });
@@ -1834,7 +1837,9 @@ where
         let mut last_hop = PaymentHopData {
             amount: last_amount,
             hash_algorithm,
-            expiry: now + last_expiry_delta + rand_tlc_expiry_delta,
+            expiry: now
+                .saturating_add(last_expiry_delta)
+                .saturating_add(rand_tlc_expiry_delta),
             payment_preimage,
             custom_records,
             ..Default::default()
@@ -1962,9 +1967,9 @@ where
             node_id: from,
             weight,
             distance,
-            amount_to_send: next_hop_received_amount + fee,
+            amount_to_send: next_hop_received_amount.saturating_add(fee),
             tlc_min_value,
-            incoming_tlc_expiry: incoming_tlc_expiry + tlc_expiry_delta,
+            incoming_tlc_expiry: incoming_tlc_expiry.saturating_add(tlc_expiry_delta),
             fee_charged: fee,
             probability,
             pending_count,
