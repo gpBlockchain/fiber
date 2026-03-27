@@ -1,5 +1,6 @@
 mod channel;
 mod channel_commit_diff;
+mod fee;
 mod features;
 mod gossip;
 mod graph;
