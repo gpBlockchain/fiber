@@ -12,7 +12,12 @@ Fiber Network - 基于 Nervos CKB 的点对点支付/交换网络，类似于 Li
 
 ## Test Coverage Gaps
 
-待分析...
+1. **config.rs** - NO TESTS (592 lines)
+2. **key.rs** - NO TESTS (139 lines)
+3. **in_flight_ckb_tx_actor.rs** - NO TESTS (340 lines)
+4. **payment.rs** - Partial coverage (SendPaymentDataBuilder validation needs tests)
+5. **channel.rs** - Partial coverage (state transition validation needs tests)
+6. **network.rs** - Minimal tests (1 test only for 5,771 lines)
 
 ## Known Bugs
 
@@ -25,7 +30,11 @@ Fiber Network - 基于 Nervos CKB 的点对点支付/交换网络，类似于 Li
 
 ## What Works
 
-(None yet — baseline established)
+1. **fee.rs tests** - 14 new unit tests added and passing
+   - `calculate_fee_with_base` - fee calculation with overflow checking
+   - `calculate_tlc_forward_fee` - TLC forwarding fee calculation
+   - `calculate_commitment_tx_fee` - commitment transaction fee
+   - `calculate_shutdown_tx_fee` - shutdown transaction fee
 
 ## What Doesn't Work
 
