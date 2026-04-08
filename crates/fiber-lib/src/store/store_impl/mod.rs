@@ -145,6 +145,17 @@ fn check_migrate<D: AsRef<Path>>(fiber_dir: D, db: &fiber_store::Store) -> Resul
     Ok(())
 }
 
+/// Convenience wrapper: uses the same path as both store path and fiber_dir.
+/// Intended for tests where there is no separate fiber base directory.
+pub fn open_store_for_test<P: AsRef<Path>>(path: P) -> Result<Store, String> {
+    let db = fiber_store::Store::open_db(path.as_ref())?;
+    check_migrate(path, &db)?;
+    Ok(Store {
+        inner: db,
+        watcher: None,
+    })
+}
+
 pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
     let db = fiber_store::Store::open_db(path.as_ref())?;
     let store = Store {

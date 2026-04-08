@@ -28,7 +28,7 @@ use crate::{
         types::{BroadcastMessage, BroadcastMessageWithTimestamp, Cursor},
     },
     gen_node_announcement_from_privkey, gen_rand_node_announcement,
-    store::{open_store, Store},
+    store::{open_store_for_test, Store},
 };
 use crate::{create_invalid_ecdsa_signature, now_timestamp_as_millis_u64, ChannelTestContext};
 
@@ -43,7 +43,7 @@ struct GossipTestingContext {
 impl GossipTestingContext {
     async fn new() -> Self {
         let dir = TempDir::new("test-gossip-store");
-        let store = open_store(&dir, &dir).expect("created store failed");
+        let store = open_store_for_test(&dir).expect("created store failed");
         let shared_state = Arc::new(std::sync::RwLock::new(MockChainState::new()));
         let chain_actor = Actor::spawn(None, MockChainActor::new(), (None, shared_state.clone()))
             .await
