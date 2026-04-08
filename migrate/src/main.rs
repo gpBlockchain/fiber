@@ -44,12 +44,12 @@ struct Args {
 
 fn run_migrate<P: AsRef<Path>>(
     migrate: DbAndDbMigrate,
-    path: P,
+    fiber_dir: P,
     skip_confirm: bool,
 ) -> Result<DbAndDbMigrate, String> {
     if migrate
         .borrow_migrate()
-        .init_or_check(path.as_ref())
+        .init_or_check(fiber_dir.as_ref())
         .is_err()
     {
         let result = migrate.borrow_migrate().check();
@@ -63,13 +63,13 @@ fn run_migrate<P: AsRef<Path>>(
                 );
             }
             if !skip_confirm {
-                let path_buf = path.as_ref().to_path_buf();
+                let dir_buf = fiber_dir.as_ref().to_path_buf();
                 let input = prompt(format!("\
                      Once the migration started, the data will be no longer compatible with all older version,\n\
                      so we strongly recommended you to backup the old data {} before migrating.\n\
                      \n\
                      \nIf you want to migrate the data, please input YES, otherwise, the current process will exit.\n\
-                     > ", path_buf.display()).as_str());
+                     > ", dir_buf.display()).as_str());
 
                 if input.trim().to_lowercase() != "yes" {
                     error!("Migration was declined since the user didn't confirm.");
@@ -104,7 +104,7 @@ fn main() {
     let db = Store::open_db(&store_path).expect("failed to open db");
     let migrate = init_db_migrate(db);
 
-    if let Err(err) = run_migrate(migrate, &store_path, skip_confirm) {
+    if let Err(err) = run_migrate(migrate, &args.dir, skip_confirm) {
         eprintln!("{}", err);
         exit(1);
     }

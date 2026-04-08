@@ -99,7 +99,8 @@ pub async fn main() -> Result<(), ExitMessage> {
 
     // Derive store_path: prefer fiber config, fall back to base_dir/fiber/store
     let store_path = parsed_fiber_config.store_path();
-    let raw_store = open_store(store_path).map_err(|err| ExitMessage(err.to_string()))?;
+    let raw_store = open_store(&store_path, parsed_fiber_config.base_dir())
+        .map_err(|err| ExitMessage(err.to_string()))?;
 
     if config.cch.is_some() || config.rpc.is_some() {
         let port = Arc::new(OutputPort::default());

@@ -129,18 +129,19 @@ where
 }
 
 /// Open a store at `path`, with migration check.
-pub fn open_store<P: AsRef<Path>>(path: P) -> Result<Store, String> {
+/// `fiber_dir` is the Fiber base directory shown in migration error messages.
+pub fn open_store<P: AsRef<Path>, D: AsRef<Path>>(path: P, fiber_dir: D) -> Result<Store, String> {
     let db = fiber_store::Store::open_db(path.as_ref())?;
-    check_migrate(path, &db)?;
+    check_migrate(fiber_dir, &db)?;
     Ok(Store {
         inner: db,
         watcher: None,
     })
 }
 
-fn check_migrate<P: AsRef<Path>>(path: P, db: &fiber_store::Store) -> Result<(), String> {
+fn check_migrate<D: AsRef<Path>>(fiber_dir: D, db: &fiber_store::Store) -> Result<(), String> {
     let migrate = DbMigrate::new(db);
-    migrate.init_or_check(path)?;
+    migrate.init_or_check(fiber_dir)?;
     Ok(())
 }
 
