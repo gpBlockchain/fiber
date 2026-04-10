@@ -104,7 +104,7 @@ fn main() {
     let db = Store::open_db(&store_path).expect("failed to open db");
     let migrate = init_db_migrate(db);
 
-    if let Err(err) = run_migrate(migrate, &store_path, skip_confirm) {
+    if let Err(err) = run_migrate(migrate, &args.dir, skip_confirm) {
         eprintln!("{}", err);
         exit(1);
     }
