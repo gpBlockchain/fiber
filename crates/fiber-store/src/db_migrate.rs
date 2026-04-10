@@ -57,7 +57,7 @@ impl<'a> DbMigrate<'a> {
         self.migrations.need_init(self.db)
     }
 
-    pub fn init_or_check<P: AsRef<Path>>(&self, path: P) -> Result<&Store, String> {
+    pub fn init_or_check<P: AsRef<Path>>(&self, base_dir: P) -> Result<&Store, String> {
         if self.need_init() {
             info!("begin to init db version ...");
             self.init_db_version().expect("failed to init db version");
@@ -87,8 +87,7 @@ impl<'a> DbMigrate<'a> {
                                 .to_string(),
                         );
                     }
-                    let dir = path.as_ref().parent().unwrap_or(path.as_ref());
-                    return Err(format!("Fiber need to run some database migrations, please run `fnn-migrate -d {}` to start migrations.", dir.display()));
+                    return Err(format!("Fiber need to run some database migrations, please run `fnn-migrate -d {}` to start migrations.", base_dir.as_ref().display()));
                 }
             }
         }
