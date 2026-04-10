@@ -131,7 +131,8 @@ where
 /// Open a store at `path`, with migration check.
 pub fn open_store<P: AsRef<Path>>(path: P) -> Result<Store, String> {
     let db = fiber_store::Store::open_db(path.as_ref())?;
-    check_migrate(path, &db)?;
+    let base_dir = path.as_ref().parent().unwrap_or(path.as_ref());
+    check_migrate(base_dir, &db)?;
     Ok(Store {
         inner: db,
         watcher: None,
@@ -250,7 +251,8 @@ pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
     }
 
     let mut errors: Vec<String> = errors.into_iter().collect();
-    if let Err(version_err) = check_migrate(path, &store.inner) {
+    let base_dir = path.as_ref().parent().unwrap_or(path.as_ref());
+    if let Err(version_err) = check_migrate(base_dir, &store.inner) {
         errors.push(version_err);
     }
     if errors.is_empty() {
