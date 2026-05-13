@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v5** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 5 完成)
+> 版本: **v6** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 6 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -31,11 +31,11 @@
 
 ## 审计进度
 
-- **总 TODO 项**: 31
+- **总 TODO 项**: 32
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 7 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-004, AUDIT-LOGIC-005, AUDIT-LOGIC-006)
+- ⚠️ 发现弱设计: 8 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-004, AUDIT-LOGIC-005, AUDIT-LOGIC-006, AUDIT-LOGIC-007)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
 - ⏳ 待审计: 20
 
@@ -168,7 +168,25 @@
     - [i] **F4 (Info/Pass)**: 跨 channel preimage 复用为预期行为
     - [i] **F6 (Info)**: `sw.update() == false` 兜底路径待跟进
   - **发现记录**: 见 [`findings/AUDIT-LOGIC-006.md`](./findings/AUDIT-LOGIC-006.md)
-- [ ] 🟡 **AUDIT-LOGIC-007** CCH 跨链 HTLC 依赖与到期
+- [!] 🟠 **AUDIT-LOGIC-007** 通道关闭 — 协作关闭 / 强制关闭 / shutdown_script 校验 — **整体 High (协同) / Medium × 3 + Low × 3 + Info × 2**
+  - **关联代码**: `crates/fiber-lib/src/fiber/channel.rs:1622-1676 (handle_shutdown_peer_message), 1970-2075 (handle_shutdown_command + force), 5303-5338 (check_shutdown_fee_rate), 6189-6213 (check_shutdown_fee_valid), 6532-6620 (maybe_transfer_to_shutdown), 8001-8112 (build_shutdown_tx), 8315-8328 (get_latest_commitment_transaction), 8489-8527 (step_shutting_down), 4429-4450 (occupied_capacity)`, `fee.rs:144-218 (check_open_channel_parameters)`, `network.rs:5074-5159 (on_closing_transaction_pending/confirmed)`
+  - **审计内容**:
+    - [x] 协作关闭 TLC 对称保护：本地禁 LocalAnnounced / 对端禁 RemoteAnnounced ✓
+    - [x] 开通时 `reserved_ckb >= occupied_capacity(shutdown_script)` 严格 `<` 校验 ✓
+    - [x] MuSig2 部分签名聚合后才广播 shutdown_tx ✓
+    - [x] 强制关闭广播 `latest_commitment_transaction`（非撤销版本）✓
+    - [x] 自动应答仅当 `remote_fee_rate >= commitment_fee_rate` ✓
+    - [!] **F1 (Medium)**: `check_shutdown_fee_valid` 对对端 fee_rate **没有最低限制**（不对称于 `check_shutdown_fee_rate`），peer 可发 `fee_rate=0` 通过校验 → 推卸 100% shutdown tx fee 给本节点
+    - [!] **F2 (Medium)**: `build_shutdown_tx` UDT 分支 `local_reserved_ckb - local_shutdown_fee` 用 plain sub；`check_shutdown_fee_valid` 用 `saturating_sub(occupied_capacity)` 退化为 0 而非拒绝，留下 capacity < occupied_capacity 输出 cell 漏洞窗口
+    - [!] **F3 (Medium)**: `handle_shutdown_peer_message` 未对 `shutdown.close_script` 做开通时同等强度（严格 `<`）的 `occupied_capacity ≤ remote_reserved_ckb` 校验，与 F1/F2 协同形成完整 DoS 链
+    - [!] **F4 (Low)**: `get_latest_commitment_transaction` 用 `.expect(...)` panic
+    - [!] **F5 (Low)**: 力关可在 `ShuttingDown(WAITING_COMMITMENT_CONFIRMATION)` 重复触发
+    - [!] **F7 (Low)**: `step_shutting_down:8520` TODO — pending TLC 在 ShuttingDown 时缺少向上游回 RemoveTlcFail
+    - [i] **F6 (Pass-by-design)**: 自动应答 `fee_rate=0` 是 LN BOLT-2 风格的有意识设计
+    - [i] **F8/F9 (Pass)**: TLC 双向对称保护；`latest_commitment_transaction` 非撤销性
+  - **协同攻击链**：F1 + F2 + F3 → peer 发 `Shutdown{close_script=<oversize args>, fee_rate=0}` → 通过我方所有校验 → 我方手动应答触发 `build_shutdown_tx` 产无效 CKB tx → 广播被拒 → 通道卡死 → 只能 force close → CSV delay 资金锁定
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-007.md`](./findings/AUDIT-LOGIC-007.md)
+- [ ] 🟡 **AUDIT-LOGIC-008** CCH 跨链 HTLC 依赖与到期
 
 ## 第 3 章 DIM-INPUT / DIM-SERDE 输入与反序列化
 
@@ -243,6 +261,7 @@
 | 2026-05-13 | S4 | AUDIT-LOGIC-006 | Watchtower 剩余面（settlement tx 构造/preimage 收集/parsers）安全 — 仅 4 个 Low：lock_args[0..36] 长度（同 003.F3）、tx-pinning loop 无上限、Htlc parser unwrap、RPC 错误处理；解析器整体 panic-safe | [~] Low × 4, Info × 2 |
 | 2026-05-13 | S5 | AUDIT-LOGIC-004 | 多跳支付转发金额/费用一致性整体严谨；F1 Medium: `forward_amount == 0` 未拒绝可 HTLC slot jamming；F3 Low: ppm 缺上界 | [!] Medium × 1, Low × 3, Info × 2 |
 | 2026-05-13 | S5 | AUDIT-LOGIC-005 | MPP 一致性核心校验完备；F1 Medium: `total_amount` 无上界接受任意倍超付（资金注水 + 错误码语义错位）；trampoline 内外 onion 用 payment_hash tweak 绑定 ✓ | [!] Medium × 1, Low × 3, Info × 2 |
+| 2026-05-13 | S6 | AUDIT-LOGIC-007 | 通道关闭路径整体严谨；F1+F2+F3 协同：`check_shutdown_fee_valid` 缺 fee_rate 下限 + `build_shutdown_tx` saturating_sub 漏洞窗口 + `handle_shutdown_peer_message` 未校验 close_script.occupied_capacity → 可构造 DoS 链让协作关闭不可达 | [!] Medium × 3, Low × 3, Info × 2 (整体 High) |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -275,6 +294,10 @@
 | 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-C | S5 / AUDIT-LOGIC-005 | 解决 `apply_final_hop_tlc_onion_packet:1513` FIXME（MPP invoice 是否强制要求 MPP record）|
 | 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-D | S5 / AUDIT-LOGIC-005 | `verify_mpp_tlcs_have_consistent_total_amount` 加 `payment_secret` 一致性断言 |
 | 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-E | S5 / AUDIT-LOGIC-005 | 审计 `graph.rs:1451` trampoline 选路 `build_max_fee_amount` 总预算约束 |
+| 2026-05-13 | AUDIT-LOGIC-007-FOLLOWUP-A | S6 / AUDIT-LOGIC-007 | **PoC** — 构造 `Shutdown{close_script=<args=200B>, fee_rate=0}`，验证 F1+F2+F3 协同 DoS（协作关闭不可达 → 必须 force close）|
+| 2026-05-13 | AUDIT-LOGIC-007-FOLLOWUP-B | S6 / AUDIT-LOGIC-007 | 实施统一补丁：`check_shutdown_fee_valid` 加 `remote_fee_rate >= commitment_fee_rate`；`handle_shutdown_peer_message` 加 `occupied_capacity(close_script) <= remote_reserved_ckb` 严格 `<` 校验 |
+| 2026-05-13 | AUDIT-LOGIC-007-FOLLOWUP-C | S6 / AUDIT-LOGIC-007 | F4: `get_latest_commitment_transaction` `.expect` → `Result`；F5: force close 加 `WAITING_COMMITMENT_CONFIRMATION` 守卫 |
+| 2026-05-13 | AUDIT-LOGIC-007-FOLLOWUP-D | S6 / AUDIT-LOGIC-007 | 解决 `step_shutting_down:8520` TODO — 在 ShuttingDown 状态下主动向上游 RemoveTlcFail（"channel closing"错误码）|
 
 ## 附录 C：修复建议
 
@@ -310,24 +333,34 @@
 | AUDIT-LOGIC-005.F1 | 🟡 Medium | `leave_just_fulfilled_tlcs_for_mpp_invoice` 加 `total <= invoice.amount * accept_overpay_factor` 限额 + overpaid 错误码改 `IncorrectOrUnknownPaymentDetails` | 未修复 |
 | AUDIT-LOGIC-005.F3 | 🟢 Low | 解决 `apply_final_hop_tlc_onion_packet:1513` FIXME | 未修复 |
 | AUDIT-LOGIC-005.F4 | 🟢 Low | `verify_mpp_consistent` 加 payment_secret 一致性断言 | 未修复 |
+| AUDIT-LOGIC-007.F1 | 🟡 Medium | `check_shutdown_fee_valid` 加 `remote_fee_rate >= commitment_fee_rate` 下限 | 未修复 |
+| AUDIT-LOGIC-007.F2 | 🟡 Medium | `build_shutdown_tx` 改用 `checked_sub` 或在前置校验中拒绝 saturating-to-0 路径 | 未修复 |
+| AUDIT-LOGIC-007.F3 | 🟡 Medium | `handle_shutdown_peer_message` 加 `occupied_capacity(close_script) <= remote_reserved_ckb` 严格 `<` 校验 | 未修复 |
+| AUDIT-LOGIC-007.F4 | 🟢 Low | `get_latest_commitment_transaction` `.expect` → `Result` | 未修复 |
+| AUDIT-LOGIC-007.F5 | 🟢 Low | force close 加 `WAITING_COMMITMENT_CONFIRMATION` 守卫 | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S6)
+## Phase 1 — 下一步建议 (Session S7)
 
-按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S6 计划：
+按 SKILL §三选取规则，S7 计划：
 
-1. **AUDIT-LOGIC-007** — 通道关闭：协作关闭 + 强制关闭（force close）+ shutdown_script 验证
-2. **AUDIT-NET-001 / AUDIT-NET-002** — Tentacle 网络层：消息认证、连接限速、对等节点身份验证
+1. **AUDIT-NET-001 / AUDIT-NET-002** — Tentacle 网络层：消息认证、连接限速、对等节点身份验证 / 防 Sybil
+2. **AUDIT-CRYPTO-004 / AUDIT-CRYPTO-005** （如存在）— 剩余密钥派生 / 签名路径
 
-同时跟进遗留（按优先级）：
+跟进遗留（按优先级）：
+- **AUDIT-LOGIC-007-FOLLOWUP-A** — F1+F2+F3 协同 DoS PoC（高优先级，影响协议可用性）
 - **AUDIT-LOGIC-005-FOLLOWUP-A** — MPP 100x 超付 PoC
 - **AUDIT-LOGIC-004-FOLLOWUP-A** — `forward_amount=0` HTLC slot jamming PoC
 - **AUDIT-LOGIC-002-FOLLOWUP-A** — `expiry: u64::MAX` PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
-- **AUDIT-LOGIC-006-FOLLOWUP-A** — `sw.update() == false` 兜底路径
 - **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce-reuse 动态验证
 - **AUDIT-CRYPTO-002-FOLLOWUP-A** — cross-channel onion replay 动态验证
+
+## Phase 1 — Session 6 已完成
+
+按计划完成：
+- ✅ **AUDIT-LOGIC-007** — 通道关闭路径完整审计（cooperative + force + shutdown_script 校验），发现 F1+F2+F3 协同 DoS 链
 
 ## Phase 1 — Session 5 已完成
 
