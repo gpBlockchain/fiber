@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v8** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 8 完成)
+> 版本: **v9** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 9 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 10 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001, AUDIT-AUTH-002)
+- ⚠️ 发现弱设计: 11 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 18
+- ⏳ 待审计: 17
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -246,8 +246,20 @@
 
 ## 第 5 章 DIM-MEMORY 数值与资源
 
-- [ ] 🟠 **AUDIT-MEM-001** 金额 / 费用 / 高度数值溢出
-- [ ] 🟠 **AUDIT-MEM-002** P2P / RPC 资源耗尽
+- [!] 🔴 **AUDIT-MEM-001** 资源耗尽 (Memory & Connection) — **整体 High / High × 1 + Medium × 2 + Low × 3 + Pass × 2**
+  - **关联代码**: `crates/fiber-lib/src/fiber/gossip.rs:1339 (messages_to_be_saved)`, `gossip.rs:1585-1646 (insert_message_to_be_saved_list)`, `gossip.rs:1369-1425 (prune)`, `gossip.rs:1476-1559 (spawn_query_tasks)`, `gossip.rs:84 (MAX_NUM_OF_BROADCAST_MESSAGES=1000)`, `network.rs:126 (MAX_SERVICE_PROTOCOAL_DATA_SIZE=130KB)`, `network.rs:6053-6108 (FiberProtocolHandle::received)`, `channel.rs:284 (DEFAULT_MAX_TLC_VALUE_IN_FLIGHT=u128::MAX)`, `network.rs:6270-6354 (ToBeAcceptedChannels Pass)`, `fiber/config.rs:101 (gossip_store_maintenance=20s)`
+  - **审计内容**:
+    - [!] **F1 (High)**: gossip `messages_to_be_saved: HashMap<Pubkey, HashSet<BroadcastMessage>>` 在 `insert_message_to_be_saved_list` 入存时**不验签**且**无 per-peer 大小上限**。签名验证延迟到 20s 间隔的 Tick 中 `prune_messages_to_be_saved` 才执行，且仅对依赖完整的消息验签 → 攻击者伪造孤儿 `ChannelUpdate`（不存在的 channel_outpoint）永远不会被 `has_dependencies_available` 通过，仅靠 `spawn_query_tasks` 的 `.remove(&peer)` 间接清理但 `MAX_NUM_CONCURRENT_QUERY_TASKS=10` saturate 时停止移除。单 inbound 连接 ~3 MB RAM/s，16 个 inbound (配合 AUTH-002.F1) ~50 MB/s → 4 GB 节点 80 秒 OOM。零密码学成本、远程、可重复。
+    - [!] **F2 (Medium)**: ractor actor mailbox 默认 unbounded mpsc；`FiberProtocolHandle::received` 无 per-peer rate-limit，攻击者可灌入语法合法的 FiberMessage 至 mailbox 累积 OOM
+    - [!] **F3 (Medium)**: `spawn_query_tasks` 内 `incomplete_messages: Vec` 完整 clone 单 peer 的全部 pending 消息，task 内存放大 × 10；query 响应回灌前不验签 → F1 的二阶段放大器
+    - [!] **F4 (Low)**: `channel.rs:284 DEFAULT_MAX_TLC_VALUE_IN_FLIGHT = u128::MAX` 默认放任 in-flight HTLC 总价值无限制（与 LOGIC-004 协同锁住整 channel 容量长达 14 天）
+    - [!] **F5 (Low)**: `MAX_NUM_OF_BROADCAST_MESSAGES = 1000`，单 gossip 协议帧最大携带量过大，10× 放大 F1
+    - [!] **F6 (Low)**: `prune_messages_to_be_saved` 的 retain 仅清理"已完成"消息，对永远不可能完成的消息无 TTL
+    - [i] **F7 (Pass)**: `ToBeAcceptedChannels` 正确限额 20 channel / 50 KB / per pubkey
+    - [i] **F8 (Pass)**: NodeAnnouncement 在 `announce_private_addr=false` 时拒收私网-only address
+  - **最严重场景 (F1)**: 攻击者建立 inbound 连接（配合 AUTH-002.F1 控制 16 槽位），通过 `BroadcastMessagesFilterResult` 持续推送伪造 `ChannelUpdate`（随机签名 + 不存在的 channel_outpoint）。每帧 130 KB 携带 1000 条 broadcast，`insert_message_to_be_saved_list` 不验签直接入 HashSet。`prune` 不清理（依赖未到位），`spawn_query_tasks` saturate 后停止 remove。50 MB/s RAM 增长，分钟级 OOM；与 AUTH-001.F1 (watchtower 多租户) 协同：受害节点 OOM 时错过 revocation 信号 → cheat 成功
+  - **发现记录**: 见 [`findings/AUDIT-MEM-001.md`](./findings/AUDIT-MEM-001.md)
+- [ ] 🟠 **AUDIT-MEM-002** 金额 / 费用 / 高度数值溢出
 - [ ] 🟡 **AUDIT-MEM-003** Actor mailbox 阻塞
 
 ## 第 6 章 DIM-ERRINFO 错误信息与隐私
@@ -295,6 +307,7 @@
 | 2026-05-13 | S6 | AUDIT-LOGIC-007 | 通道关闭路径整体严谨；F1+F2+F3 协同：`check_shutdown_fee_valid` 缺 fee_rate 下限 + `build_shutdown_tx` saturating_sub 漏洞窗口 + `handle_shutdown_peer_message` 未校验 close_script.occupied_capacity → 可构造 DoS 链让协作关闭不可达 | [!] Medium × 3, Low × 3, Info × 2 (整体 High) |
 | 2026-05-13 | S7 | AUDIT-AUTH-001 | biscuit ed25519/撤销/时间机制健壮；F1 High: standalone watchtower `enable_auth=false` 时所有客户端共享 NodeId::local() 空命名空间，攻击者可覆盖受害者 revocation_data；F2/F3 Medium: middleware fail-open + CORS Any | [!] High × 1, Medium × 2, Low × 5, Pass × 2 |
 | 2026-05-13 | S8 | AUDIT-AUTH-002 | secio + gossip 签名验证完整；F1 Medium: inbound 驱逐顺序倒置(踢老留新)→ Sybil eviction DoS；F2 Medium: `listen_on_onion=true` 仍开明文 TCP 监听，隐私模式失效；F3-F6 Low: tor key 权限/session 覆盖/tor_password 明文/connect_peer 不查 gossip | [!] Medium × 2, Low × 4, Pass × 4 |
+| 2026-05-13 | S9 | AUDIT-MEM-001 | F1 High: gossip `messages_to_be_saved` 入存不验签 + 无 per-peer 上限 + prune 不清理孤儿消息 → 50 MB/s RAM 增长可分钟级 OOM；F2 Medium: ractor mailbox unbounded + 入站无 rate-limit；F3 Medium: spawn_query_tasks 内 incomplete_messages 完整 clone × 10 放大 F1；F4-F6 Low: TLC_VALUE_IN_FLIGHT=u128::MAX / 单帧 1000 broadcasts / prune 无 TTL；F7-F8 Pass: ToBeAcceptedChannels 限额、NodeAnnouncement 私网过滤 | [!] High × 1, Medium × 2, Low × 3, Pass × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -342,6 +355,11 @@
 | 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-D | S8 / AUDIT-AUTH-002 | F4 Low: `peer_session_map.insert` 显式 disconnect 旧 session_id（与 LOGIC-006 状态机 idempotency 联合处理）|
 | 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-E | S8 / AUDIT-AUTH-002 | F5 Low: `tor_password` 用 `secrecy::SecretString` 包装；文档推荐 cookie auth |
 | 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-F | S8 / AUDIT-AUTH-002 | F6 Low/UX: `ConnectPeerWithPubkey` 回退查询 gossip `NodeAnnouncement.addresses` |
+| 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-A | S9 / AUDIT-MEM-001 | **PoC + 修复** — F1 High: `messages_to_be_saved` 加 per-peer 上限 + 入存验签；PoC 单 inbound × 16 帧/秒灌入伪造 ChannelUpdate，监控 RSS 增长 / OOM 时间 |
+| 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-B | S9 / AUDIT-MEM-001 | F2 Medium: 引入 per-peer FiberMessage rate-limit 或 NetworkActor mailbox 上界 |
+| 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-C | S9 / AUDIT-MEM-001 | F3 Medium: `spawn_query_tasks` 内 truncate `incomplete_messages` 上限；query 响应回灌前验签 |
+| 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-D | S9 / AUDIT-MEM-001 | F4 Low: 重设 `DEFAULT_MAX_TLC_VALUE_IN_FLIGHT` 为 channel capacity 比例；文档强制配置 |
+| 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-E | S9 / AUDIT-MEM-001 | F5+F6 Low: 调小 `MAX_NUM_OF_BROADCAST_MESSAGES` (1000→100/200)；prune 增加 TTL 字段清理永不完成消息 |
 
 ## 附录 C：修复建议
 
@@ -392,27 +410,33 @@
 | AUDIT-AUTH-002.F2 | 🟡 Medium | `OnionConfig.onion_only` 模式（限制明文监听）| 未修复 |
 | AUDIT-AUTH-002.F3 | 🟢 Low | onion key load 校验 unix 0o600 | 未修复 |
 | AUDIT-AUTH-002.F4/F5/F6 | 🟢 Low | session 覆盖显式 disconnect / tor_password secrecy / connect_peer fallback gossip | 未修复 |
+| AUDIT-MEM-001.F1 | 🟠 High | gossip `messages_to_be_saved` 入存验签 + per-peer 上限 | 未修复 |
+| AUDIT-MEM-001.F2/F3 | 🟡 Medium | mailbox/incoming-rate 限制；spawn_query_tasks truncate + 验签 | 未修复 |
+| AUDIT-MEM-001.F4/F5/F6 | 🟢 Low | TLC_VALUE_IN_FLIGHT 默认 / 单帧 broadcast 数 / prune TTL | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S9)
+## Phase 1 — 下一步建议 (Session S10)
 
-按 SKILL §三选取规则，S9 计划：
+按 SKILL §三选取规则，S10 计划：
 
-1. **AUDIT-MEM-001 / AUDIT-MEM-002** — 资源耗尽 / 数值溢出（与 AUTH-002.F1 同主题，深入资源管理；覆盖 gossip 消息存储 cap、actor mailbox、p2p 连接配额数值）
+1. **AUDIT-MEM-002** — 数值溢出与边界（承接 MEM-001 资源管理主题；覆盖 fee 计算、HTLC amount + capacity、channel_state 状态机数值）
 2. **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期
 3. **AUDIT-INPUT-002** — Invoice 解析（bech32 / lightning-invoice）
 
 跟进遗留（按优先级）：
-- **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower 多租户 NodeId 冲突 PoC + 修复（高优先级，影响生产部署）
-- **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复（高优先级，低成本攻击）
-- **AUDIT-LOGIC-007-FOLLOWUP-A** — F1+F2+F3 协同 DoS PoC（高优先级，影响协议可用性）
-- **AUDIT-LOGIC-005-FOLLOWUP-A** — MPP 100x 超付 PoC
-- **AUDIT-LOGIC-004-FOLLOWUP-A** — `forward_amount=0` HTLC slot jamming PoC
-- **AUDIT-LOGIC-002-FOLLOWUP-A** — `expiry: u64::MAX` PoC
+- **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复（最高优先级，远程零成本 OOM 攻击链关键节点）
+- **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower 多租户 NodeId 冲突 PoC + 修复
+- **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复
+- **AUDIT-LOGIC-007-FOLLOWUP-A** — 协同 DoS PoC
+- **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
-- **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce-reuse 动态验证
-- **AUDIT-CRYPTO-002-FOLLOWUP-A** — cross-channel onion replay 动态验证
+- **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 9 已完成
+
+按计划完成：
+- ✅ **AUDIT-MEM-001** — 资源耗尽审计（gossip 暂存层、actor mailbox、TLC 默认值、channel pending limits），发现 F1 High（gossip `messages_to_be_saved` 远程 OOM）+ F2/F3 Medium + F4-F6 Low + F7/F8 Pass
 
 ## Phase 1 — Session 8 已完成
 
