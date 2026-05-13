@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v10** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 10 完成)
+> 版本: **v11** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 11 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 12 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002)
+- ⚠️ 发现弱设计: 13 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 16
+- ⏳ 待审计: 15
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -186,7 +186,17 @@
     - [i] **F8/F9 (Pass)**: TLC 双向对称保护；`latest_commitment_transaction` 非撤销性
   - **协同攻击链**：F1 + F2 + F3 → peer 发 `Shutdown{close_script=<oversize args>, fee_rate=0}` → 通过我方所有校验 → 我方手动应答触发 `build_shutdown_tx` 产无效 CKB tx → 广播被拒 → 通道卡死 → 只能 force close → CSV delay 资金锁定
   - **发现记录**: 见 [`findings/AUDIT-LOGIC-007.md`](./findings/AUDIT-LOGIC-007.md)
-- [ ] 🟡 **AUDIT-LOGIC-008** CCH 跨链 HTLC 依赖与到期
+- [!] 🟠 **AUDIT-LOGIC-008** CCH 跨链 HTLC 依赖与到期 — **整体 High / High × 1 + Low × 1 + Info × 1 + Pass × 3**
+  - **关联代码**: `crates/fiber-lib/src/cch/scheduler.rs:262-301` (`expire_order` 不区分 status), `cch/actor.rs:459-473` (`schedule_job_for_non_final_order`), `cch/actor.rs:450-457` (`get_active_order_or_none` 过滤 final), `cch/order/state_machine.rs:44-65,68-84` (preimage hash 校验 + `_ → Failed` 总是允许), `cch/actions/settle_incoming_invoice.rs:124-126` (settle 需 `OutgoingSuccess`), `cch/actor.rs:560,655-674` (静态 half check), `cch/actions/send_outgoing_payment.rs:180-281` (动态 half check), `cch/config.rs:6-12` (`order_expiry=36h` < TLC_expiry=60h), `docs/specs/cch-expiry-dependency.md`
+  - **审计内容**:
+    - [!] **F1 🟠 High — 致命竞态 / 直接资金损失**: `expire_order` 仅 `is_final()` 跳过 Success/Failed，未跳过 `IncomingAccepted / OutgoingInFlight / OutgoingSuccess`。默认 `order_expiry_delta_seconds=36h` < `ckb_final_tlc_expiry_delta_seconds=60h` (或 BTC `360 blocks ≈ 60h`)，留 24h 攻击窗口。攻击路径：用户故意延迟到 T≈36h−ε 才付 incoming → CCH 派发 outgoing → T=36h 调度器强制 status=Failed → 用户在收款端 claim outgoing 揭示 preimage → `handle_tracking_event` 经 `get_active_order_or_none` 返回 None → preimage 事件被丢弃 → CCH 未 settle incoming → incoming TLC/HTLC 60h 后超时退还付款方 → **用户同时获得 outgoing 真金 + 退回的 incoming，CCH 损失全额**。SendBTC 与 ReceiveBTC 双向均可利用。**`grep cancel_invoice|CancelInvoice|cancel_payment` 在 `crates/fiber-lib/src/cch` 下 0 命中**，确认无对称取消路径。即便已到达 `OutgoingSuccess`（preimage 已存入 order），`SettleIncomingInvoiceDispatcher::should_dispatch` 要求 `status==OutgoingSuccess`，被强制改 Failed 后 settle action 链经 retry 也被 `get_active_order_or_none` 阻断。
+    - [!] **F2 🟢 Low**: `actor.rs:560` 与 `send_outgoing_payment.rs:249` 的 `invoice.min_final_cltv_expiry_delta() * 600` 未 checked/saturating，与同文件 line 205 的 `saturating_mul(600)` 不一致；攻击者构造极大 `min_final_cltv` 致 u64 wrap → 静态 half check 误通过 → 订单僵尸（DoS/资源消耗，非直接资金损失，因下游 LND/bolt11 会拒）。
+    - [i] **F3 ℹ️ Info**: BTC 块时间固定 600 s/block 假设，在持续偏快块速下可能压缩 half-budget 余量；建议文档化并允许部署方下调安全系数。
+    - [✓] **F4 ✅ Pass**: `state_machine.rs:49-54` 对 outgoing preimage SHA256 校验后才接受 → 防伪造 preimage。
+    - [✓] **F5 ✅ Pass**: 静态 half-budget check（SendBTC `actor.rs:557-564`、ReceiveBTC `actor.rs:655-674` 含 `checked_mul`）。
+    - [✓] **F6 ✅ Pass**: 动态 half-budget + max_outgoing limit + `check_expiry_or_fail` (`send_outgoing_payment.rs:180-281`)，使用 `elapsed = now − created_at` 保守下界，`remaining / 2` 切分，并把 `tlc_expiry_limit` / `cltv_limit` 下放给后端。
+  - **总体评价**: 协议层（preimage 验签、双重 half-budget、单调状态机）设计**严格遵循 LN 跨链 HTLC 标准**，但**运营层调度器**与**协议层状态机**之间存在严重接口失配：`expire_order` 把 wall-clock 订单过期与 HTLC 时序协调混为一谈，默认配置下 24h 攻击窗口默认开启。这是本审计目前**最严重的 LOGIC 类发现**，优先级高于 AUDIT-LOGIC-007。
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-008.md`](./findings/AUDIT-LOGIC-008.md)
 
 ## 第 3 章 DIM-INPUT / DIM-SERDE 输入与反序列化
 
@@ -322,6 +332,7 @@
 | 2026-05-13 | S8 | AUDIT-AUTH-002 | secio + gossip 签名验证完整；F1 Medium: inbound 驱逐顺序倒置(踢老留新)→ Sybil eviction DoS；F2 Medium: `listen_on_onion=true` 仍开明文 TCP 监听，隐私模式失效；F3-F6 Low: tor key 权限/session 覆盖/tor_password 明文/connect_peer 不查 gossip | [!] Medium × 2, Low × 4, Pass × 4 |
 | 2026-05-13 | S9 | AUDIT-MEM-001 | F1 High: gossip `messages_to_be_saved` 入存不验签 + 无 per-peer 上限 + prune 不清理孤儿消息 → 50 MB/s RAM 增长可分钟级 OOM；F2 Medium: ractor mailbox unbounded + 入站无 rate-limit；F3 Medium: spawn_query_tasks 内 incomplete_messages 完整 clone × 10 放大 F1；F4-F6 Low: TLC_VALUE_IN_FLIGHT=u128::MAX / 单帧 1000 broadcasts / prune 无 TTL；F7-F8 Pass: ToBeAcceptedChannels 限额、NodeAnnouncement 私网过滤 | [!] High × 1, Medium × 2, Low × 3, Pass × 2 |
 | 2026-05-13 | S10 | AUDIT-MEM-002 | 整体 Medium，数值算术接近正确：F1 Low: check_tlc_limits fold 未 checked_add (max_tlc_value_in_flight 默认 u128::MAX 时无后果)；F2 Low: build_settlement_data 链式 +/- 未 checked，依赖状态机不变式 (force-close 路径最有价值修复)；F3 Low: commitment_fee*2 未 checked_mul / u128 as u64 截断；F4 Info: apply_remove_tlc checked_* 正面典范；F5 Info: funding < u64::MAX 显式 cap；F6-F9 Pass: payment/graph/onion checked_add 完整、retry/backoff saturating、MPP saturating_add、add_amount==0 拒绝 | [!] Low × 3, Info × 2, Pass × 4 |
+| 2026-05-13 | S11 | AUDIT-LOGIC-008 | 整体 High — F1 High: `expire_order` 不区分订单 status，默认 order_expiry=36h < TLC_expiry=60h 留 24h 窗口可让调度器在 outgoing 流程中强制 Fail 订单导致 preimage 事件被 `get_active_order_or_none` 丢弃 → CCH 直接资金损失（SendBTC/ReceiveBTC 双向均可利用）；模块完全无 cancel_invoice / cancel_payment 调用路径 (grep 0 命中)。F2 Low: `min_final_cltv_expiry_delta() * 600` 两处未 checked/saturating，与同文件 line 205 `saturating_mul` 不一致。F3 Info: BTC 600s/block 固定假设。F4-F6 Pass: preimage SHA256 hash 校验、静态 half-budget check（含 checked_mul）、动态 half-budget + max_outgoing limit + check_expiry_or_fail | [!] High × 1, Low × 1, Info × 1, Pass × 3 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -378,6 +389,12 @@
 | 2026-05-13 | AUDIT-MEM-002-FOLLOWUP-B | S10 / AUDIT-MEM-002 | **最有价值修复** — F2 Low: `build_settlement_data` 链式 +/- 拆分为分步 `checked_*` + 返回 `InternalError` (force-close 路径) |
 | 2026-05-13 | AUDIT-MEM-002-FOLLOWUP-C | S10 / AUDIT-MEM-002 | F3 Low: `fee.rs:188 commitment_fee.checked_mul(2)`；`channel.rs:5324 u64::try_from(to_local_amount)` 替代 `as u64` |
 | 2026-05-13 | AUDIT-MEM-002-FOLLOWUP-D | S10 / AUDIT-MEM-002 | (维护) 评估在 release profile 启用 `overflow-checks = true`，权衡性能代价 ~5% 与消除静默 wrap 风险 |
+| 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-A | S11 / AUDIT-LOGIC-008 | **🟠 High 必修** — `expire_order` 仅当 `order.status == Pending` 时强制 Failed；为非 Pending 订单设计基于 TLC/HTLC 实际剩余时间的独立调度作业 |
+| 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-B | S11 / AUDIT-LOGIC-008 | **🟠 High 必修** — 实现 LND `CancelInvoice` 与 Fiber invoice cancel 反向路径；CCH 决定 fail 已 IncomingAccepted 订单时主动取消两侧 HTLC/TLC 避免单边占用 |
+| 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-C | S11 / AUDIT-LOGIC-008 | (Medium, 防御性恢复) `handle_tracking_event` 收到 `PaymentChanged{payment_preimage:Some(_)}` 但订单已 Failed 时旁路写入 "orphaned_preimages" 表 / 显著日志，并尝试一次 best-effort settle |
+| 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-D | S11 / AUDIT-LOGIC-008 | (Low) 将 `actor.rs:560` 与 `send_outgoing_payment.rs:249` 的 `min_final_cltv_expiry_delta() * 600` 统一为 `saturating_mul(600)` / `checked_mul` |
+| 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-E | S11 / AUDIT-LOGIC-008 | (Info, 文档) 在 `cch-expiry-dependency.md` 中明确 BTC 600 s/block 假设；提供持续偏快块速下下调 `btc_final_tlc_expiry_delta_blocks` 的指导 |
+| 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-F | S11 / AUDIT-LOGIC-008 | (Low, 配置校验) 启动时拒绝 `order_expiry_delta_seconds >= min(ckb_final_tlc_expiry_delta_seconds, btc_final_tlc_expiry_delta_blocks * 600)` 的危险配置组合 |
 
 ## 附录 C：修复建议
 
@@ -432,26 +449,35 @@
 | AUDIT-MEM-001.F2/F3 | 🟡 Medium | mailbox/incoming-rate 限制；spawn_query_tasks truncate + 验签 | 未修复 |
 | AUDIT-MEM-001.F4/F5/F6 | 🟢 Low | TLC_VALUE_IN_FLIGHT 默认 / 单帧 broadcast 数 / prune TTL | 未修复 |
 | AUDIT-MEM-002.F1/F2/F3 | 🟢 Low | check_tlc_limits fold checked_add / build_settlement_data checked_* / commitment_fee*2 checked_mul + u128→u64 try_from | 未修复 |
+| AUDIT-LOGIC-008.F1 | 🟠 **High** | CCH `expire_order` 仅 status==Pending 才 Fail；新增 LND/Fiber 对称 cancel 路径；handle_tracking_event 旁路写入 finalized 订单的 preimage | **未修复（直接资金损失）** |
+| AUDIT-LOGIC-008.F2 | 🟢 Low | `min_final_cltv_expiry_delta() * 600` 两处统一为 saturating_mul / checked_mul | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S11)
+## Phase 1 — 下一步建议 (Session S12)
 
-按 SKILL §三选取规则，S11 计划：
+按 SKILL §三选取规则，S12 计划：
 
-1. **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期（剩余 LOGIC 章节）
-2. **AUDIT-INPUT-002** — Invoice 解析（bech32 / lightning-invoice）
-3. **AUDIT-ERR-001** — 支付错误码与 payment probing
+1. **AUDIT-INPUT-002** — Invoice 解析（bech32 / lightning-invoice）
+2. **AUDIT-ERR-001** — 支付错误码与 payment probing
+3. **AUDIT-STORE-001** — 持久层与迁移安全（RocksDB column families、`.schema.json`、binary 反序列化）
 
 跟进遗留（按优先级）：
-- **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复（最高优先级，远程零成本 OOM 攻击链关键节点）
+- **AUDIT-LOGIC-008-FOLLOWUP-A/B (highest, 直接资金损失修复)** — `expire_order` 限定 status==Pending；新增 LND `CancelInvoice` / Fiber invoice cancel 反向取消路径
+- **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复（远程零成本 OOM）
 - **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower 多租户 NodeId 冲突 PoC + 修复
 - **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复
 - **AUDIT-LOGIC-007-FOLLOWUP-A** — 协同 DoS PoC
-- **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造（局部、低风险、高价值）
+- **AUDIT-LOGIC-008-FOLLOWUP-C** — handle_tracking_event 收到 finalized 订单的 preimage 时旁路写入 orphaned_preimages
+- **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造
 - **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 11 已完成
+
+按计划完成：
+- ✅ **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期。发现 **F1 🟠 High — `expire_order` 与 outgoing 流程的致命竞态**：默认配置 (order_expiry=36h < TLC_expiry=60h) 下，攻击者可通过控制 incoming 支付时刻让调度器在 outgoing 流程中强制 Fail 订单，导致 preimage 事件被 `get_active_order_or_none` 丢弃 → CCH 未 settle incoming → 24h 后退款。CCH 模块**完全没有** cancel_invoice / cancel_payment 调用路径（grep 0 命中）。**这是当前审计中最严重的 LOGIC 类发现**，优先级高于 LOGIC-007。新增 6 个 follow-ups（A/B 必修：限定 Pending only + 实现对称取消；C 防御性恢复；D Low fix；E/F 文档与配置加固）。
 
 ## Phase 1 — Session 10 已完成
 
