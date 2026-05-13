@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v3** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 3 完成)
+> 版本: **v4** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 4 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 3 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-003)
+- ⚠️ 发现弱设计: 5 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-006)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 24
+- ⏳ 待审计: 22
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -101,7 +101,18 @@
     - [!] **F1/F2/F5/F6 (Low × 4)**: `TxSignatures` / `AnnouncementSignatures` / `ClosingSigned` / `TxAbort` 缺少显式状态匹配或静默忽略
     - [i] **F3/F7 (Info × 2)**: `RevokeAndAck` 缺显式状态匹配；reestablishing 期间静默丢弃消息无限速
   - **发现记录**: 见 [`findings/AUDIT-LOGIC-001.md`](./findings/AUDIT-LOGIC-001.md)
-- [ ] 🔴 **AUDIT-LOGIC-002** TLC / PTLC 生命周期与时间锁
+- [!] 🔴 **AUDIT-LOGIC-002** TLC / PTLC 生命周期与时间锁 — **Medium × 1, Low × 2, Info × 1; 大量 Pass**
+  - **关联代码**: `crates/fiber-lib/src/fiber/channel.rs:1279-1564, 1575-1591, 1882-1929, 2697-2765, 6221-6250, 4453-4458`, `crates/fiber-lib/src/fiber/config.rs:38-58`, `crates/fiber-lib/src/fiber/fee.rs:144-228`, `crates/fiber-lib/src/fiber/network.rs:5263-5283`
+  - **审计内容**:
+    - [x] 出站 `check_tlc_expiry` 三项边界检查（MIN/MAX/epoch buffer）✓
+    - [x] `commitment_delay_epoch` 在出站 + 入站 OpenChannel 两处都强制 `is_well_formed()`（length>0）✓
+    - [x] `maintain_pending_tlcs` 正确清理过期 received TLC + 强关 offered TLC ✓
+    - [x] `forward_amount + fee <= received_amount` 防 underflow ✓
+    - [!] **F1 (Medium)**: 入站 `handle_add_tlc_peer_message` 完全不调用 `check_tlc_expiry` — peer 可发送 `expiry = u64::MAX` 锁定本方 TLC 额度直至强关
+    - [!] **F2 (Low)**: `tlc_expiry_delay` 用 f64 除法，`length==0 → NaN as u64 = 0`（当前协议层不可达但缺防御）
+    - [i] **F3 (Info)**: 出/入 expiry 校验不对称（相对 vs 绝对）
+    - [!] **F4 (Low)**: debug 编译下接受无 onion 的 TLC（生产路径正确拒绝）
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-002.md`](./findings/AUDIT-LOGIC-002.md)
 - [!] 🔴 **AUDIT-LOGIC-003** Commitment 序号 & revocation key — **Medium × 3, Low × 2; 协议层 Pass**
   - **关联代码**: `crates/fiber-types/src/channel.rs:308-346`, `channel.rs:5524-5640, 6841-6937, 7270-7407, 7409-7587`, `watchtower/actor.rs:230-330`
   - **审计内容**:
@@ -117,7 +128,20 @@
   - **发现记录**: 见 [`findings/AUDIT-LOGIC-003.md`](./findings/AUDIT-LOGIC-003.md)
 - [ ] 🟠 **AUDIT-LOGIC-004** 多跳支付转发金额/费用一致性
 - [ ] 🟠 **AUDIT-LOGIC-005** MPP / Trampoline 拆分一致性
-- [ ] 🟠 **AUDIT-LOGIC-006** Watchtower 反应路径
+- [!] 🟠 **AUDIT-LOGIC-006** Watchtower 反应路径（剩余面）— **Low × 4, Info × 2; 大量 Pass**
+  - **关联代码**: `crates/fiber-lib/src/watchtower/actor.rs:486-667 (try_settle_commitment_tx), 669-810 (find_preimages), 794-1500 (build_settlement_tx), 1555-1788 (parsers)`
+  - **审计内容**:
+    - [x] `SettlementWitness` / `Unlock` 解析器长度检查正确（INV-1/2/3）✓
+    - [x] `unlock.preimage.unwrap()` 由 `with_preimage` 不变式保证（INV-4）✓
+    - [x] preimage hash 前缀匹配（20-byte 截断 vs 32-byte hash）✓
+    - [x] Per-commitment 搜索 prefix 正确隔离（lock_args[0..36] 含 commitment_number）✓
+    - [!] **F1 (Low)**: `try_settle_commitment_tx:500` `lock_args[0..36]` 缺独立长度检查（与 LOGIC-003.F3 同源）
+    - [!] **F2 (Low)**: tx-pinning loop 无总迭代上限；`Err` 路径不 break 导致 RPC 失败时潜在死循环
+    - [!] **F3 (Low)**: `Htlc::build_from_witness` 用 `unwrap`，调用方安全但 refactor 风险
+    - [!] **F5 (Low)**: RPC 失败/非 Committed 状态用 `error!` 噪音；无重试机制
+    - [i] **F4 (Info/Pass)**: 跨 channel preimage 复用为预期行为
+    - [i] **F6 (Info)**: `sw.update() == false` 兜底路径待跟进
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-006.md`](./findings/AUDIT-LOGIC-006.md)
 - [ ] 🟡 **AUDIT-LOGIC-007** CCH 跨链 HTLC 依赖与到期
 
 ## 第 3 章 DIM-INPUT / DIM-SERDE 输入与反序列化
@@ -189,6 +213,8 @@
 | 2026-05-13 | S2 | AUDIT-INPUT-001 | 现有 9 个 fuzz 目标覆盖广泛；二阶 TryFrom 子类型 fuzz 较浅；CI 未集成定期 fuzz | [~] Low × 1, Improvement × 3 |
 | 2026-05-13 | S3 | AUDIT-LOGIC-001 | 17 种 P2P 消息状态守卫矩阵 — 大部分有显式 match；`UpdateTlcInfo` 完全无状态守卫；4 处缺少显式状态匹配；Reestablishing 期间静默丢弃无限速 | [~] Medium × 1, Low × 4, Info × 2 |
 | 2026-05-13 | S3 | AUDIT-LOGIC-003 | Commitment 序号管理协议层严谨；watchtower 层有两个 Medium：`lock_args[28..36]` 缺长度检查 (panic-DoS)、revocation_data 覆盖式存储可能无法惩罚选择性上链 | [!] Medium × 3, Low × 2 |
+| 2026-05-13 | S4 | AUDIT-LOGIC-002 | 入站 `AddTlc` 缺 `check_tlc_expiry` (Medium) — peer 可锁定 TLC 额度；`tlc_expiry_delay` f64 路径协议层不可达但缺防御；debug-only 接受无 onion TLC | [!] Medium × 1, Low × 2, Info × 1 |
+| 2026-05-13 | S4 | AUDIT-LOGIC-006 | Watchtower 剩余面（settlement tx 构造/preimage 收集/parsers）安全 — 仅 4 个 Low：lock_args[0..36] 长度（同 003.F3）、tx-pinning loop 无上限、Htlc parser unwrap、RPC 错误处理；解析器整体 panic-safe | [~] Low × 4, Info × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -207,6 +233,12 @@
 | 2026-05-13 | AUDIT-LOGIC-003-FOLLOWUP-A | S3 / AUDIT-LOGIC-003 | **动态验证** — 检查链上 commitment-lock 合约源码 ([fiber-scripts](https://github.com/nervosnetwork/fiber-scripts))：lock_args 中 commitment_number 是否与 witness 中 commitment_number 做绑定比对，决定 F6 是否成立 |
 | 2026-05-13 | AUDIT-LOGIC-003-FOLLOWUP-B | S3 / AUDIT-LOGIC-003 | **PoC** — 构造 peer 在协作关闭中提供 < 36 字节 `close_script.args`，观测受害方 watchtower 是否 panic |
 | 2026-05-13 | AUDIT-LOGIC-001-FOLLOWUP-A | S3 / AUDIT-LOGIC-001 | **PoC** — `UpdateTlcInfo` 在 `NegotiatingFunding` / `Closed` 状态下发送，验证 `remote_tlc_info` / 网络图是否被污染 |
+| 2026-05-13 | AUDIT-LOGIC-002-FOLLOWUP-A | S4 / AUDIT-LOGIC-002 | **PoC** — 恶意 peer 发送 `AddTlc { expiry: u64::MAX }`，验证 (a) TLC 进入 state、(b) 不被 `maintain_pending_tlcs` 清理、(c) 仅能通过 force-close 释放 |
+| 2026-05-13 | AUDIT-LOGIC-002-FOLLOWUP-B | S4 / AUDIT-LOGIC-002 | 新增 fuzz / property test：`handle_add_tlc_peer_message` 在各种 `expiry × peeled.expiry × tlc_expiry_delta` 组合下的不变式 INV-3/INV-4 |
+| 2026-05-13 | AUDIT-LOGIC-002-FOLLOWUP-C | S4 / AUDIT-LOGIC-002 | 将 `tlc_expiry_delay` 重写为 checked 整数运算（消除 f64 NaN/Inf footgun）|
+| 2026-05-13 | AUDIT-LOGIC-006-FOLLOWUP-A | S4 / AUDIT-LOGIC-006 | 完整核对 `build_settlement_tx` 在 `sw.update() == false` 时的兜底路径（unreachable / 静默退出 / 错误处理）|
+| 2026-05-13 | AUDIT-LOGIC-006-FOLLOWUP-B | S4 / AUDIT-LOGIC-006 | 在测试网构造 1000+ 个 dust cell 匹配某 channel commitment prefix，量化 tx-pinning 单次 PeriodicCheck 耗时 |
+| 2026-05-13 | AUDIT-LOGIC-006-FOLLOWUP-C | S4 / AUDIT-LOGIC-006 | 评估独立部署 watchtower 客户端（`watchtower.rs`）相同问题适用性 |
 
 ## 附录 C：修复建议
 
@@ -230,22 +262,36 @@
 | AUDIT-LOGIC-003.F1 | 🟡 Medium | `CommitmentNumbers::increment_*` 改为 `checked_add(1)`；溢出时强制 close 通道 | 未修复 |
 | AUDIT-LOGIC-003.F2 | 🟢 Low | `get_*_commitment_number() - 1` 改为 `checked_sub(1).ok_or(InvalidState)?` | 未修复 |
 | AUDIT-LOGIC-003.F4 | 🟢 Low | watchtower 添加 confirmation 阈值 + 历史 tx 去重缓存 | 未修复 |
+| AUDIT-LOGIC-002.F1 | 🟡 Medium | `handle_add_tlc_peer_message` 入口加 `check_inbound_tlc_expiry`（至少防 u64::MAX 极端值 + `expiry > now`）| 未修复 |
+| AUDIT-LOGIC-002.F2 | 🟢 Low | `tlc_expiry_delay` 改为 checked u128 整数运算 | 未修复 |
+| AUDIT-LOGIC-002.F4 | 🟢 Low | 将 `cfg!(debug_assertions)` no-onion 分支改为 `#[cfg(test)]` 强限定 | 未修复 |
+| AUDIT-LOGIC-006.F1 | 🟢 Low | `try_settle_commitment_tx` 顶部 `lock_args.len() < 36 { return }` | 未修复 |
+| AUDIT-LOGIC-006.F2 | 🟢 Low | 添加 `MAX_CELLS_PER_PERIODIC_CHECK = 1000` 总上限；`Err` 路径 `break` | 未修复 |
+| AUDIT-LOGIC-006.F3 | 🟢 Low | `Htlc::build_from_witness` 改为返回 `Option<Self>` | 未修复 |
+| AUDIT-LOGIC-006.F5 | 🟢 Low | 非 Committed 状态降为 `debug!`；Err 加指数退避重试 | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S4)
+## Phase 1 — 下一步建议 (Session S5)
 
-按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S4 计划：
+按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S5 计划：
 
-1. **AUDIT-LOGIC-002** — TLC / PTLC 生命周期与时间锁（HTLC timeout、相对/绝对锁定、过期处理）
-2. **AUDIT-LOGIC-006** — Watchtower 反应路径（补 S3 watchtower 审计的剩余面：preimage 监控、settle 路径、HTLC-success/timeout 交易）
+1. **AUDIT-LOGIC-004** — 多跳支付转发金额/费用一致性（与已审计 F1 `register_and_apply_forward_tlc` 路径衔接）
+2. **AUDIT-LOGIC-005** — MPP / Trampoline 拆分一致性
 
 同时跟进遗留：
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计（决定 F6 是否成立）
-- **AUDIT-LOGIC-003-FOLLOWUP-B** / **AUDIT-LOGIC-001-FOLLOWUP-A** — PoC 验证 panic-DoS / 网络图污染
-- **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce 复用动态验证
+- **AUDIT-LOGIC-002-FOLLOWUP-A** — `expiry: u64::MAX` PoC
+- **AUDIT-LOGIC-006-FOLLOWUP-A** — `sw.update() == false` 兜底路径
+- **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce-reuse 动态验证
 - **AUDIT-CRYPTO-002-FOLLOWUP-A** — cross-channel onion replay 动态验证
 - **AUDIT-CRYPTO-002-FOLLOWUP-B** — `fiber-sphinx 2.3` 上游源码审计
+
+## Phase 1 — Session 4 已完成
+
+按计划完成：
+- ✅ **AUDIT-LOGIC-002** — TLC / PTLC 生命周期与时间锁（含入站 expiry 校验缺失）
+- ✅ **AUDIT-LOGIC-006** — Watchtower 反应路径剩余面（settlement / preimage / parsers）
 
 ## Phase 1 — Session 3 已完成
 

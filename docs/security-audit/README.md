@@ -18,7 +18,7 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 3. **Phase 2** — Doc updates after every session (status, findings, new attack-surface items).
 4. **Phase 3** — Final report.
 
-## Status (TODO v3, 2026-05-13)
+## Status (TODO v4, 2026-05-13)
 
 | Bucket | Count |
 |---|---|
@@ -26,11 +26,25 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | ✅ Passed | 0 |
 | ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
-| ⚠️ Weak design | 3 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-003) |
+| ⚠️ Weak design | 5 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-006) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001 — no known CVE in surveyed deps) |
-| ⏳ Pending | 24 |
+| ⏳ Pending | 22 |
 
-## Next session (S4) — planned
+## Next session (S5) — planned
 
-- AUDIT-LOGIC-002 — TLC / PTLC lifecycle & timelocks
-- AUDIT-LOGIC-006 — Watchtower reaction paths (preimage monitor, settle, HTLC-success/timeout)
+- AUDIT-LOGIC-004 — Multi-hop forward amount / fee consistency
+- AUDIT-LOGIC-005 — MPP / Trampoline split consistency
+
+## Findings index
+
+| ID | Severity | Title | File |
+|---|---|---|---|
+| AUDIT-CRYPTO-001 | 🔴 Suspected H/Critical | MuSig2 nonce reuse (requires dynamic PoC) | [findings/AUDIT-CRYPTO-001.md](./findings/AUDIT-CRYPTO-001.md) |
+| AUDIT-CRYPTO-002 | 🟡 Medium + 🟢 Low + ℹ️ Info | Sphinx onion peeling & replay protection | [findings/AUDIT-CRYPTO-002.md](./findings/AUDIT-CRYPTO-002.md) |
+| AUDIT-CRYPTO-003 | 🟡 Medium × 2 + 🟢 Low × 3 | Wallet encryption (key derivation, AEAD) | [findings/AUDIT-CRYPTO-003.md](./findings/AUDIT-CRYPTO-003.md) |
+| AUDIT-DEP-001 | ℹ️ Info | Dependency vulnerability scan | [findings/AUDIT-DEP-001.md](./findings/AUDIT-DEP-001.md) |
+| AUDIT-INPUT-001 | 🟢 Low + 🟡 Improvement × 3 | P2P Molecule input fuzz coverage | [findings/AUDIT-INPUT-001.md](./findings/AUDIT-INPUT-001.md) |
+| AUDIT-LOGIC-001 | 🟡 Medium × 1 + 🟢 Low × 4 + ℹ️ Info × 2 | Channel state-machine illegal transitions | [findings/AUDIT-LOGIC-001.md](./findings/AUDIT-LOGIC-001.md) |
+| AUDIT-LOGIC-002 | 🟡 Medium × 1 + 🟢 Low × 2 + ℹ️ Info × 1 | TLC / PTLC lifecycle & timelocks | [findings/AUDIT-LOGIC-002.md](./findings/AUDIT-LOGIC-002.md) |
+| AUDIT-LOGIC-003 | 🟡 Medium × 3 + 🟢 Low × 2 | Commitment number & revocation key | [findings/AUDIT-LOGIC-003.md](./findings/AUDIT-LOGIC-003.md) |
+| AUDIT-LOGIC-006 | 🟢 Low × 4 + ℹ️ Info × 2 | Watchtower reaction paths (remaining surface) | [findings/AUDIT-LOGIC-006.md](./findings/AUDIT-LOGIC-006.md) |
