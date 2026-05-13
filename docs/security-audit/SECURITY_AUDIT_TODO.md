@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v4** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 4 完成)
+> 版本: **v5** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 5 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 5 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-006)
+- ⚠️ 发现弱设计: 7 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-004, AUDIT-LOGIC-005, AUDIT-LOGIC-006)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 22
+- ⏳ 待审计: 20
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -126,8 +126,34 @@
     - [!] **F2 (Low)**: `get_*_commitment_number() - 1` 用裸 `-1`，当前路径不可达但缺防御
     - [!] **F4 (Low)**: watchtower 只查询最新 1 笔 tx，无 confirmation 阈值/历史去重
   - **发现记录**: 见 [`findings/AUDIT-LOGIC-003.md`](./findings/AUDIT-LOGIC-003.md)
-- [ ] 🟠 **AUDIT-LOGIC-004** 多跳支付转发金额/费用一致性
-- [ ] 🟠 **AUDIT-LOGIC-005** MPP / Trampoline 拆分一致性
+- [!] 🟠 **AUDIT-LOGIC-004** 多跳支付转发金额/费用一致性 — **Medium × 1 + Low × 3 + Info × 2**
+  - **关联代码**: `crates/fiber-lib/src/fiber/channel.rs:1382-1421, 1882-1929, 2185-2222, 6252-6284`, `fee.rs:115-142`, `network.rs:3042-3157`, `utils/payment.rs:15-41`
+  - **审计内容**:
+    - [x] Forwarding hop `received_amount >= forward_amount` 防资金凭空生成 ✓
+    - [x] `forward_fee = saturating_sub` 防 underflow + 出站 `check_tlc_forward_amount` 双向校验 ✓
+    - [x] `calculate_fee_with_base` 用 `checked_mul` + 余数向上取整防舍入嫖 ✓
+    - [x] Trampoline 严格 fee 等式 `available == build_max_fee_amount` ✓
+    - [x] `try_to_settle_down_tlc` 只在 onion last hop 触发，防 forward-preimage 抢付 ✓
+    - [!] **F1 (Medium)**: `forward_amount == 0` 未拒绝 → 攻击者可制造大量零值 TLC 挤占 `max_tlc_number_in_flight` slot (HTLC slot jamming)
+    - [!] **F3 (Low)**: `tlc_fee_proportional_millionths` 缺上界 → peer 可广告 `ppm = u128::MAX` 自损式 DoS 通道
+    - [!] **F6 (Low)**: `try_to_settle_down_tlc_without_invoice` 全局 preimage 命中即 fulfill 的测试 hazard
+    - [i] **F4 (Pass)**: trampoline 严格等式是有意识的安全设计
+    - [i] **F5 (Pass)**: `is_invoice_fulfilled` 单 TLC 调用安全，但建议 `checked_add`
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-004.md`](./findings/AUDIT-LOGIC-004.md)
+- [!] 🟠 **AUDIT-LOGIC-005** MPP / Trampoline 拆分一致性 — **Medium × 1 + Low × 3 + Info × 2**
+  - **关联代码**: `crates/fiber-lib/src/fiber/settle_tlc_set_command.rs (全文件)`, `channel.rs:1148-1229, 1425-1564`, `network.rs:3042-3157`, `types.rs:1700-1815`
+  - **审计内容**:
+    - [x] MPP `total_amount` 一致性校验 (`verify_mpp_tlcs_have_consistent_total_amount`) ✓
+    - [x] MPP `payment_secret` 与 invoice 匹配（每 shard 单独校验）✓
+    - [x] Hold TLC `hold_expire_at <= tlc.expiry` 保护 ✓
+    - [x] Trampoline 内层 onion 用 `payment_hash` 做 tweak，绑定内外 onion ✓
+    - [x] Trampoline 转发起的新支付复用 payment_hash（协议核心机制）✓
+    - [!] **F1 (Medium)**: `leave_just_fulfilled_tlcs_for_mpp_invoice` 接受任意倍超付（`total_amount = invoice.amount * N`），可触发资金注水 + overpaid 错误码用 `HoldTlcTimeout` 语义错位
+    - [!] **F3 (Low)**: `apply_final_hop_tlc_onion_packet:1513` FIXME — MPP invoice + 单 TLC 无 MPP record 当前允许（技术债）
+    - [!] **F4 (Low)**: `verify_mpp_consistent` 未显式校验 `payment_secret` 一致性（个体已检查，但 defense-in-depth）
+    - [!] **F5 (Low)**: Hold `expire_at` 继承 LOGIC-002.F1 inbound expiry 问题
+    - [i] **F2/F6/F7 (Pass)**: len==1 跳过校验已验证安全；trampoline tweak/preimage 设计正确
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-005.md`](./findings/AUDIT-LOGIC-005.md)
 - [!] 🟠 **AUDIT-LOGIC-006** Watchtower 反应路径（剩余面）— **Low × 4, Info × 2; 大量 Pass**
   - **关联代码**: `crates/fiber-lib/src/watchtower/actor.rs:486-667 (try_settle_commitment_tx), 669-810 (find_preimages), 794-1500 (build_settlement_tx), 1555-1788 (parsers)`
   - **审计内容**:
@@ -215,6 +241,8 @@
 | 2026-05-13 | S3 | AUDIT-LOGIC-003 | Commitment 序号管理协议层严谨；watchtower 层有两个 Medium：`lock_args[28..36]` 缺长度检查 (panic-DoS)、revocation_data 覆盖式存储可能无法惩罚选择性上链 | [!] Medium × 3, Low × 2 |
 | 2026-05-13 | S4 | AUDIT-LOGIC-002 | 入站 `AddTlc` 缺 `check_tlc_expiry` (Medium) — peer 可锁定 TLC 额度；`tlc_expiry_delay` f64 路径协议层不可达但缺防御；debug-only 接受无 onion TLC | [!] Medium × 1, Low × 2, Info × 1 |
 | 2026-05-13 | S4 | AUDIT-LOGIC-006 | Watchtower 剩余面（settlement tx 构造/preimage 收集/parsers）安全 — 仅 4 个 Low：lock_args[0..36] 长度（同 003.F3）、tx-pinning loop 无上限、Htlc parser unwrap、RPC 错误处理；解析器整体 panic-safe | [~] Low × 4, Info × 2 |
+| 2026-05-13 | S5 | AUDIT-LOGIC-004 | 多跳支付转发金额/费用一致性整体严谨；F1 Medium: `forward_amount == 0` 未拒绝可 HTLC slot jamming；F3 Low: ppm 缺上界 | [!] Medium × 1, Low × 3, Info × 2 |
+| 2026-05-13 | S5 | AUDIT-LOGIC-005 | MPP 一致性核心校验完备；F1 Medium: `total_amount` 无上界接受任意倍超付（资金注水 + 错误码语义错位）；trampoline 内外 onion 用 payment_hash tweak 绑定 ✓ | [!] Medium × 1, Low × 3, Info × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -239,6 +267,14 @@
 | 2026-05-13 | AUDIT-LOGIC-006-FOLLOWUP-A | S4 / AUDIT-LOGIC-006 | 完整核对 `build_settlement_tx` 在 `sw.update() == false` 时的兜底路径（unreachable / 静默退出 / 错误处理）|
 | 2026-05-13 | AUDIT-LOGIC-006-FOLLOWUP-B | S4 / AUDIT-LOGIC-006 | 在测试网构造 1000+ 个 dust cell 匹配某 channel commitment prefix，量化 tx-pinning 单次 PeriodicCheck 耗时 |
 | 2026-05-13 | AUDIT-LOGIC-006-FOLLOWUP-C | S4 / AUDIT-LOGIC-006 | 评估独立部署 watchtower 客户端（`watchtower.rs`）相同问题适用性 |
+| 2026-05-13 | AUDIT-LOGIC-004-FOLLOWUP-A | S5 / AUDIT-LOGIC-004 | **PoC** — `forward_amount=0` HTLC slot jamming：测试网构造，量化 slot 占用时长 |
+| 2026-05-13 | AUDIT-LOGIC-004-FOLLOWUP-B | S5 / AUDIT-LOGIC-004 | 为 `tlc_fee_proportional_millionths` 设软上界（如 100_000 = 10%）在 `graph.rs:783` |
+| 2026-05-13 | AUDIT-LOGIC-004-FOLLOWUP-C | S5 / AUDIT-LOGIC-004 | `is_invoice_fulfilled` 用 `checked_add` 替代 `+=`，并直接复用 SettleTlcSetCommand 已校验的 total |
+| 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-A | S5 / AUDIT-LOGIC-005 | **PoC** — MPP 100x 超付：构造 `total_amount = invoice.amount * 100`，验证接收方 fulfill 全部 |
+| 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-B | S5 / AUDIT-LOGIC-005 | 加 `total_amount <= invoice.amount * accept_overpay_factor` 限额 + overpaid 错误码改 `IncorrectOrUnknownPaymentDetails` |
+| 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-C | S5 / AUDIT-LOGIC-005 | 解决 `apply_final_hop_tlc_onion_packet:1513` FIXME（MPP invoice 是否强制要求 MPP record）|
+| 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-D | S5 / AUDIT-LOGIC-005 | `verify_mpp_tlcs_have_consistent_total_amount` 加 `payment_secret` 一致性断言 |
+| 2026-05-13 | AUDIT-LOGIC-005-FOLLOWUP-E | S5 / AUDIT-LOGIC-005 | 审计 `graph.rs:1451` trampoline 选路 `build_max_fee_amount` 总预算约束 |
 
 ## 附录 C：修复建议
 
@@ -269,23 +305,35 @@
 | AUDIT-LOGIC-006.F2 | 🟢 Low | 添加 `MAX_CELLS_PER_PERIODIC_CHECK = 1000` 总上限；`Err` 路径 `break` | 未修复 |
 | AUDIT-LOGIC-006.F3 | 🟢 Low | `Htlc::build_from_witness` 改为返回 `Option<Self>` | 未修复 |
 | AUDIT-LOGIC-006.F5 | 🟢 Low | 非 Committed 状态降为 `debug!`；Err 加指数退避重试 | 未修复 |
+| AUDIT-LOGIC-004.F1 | 🟡 Medium | `apply_add_tlc_operation_with_peeled_onion_packet` 加 `forward_amount > 0` 守卫 | 未修复 |
+| AUDIT-LOGIC-004.F3 | 🟢 Low | 对 `tlc_fee_proportional_millionths` 设上界（如 100_000 = 10%）| 未修复 |
+| AUDIT-LOGIC-005.F1 | 🟡 Medium | `leave_just_fulfilled_tlcs_for_mpp_invoice` 加 `total <= invoice.amount * accept_overpay_factor` 限额 + overpaid 错误码改 `IncorrectOrUnknownPaymentDetails` | 未修复 |
+| AUDIT-LOGIC-005.F3 | 🟢 Low | 解决 `apply_final_hop_tlc_onion_packet:1513` FIXME | 未修复 |
+| AUDIT-LOGIC-005.F4 | 🟢 Low | `verify_mpp_consistent` 加 payment_secret 一致性断言 | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S5)
+## Phase 1 — 下一步建议 (Session S6)
 
-按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S5 计划：
+按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S6 计划：
 
-1. **AUDIT-LOGIC-004** — 多跳支付转发金额/费用一致性（与已审计 F1 `register_and_apply_forward_tlc` 路径衔接）
-2. **AUDIT-LOGIC-005** — MPP / Trampoline 拆分一致性
+1. **AUDIT-LOGIC-007** — 通道关闭：协作关闭 + 强制关闭（force close）+ shutdown_script 验证
+2. **AUDIT-NET-001 / AUDIT-NET-002** — Tentacle 网络层：消息认证、连接限速、对等节点身份验证
 
-同时跟进遗留：
-- **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计（决定 F6 是否成立）
+同时跟进遗留（按优先级）：
+- **AUDIT-LOGIC-005-FOLLOWUP-A** — MPP 100x 超付 PoC
+- **AUDIT-LOGIC-004-FOLLOWUP-A** — `forward_amount=0` HTLC slot jamming PoC
 - **AUDIT-LOGIC-002-FOLLOWUP-A** — `expiry: u64::MAX` PoC
+- **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
 - **AUDIT-LOGIC-006-FOLLOWUP-A** — `sw.update() == false` 兜底路径
 - **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce-reuse 动态验证
 - **AUDIT-CRYPTO-002-FOLLOWUP-A** — cross-channel onion replay 动态验证
-- **AUDIT-CRYPTO-002-FOLLOWUP-B** — `fiber-sphinx 2.3` 上游源码审计
+
+## Phase 1 — Session 5 已完成
+
+按计划完成：
+- ✅ **AUDIT-LOGIC-004** — 多跳支付转发金额/费用一致性（含 HTLC slot jamming 风险）
+- ✅ **AUDIT-LOGIC-005** — MPP / Trampoline 拆分一致性（含 N 倍超付风险）
 
 ## Phase 1 — Session 4 已完成
 

@@ -18,7 +18,7 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 3. **Phase 2** — Doc updates after every session (status, findings, new attack-surface items).
 4. **Phase 3** — Final report.
 
-## Status (TODO v4, 2026-05-13)
+## Status (TODO v5, 2026-05-13)
 
 | Bucket | Count |
 |---|---|
@@ -26,14 +26,14 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | ✅ Passed | 0 |
 | ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
-| ⚠️ Weak design | 5 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-006) |
+| ⚠️ Weak design | 7 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-004, AUDIT-LOGIC-005, AUDIT-LOGIC-006) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001 — no known CVE in surveyed deps) |
-| ⏳ Pending | 22 |
+| ⏳ Pending | 20 |
 
-## Next session (S5) — planned
+## Next session (S6) — planned
 
-- AUDIT-LOGIC-004 — Multi-hop forward amount / fee consistency
-- AUDIT-LOGIC-005 — MPP / Trampoline split consistency
+- AUDIT-LOGIC-007 — Channel close (cooperative + force) & shutdown_script validation
+- AUDIT-NET-001 / AUDIT-NET-002 — Tentacle network layer (message auth, rate limit, peer identity)
 
 ## Findings index
 
@@ -47,4 +47,6 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | AUDIT-LOGIC-001 | 🟡 Medium × 1 + 🟢 Low × 4 + ℹ️ Info × 2 | Channel state-machine illegal transitions | [findings/AUDIT-LOGIC-001.md](./findings/AUDIT-LOGIC-001.md) |
 | AUDIT-LOGIC-002 | 🟡 Medium × 1 + 🟢 Low × 2 + ℹ️ Info × 1 | TLC / PTLC lifecycle & timelocks | [findings/AUDIT-LOGIC-002.md](./findings/AUDIT-LOGIC-002.md) |
 | AUDIT-LOGIC-003 | 🟡 Medium × 3 + 🟢 Low × 2 | Commitment number & revocation key | [findings/AUDIT-LOGIC-003.md](./findings/AUDIT-LOGIC-003.md) |
+| AUDIT-LOGIC-004 | 🟡 Medium × 1 + 🟢 Low × 3 + ℹ️ Info × 2 | Multi-hop forward amount / fee consistency | [findings/AUDIT-LOGIC-004.md](./findings/AUDIT-LOGIC-004.md) |
+| AUDIT-LOGIC-005 | 🟡 Medium × 1 + 🟢 Low × 3 + ℹ️ Info × 2 | MPP / Trampoline split consistency | [findings/AUDIT-LOGIC-005.md](./findings/AUDIT-LOGIC-005.md) |
 | AUDIT-LOGIC-006 | 🟢 Low × 4 + ℹ️ Info × 2 | Watchtower reaction paths (remaining surface) | [findings/AUDIT-LOGIC-006.md](./findings/AUDIT-LOGIC-006.md) |
