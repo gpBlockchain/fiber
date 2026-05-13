@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v6** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 6 完成)
+> 版本: **v7** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 7 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 8 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-002, AUDIT-LOGIC-003, AUDIT-LOGIC-004, AUDIT-LOGIC-005, AUDIT-LOGIC-006, AUDIT-LOGIC-007)
+- ⚠️ 发现弱设计: 9 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 20
+- ⏳ 待审计: 19
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -209,7 +209,23 @@
 
 ## 第 4 章 DIM-AUTH 认证与鉴权
 
-- [ ] 🔴 **AUDIT-AUTH-001** Biscuit RPC 鉴权
+- [!] 🔴 **AUDIT-AUTH-001** Biscuit RPC 鉴权 — **整体 High / High × 1 + Medium × 2 + Low × 5 + Pass × 2**
+  - **关联代码**: `crates/fiber-lib/src/rpc/biscuit.rs:75-262 (build_rules + BiscuitAuth + extract_node_id)`, `middleware.rs:1-205 (BiscuitAuthMiddleware)`, `mod.rs:124-296 (start_server + CORS + is_public_addr + auth 装配)`, `fiber-types/src/primitives.rs:90-99 (NodeId::local)`, `rpc/watchtower.rs:147-275 (require_rpc_context handlers)`, `bin/main.rs:235-293 (standalone watchtower)`
+  - **审计内容**:
+    - [x] biscuit ed25519 签名 + 撤销列表 + 时间约束（test 覆盖完整）✓
+    - [x] 公网监听强制要求 biscuit 公钥（`mod.rs:285-287`）✓
+    - [x] `is_public_addr` IPv4/IPv6 私网判定保守取严 ✓
+    - [!] **F1 (High)**: `enable_auth=false` 时 `require_rpc_context` 注入 `NodeId::local()`（空 Vec<u8>）→ standalone watchtower 多租户场景下所有客户端共享同一 store keyspace → 攻击者可 `update_revocation`/`remove_watch_channel`/`remove_preimage` 覆盖受害者的 watchtower entry → watchtower 反惩罚失效，资金损失
+    - [!] **F2 (Medium)**: `auth_call` local-bypass 分支对**未注册规则的方法 fail-open**（`middleware.rs:107-111` 返回 true），与 `enable_auth=true` 分支 fail-closed 不一致；当前未注册示例：`unsubscribe_store_changes`
+    - [!] **F3 (Medium)**: CORS 默认 `Any` (allow_origin + allow_headers 全开) → 任意网站 JS 可携带 `Authorization: Bearer` 跨域调用（结合 token 泄漏即 CSRF）
+    - [!] **F4 (Low)**: 撤销 token 错误信息泄露完整 token 到 `tracing::debug!` 和 `anyhow::Error`（`biscuit.rs:234-235`）
+    - [!] **F5 (Low)**: `auth_notify` 无 `enable_auth=false` local 旁路 → 本地模式 notifications 一律失败
+    - [!] **F6 (Low)**: `BEARER_PREFIX` 大小写敏感（违反 RFC 7235 §2.1）
+    - [!] **F7 (Low)**: `extract_node_id` 在每次 require_rpc_context 调用打 `tracing::warn!` → 日志噪音 + node_id metadata 泄漏
+    - [!] **F8 (Low)**: 无 rate-limit / 失败黑名单 → 撤销 token 字典攻击 + DoS 预热
+    - [i] **F9/F10 (Pass)**: biscuit 签名/撤销/超时机制；`is_public_addr` 私网判定（取严）
+  - **最严重场景 (F1)**: 自建 watchtower 集群 standalone 模式（私网/容器）无 biscuit 公钥配置时，攻击者只需访问 watchtower RPC 端口 + 已知受害者 channel_id（gossip 公开）即可调用 `update_revocation(victim_channel_id, attacker_crafted_revocation)` 覆盖 → watchtower 在 cheat 发生时广播错误的 revocation tx → 受害者无法反制 cheat
+  - **发现记录**: 见 [`findings/AUDIT-AUTH-001.md`](./findings/AUDIT-AUTH-001.md)
 - [ ] 🟠 **AUDIT-AUTH-002** Peer 身份绑定与 onion service
 - [ ] 🟡 **AUDIT-AUTH-003** RPC CORS / Tower-http 配置
 
@@ -262,6 +278,7 @@
 | 2026-05-13 | S5 | AUDIT-LOGIC-004 | 多跳支付转发金额/费用一致性整体严谨；F1 Medium: `forward_amount == 0` 未拒绝可 HTLC slot jamming；F3 Low: ppm 缺上界 | [!] Medium × 1, Low × 3, Info × 2 |
 | 2026-05-13 | S5 | AUDIT-LOGIC-005 | MPP 一致性核心校验完备；F1 Medium: `total_amount` 无上界接受任意倍超付（资金注水 + 错误码语义错位）；trampoline 内外 onion 用 payment_hash tweak 绑定 ✓ | [!] Medium × 1, Low × 3, Info × 2 |
 | 2026-05-13 | S6 | AUDIT-LOGIC-007 | 通道关闭路径整体严谨；F1+F2+F3 协同：`check_shutdown_fee_valid` 缺 fee_rate 下限 + `build_shutdown_tx` saturating_sub 漏洞窗口 + `handle_shutdown_peer_message` 未校验 close_script.occupied_capacity → 可构造 DoS 链让协作关闭不可达 | [!] Medium × 3, Low × 3, Info × 2 (整体 High) |
+| 2026-05-13 | S7 | AUDIT-AUTH-001 | biscuit ed25519/撤销/时间机制健壮；F1 High: standalone watchtower `enable_auth=false` 时所有客户端共享 NodeId::local() 空命名空间，攻击者可覆盖受害者 revocation_data；F2/F3 Medium: middleware fail-open + CORS Any | [!] High × 1, Medium × 2, Low × 5, Pass × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -298,6 +315,11 @@
 | 2026-05-13 | AUDIT-LOGIC-007-FOLLOWUP-B | S6 / AUDIT-LOGIC-007 | 实施统一补丁：`check_shutdown_fee_valid` 加 `remote_fee_rate >= commitment_fee_rate`；`handle_shutdown_peer_message` 加 `occupied_capacity(close_script) <= remote_reserved_ckb` 严格 `<` 校验 |
 | 2026-05-13 | AUDIT-LOGIC-007-FOLLOWUP-C | S6 / AUDIT-LOGIC-007 | F4: `get_latest_commitment_transaction` `.expect` → `Result`；F5: force close 加 `WAITING_COMMITMENT_CONFIRMATION` 守卫 |
 | 2026-05-13 | AUDIT-LOGIC-007-FOLLOWUP-D | S6 / AUDIT-LOGIC-007 | 解决 `step_shutting_down:8520` TODO — 在 ShuttingDown 状态下主动向上游 RemoveTlcFail（"channel closing"错误码）|
+| 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-A | S7 / AUDIT-AUTH-001 | **PoC + 修复** — F1 High: standalone watchtower `enable_auth=false` 多租户 NodeId 冲突；在 `mod.rs:285` 加判断：若 watchtower 模块启用且 `biscuit_public_key.is_none()` 则 `bail!`；或将 `require_rpc_context && !enable_auth` 改为拒绝 |
+| 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-B | S7 / AUDIT-AUTH-001 | F2: middleware fail-open 改为 fail-secure（未注册方法 `return false`）；考虑用 enum 替代 `&'static str` 强制 build_rules 完备 |
+| 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-C | S7 / AUDIT-AUTH-001 | F3: CORS `allow_origin=Any` 默认收紧 —— 启动期拒绝 `cors_enabled=true && cors_allowed_origins.is_empty()`，或至少 `allow_headers` 排除 `AUTHORIZATION` |
+| 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-D | S7 / AUDIT-AUTH-001 | F4/F5/F6/F7 一并：token 日志脱敏；`auth_notify` 加 local 旁路；BEARER 前缀 case-insensitive；`extract_node_id` 日志降级到 trace |
+| 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-E | S7 / AUDIT-AUTH-001 | F8: 引入 tower-governor / per-IP failed-auth 计数 |
 
 ## 附录 C：修复建议
 
@@ -338,17 +360,25 @@
 | AUDIT-LOGIC-007.F3 | 🟡 Medium | `handle_shutdown_peer_message` 加 `occupied_capacity(close_script) <= remote_reserved_ckb` 严格 `<` 校验 | 未修复 |
 | AUDIT-LOGIC-007.F4 | 🟢 Low | `get_latest_commitment_transaction` `.expect` → `Result` | 未修复 |
 | AUDIT-LOGIC-007.F5 | 🟢 Low | force close 加 `WAITING_COMMITMENT_CONFIRMATION` 守卫 | 未修复 |
+| AUDIT-AUTH-001.F1 | 🟠 High | standalone watchtower 强制要求 biscuit_public_key（启动期 bail!），或拒绝 `enable_auth=false && require_rpc_context` 调用 | 未修复 |
+| AUDIT-AUTH-001.F2 | 🟡 Medium | middleware `auth_call` 未注册规则的方法 `return false`（fail-secure）| 未修复 |
+| AUDIT-AUTH-001.F3 | 🟡 Medium | 默认禁止 `cors_enabled=true && cors_allowed_origins.is_empty()`，或排除 AUTHORIZATION 头 | 未修复 |
+| AUDIT-AUTH-001.F4 | 🟢 Low | 撤销 token 错误信息脱敏 | 未修复 |
+| AUDIT-AUTH-001.F5/F6/F7 | 🟢 Low | auth_notify local 旁路；BEARER 大小写不敏感；extract_node_id 日志降级 | 未修复 |
+| AUDIT-AUTH-001.F8 | 🟢 Low | 引入失败鉴权速率限制 | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S7)
+## Phase 1 — 下一步建议 (Session S8)
 
-按 SKILL §三选取规则，S7 计划：
+按 SKILL §三选取规则，S8 计划：
 
-1. **AUDIT-NET-001 / AUDIT-NET-002** — Tentacle 网络层：消息认证、连接限速、对等节点身份验证 / 防 Sybil
-2. **AUDIT-CRYPTO-004 / AUDIT-CRYPTO-005** （如存在）— 剩余密钥派生 / 签名路径
+1. **AUDIT-AUTH-002** — Peer 身份绑定与 onion service（continues auth dimension）
+2. **AUDIT-MEM-001 / AUDIT-MEM-002** — 资源耗尽 / 数值溢出（与网络层相关，覆盖 NET 主题）
+3. **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期
 
 跟进遗留（按优先级）：
+- **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower 多租户 NodeId 冲突 PoC + 修复（高优先级，影响生产部署）
 - **AUDIT-LOGIC-007-FOLLOWUP-A** — F1+F2+F3 协同 DoS PoC（高优先级，影响协议可用性）
 - **AUDIT-LOGIC-005-FOLLOWUP-A** — MPP 100x 超付 PoC
 - **AUDIT-LOGIC-004-FOLLOWUP-A** — `forward_amount=0` HTLC slot jamming PoC
@@ -356,6 +386,11 @@
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
 - **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce-reuse 动态验证
 - **AUDIT-CRYPTO-002-FOLLOWUP-A** — cross-channel onion replay 动态验证
+
+## Phase 1 — Session 7 已完成
+
+按计划完成：
+- ✅ **AUDIT-AUTH-001** — Biscuit RPC 鉴权完整审计（biscuit/middleware/start_server/CORS/standalone watchtower 多租户），发现 F1 High 漏洞链（standalone watchtower NodeId::local 共享命名空间）+ F2/F3 Medium
 
 ## Phase 1 — Session 6 已完成
 
