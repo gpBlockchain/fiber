@@ -18,7 +18,7 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 3. **Phase 2** — Doc updates after every session (status, findings, new attack-surface items).
 4. **Phase 3** — Final report.
 
-## Status (TODO v7, 2026-05-13)
+## Status (TODO v8, 2026-05-13)
 
 | Bucket | Count |
 |---|---|
@@ -26,16 +26,16 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | ✅ Passed | 0 |
 | ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
-| ⚠️ Weak design | 9 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001) |
+| ⚠️ Weak design | 10 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001, AUDIT-AUTH-002) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001 — no known CVE in surveyed deps) |
-| ⏳ Pending | 19 |
+| ⏳ Pending | 18 |
 
-## Next session (S8) — planned
+## Next session (S9) — planned
 
-- AUDIT-AUTH-002 — Peer identity binding & onion service (continues auth dimension)
-- AUDIT-MEM-001 / MEM-002 — resource exhaustion & numeric overflow
+- AUDIT-MEM-001 / MEM-002 — resource exhaustion & numeric overflow (gossip store cap, actor mailbox, p2p quota)
 - AUDIT-LOGIC-008 — CCH cross-chain HTLC dependency & expiry
-- Pending PoC follow-ups (AUDIT-AUTH-001-FOLLOWUP-A + LOGIC-007-FOLLOWUP-A highest priority)
+- AUDIT-INPUT-002 — Invoice parsing (bech32 / lightning-invoice)
+- Pending PoC follow-ups (AUTH-001-FOLLOWUP-A, AUTH-002-FOLLOWUP-A, LOGIC-007-FOLLOWUP-A highest priority)
 
 ## Findings index
 
@@ -54,3 +54,4 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | AUDIT-LOGIC-006 | 🟢 Low × 4 + ℹ️ Info × 2 | Watchtower reaction paths (remaining surface) | [findings/AUDIT-LOGIC-006.md](./findings/AUDIT-LOGIC-006.md) |
 | AUDIT-LOGIC-007 | 🟠 High (协同) / 🟡 Medium × 3 + 🟢 Low × 3 + ℹ️ Info × 2 | Channel close (cooperative + force) & shutdown_script validation | [findings/AUDIT-LOGIC-007.md](./findings/AUDIT-LOGIC-007.md) |
 | AUDIT-AUTH-001 | 🟠 High / 🟡 Medium × 2 + 🟢 Low × 5 + ℹ️ Pass × 2 | Biscuit RPC auth — incl. standalone-watchtower multi-tenant NodeId::local collision | [findings/AUDIT-AUTH-001.md](./findings/AUDIT-AUTH-001.md) |
+| AUDIT-AUTH-002 | 🟡 Medium / 🟡 Medium × 2 + 🟢 Low × 4 + ℹ️ Pass × 4 | Peer identity binding (secio) & onion service — incl. inbound eviction Sybil DoS, onion privacy gap | [findings/AUDIT-AUTH-002.md](./findings/AUDIT-AUTH-002.md) |

@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v7** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 7 完成)
+> 版本: **v8** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 8 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 9 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001)
+- ⚠️ 发现弱设计: 10 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001, AUDIT-AUTH-002)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 19
+- ⏳ 待审计: 18
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -226,7 +226,22 @@
     - [i] **F9/F10 (Pass)**: biscuit 签名/撤销/超时机制；`is_public_addr` 私网判定（取严）
   - **最严重场景 (F1)**: 自建 watchtower 集群 standalone 模式（私网/容器）无 biscuit 公钥配置时，攻击者只需访问 watchtower RPC 端口 + 已知受害者 channel_id（gossip 公开）即可调用 `update_revocation(victim_channel_id, attacker_crafted_revocation)` 覆盖 → watchtower 在 cheat 发生时广播错误的 revocation tx → 受害者无法反制 cheat
   - **发现记录**: 见 [`findings/AUDIT-AUTH-001.md`](./findings/AUDIT-AUTH-001.md)
-- [ ] 🟠 **AUDIT-AUTH-002** Peer 身份绑定与 onion service
+- [ ] 🟠 **AUDIT-AUTH-002** Peer 身份绑定与 onion service — **整体 Medium / Medium × 2 + Low × 4 + Pass × 4**
+  - **关联代码**: `crates/fiber-lib/src/fiber/network.rs:4460-4512 (enforce_inbound_peer_budget + inbound_no_channel_peers_in_connected_order)`, `network.rs:4876-4950 (on_peer_connected)`, `network.rs:6053-6108 (FiberProtocolHandle remote_pubkey)`, `network.rs:5560-5710 (secio handshake + listen + onion start)`, `network.rs:1744-1797 (ConnectPeer/ConnectPeerWithPubkey)`, `fiber/onion_service.rs:1-492 (Tor controller + key IO)`, `fiber/proxy.rs:1-50 (SOCKS5)`, `fiber/gossip.rs:2428-2615 (gossip signature verify)`, `fiber/config.rs:88,251-552 (DEFAULT_MAX_INBOUND_PEERS=16)`
+  - **审计内容**:
+    - [x] secio 握手对 `remote_pubkey` 的 ed25519 签名绑定（F7 Pass）✓
+    - [x] gossip NodeAnnouncement / ChannelAnnouncement / ChannelUpdate 签名验证（F8 Pass）✓
+    - [x] SOCKS5 stream isolation 默认开启（F9 Pass：`proxy_random_auth = true`）✓
+    - [x] Onion v3 私钥生成 / 0o600 写入（F10 Pass）✓
+    - [!] **F1 (Medium)**: `inbound_no_channel_peers_in_connected_order` 升序排序 + `take(excess_peers)` 驱逐 → **总是踢老的，留新的**。攻击者用 N 个 fresh secp256k1 keypair 发起 inbound 连接即可逐出 16 个合法 inbound-no-channel peer，阻止任何新客户上场；Sybil/eviction DoS，无链上抵押成本
+    - [!] **F2 (Medium)**: `listen_on_onion=true` 仍同时打开明文 TCP 监听（`network.rs:5680` 始终基于 `config.listening_addr()`），无 `onion_only` 模式 → 端口扫描可关联真实 IP 与 `.onion` → 隐私模式失效
+    - [!] **F3 (Low)**: `load_tor_secret_key`（onion_service.rs:475-491）不校验文件权限 → 备份恢复 / `cp -p` 引入 0o644 onion 私钥不报警
+    - [!] **F4 (Low)**: `peer_session_map.insert`（network.rs:4878-4886）同 pubkey 静默覆盖旧 session_id，旧 tentacle session 未 disconnect → reconnect race 下消息可能分裂；非攻击通路（需私钥）
+    - [!] **F5 (Low)**: `tor_password` 明文存于 config，无 `secrecy::SecretString` / zeroize
+    - [!] **F6 (Low/UX)**: `ConnectPeerWithPubkey` 仅查 `state_to_be_persisted.persisted_peer_addresses`，不回退查询 gossip `NodeAnnouncement.addresses` → 用户体验不一致
+    - [i] **F7-F10 (Pass)**: secio remote_pubkey 绑定；gossip 三类消息签名验证；SOCKS5 stream isolation 默认；onion v3 key 生成
+  - **最严重场景 (F1)**: 攻击者用 17 个 fresh keypair 同时 dial 受害节点的 p2p 端口；每次 secio 握手完成后 `enforce_inbound_peer_budget` 被触发，由于 `peers.sort_by_key(|(_, sid)| *sid)` 升序 + `.take(1).disconnect()`，**最老的合法 inbound-no-channel session 被踢**。合法节点 reconnect 后再次成为最老，再次被踢。攻击者只需 < 100 KB/s 流量持续轮转，即可让节点对任何新 peer 不可达，阻断 channel onboarding 与 gossip 同步入度
+  - **发现记录**: 见 [`findings/AUDIT-AUTH-002.md`](./findings/AUDIT-AUTH-002.md)
 - [ ] 🟡 **AUDIT-AUTH-003** RPC CORS / Tower-http 配置
 
 ## 第 5 章 DIM-MEMORY 数值与资源
@@ -279,6 +294,7 @@
 | 2026-05-13 | S5 | AUDIT-LOGIC-005 | MPP 一致性核心校验完备；F1 Medium: `total_amount` 无上界接受任意倍超付（资金注水 + 错误码语义错位）；trampoline 内外 onion 用 payment_hash tweak 绑定 ✓ | [!] Medium × 1, Low × 3, Info × 2 |
 | 2026-05-13 | S6 | AUDIT-LOGIC-007 | 通道关闭路径整体严谨；F1+F2+F3 协同：`check_shutdown_fee_valid` 缺 fee_rate 下限 + `build_shutdown_tx` saturating_sub 漏洞窗口 + `handle_shutdown_peer_message` 未校验 close_script.occupied_capacity → 可构造 DoS 链让协作关闭不可达 | [!] Medium × 3, Low × 3, Info × 2 (整体 High) |
 | 2026-05-13 | S7 | AUDIT-AUTH-001 | biscuit ed25519/撤销/时间机制健壮；F1 High: standalone watchtower `enable_auth=false` 时所有客户端共享 NodeId::local() 空命名空间，攻击者可覆盖受害者 revocation_data；F2/F3 Medium: middleware fail-open + CORS Any | [!] High × 1, Medium × 2, Low × 5, Pass × 2 |
+| 2026-05-13 | S8 | AUDIT-AUTH-002 | secio + gossip 签名验证完整；F1 Medium: inbound 驱逐顺序倒置(踢老留新)→ Sybil eviction DoS；F2 Medium: `listen_on_onion=true` 仍开明文 TCP 监听，隐私模式失效；F3-F6 Low: tor key 权限/session 覆盖/tor_password 明文/connect_peer 不查 gossip | [!] Medium × 2, Low × 4, Pass × 4 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -320,6 +336,12 @@
 | 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-C | S7 / AUDIT-AUTH-001 | F3: CORS `allow_origin=Any` 默认收紧 —— 启动期拒绝 `cors_enabled=true && cors_allowed_origins.is_empty()`，或至少 `allow_headers` 排除 `AUTHORIZATION` |
 | 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-D | S7 / AUDIT-AUTH-001 | F4/F5/F6/F7 一并：token 日志脱敏；`auth_notify` 加 local 旁路；BEARER 前缀 case-insensitive；`extract_node_id` 日志降级到 trace |
 | 2026-05-13 | AUDIT-AUTH-001-FOLLOWUP-E | S7 / AUDIT-AUTH-001 | F8: 引入 tower-governor / per-IP failed-auth 计数 |
+| 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-A | S8 / AUDIT-AUTH-002 | **PoC + 修复** — F1 Medium: inbound eviction 反序 (`sort_by_key(Reverse)`) + per-subnet 限额；构造 PoC：17 个 fresh secp256k1 keypair 持续逐出合法 inbound peer |
+| 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-B | S8 / AUDIT-AUTH-002 | F2 Medium: 新增 `OnionConfig.onion_only`，启用时 `listening_addr` 收缩到 loopback；启动期校验 announce 不暴露真实 IP |
+| 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-C | S8 / AUDIT-AUTH-002 | F3 Low: `load_tor_secret_key` 加 unix mode 校验（0o600 否则拒绝） |
+| 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-D | S8 / AUDIT-AUTH-002 | F4 Low: `peer_session_map.insert` 显式 disconnect 旧 session_id（与 LOGIC-006 状态机 idempotency 联合处理）|
+| 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-E | S8 / AUDIT-AUTH-002 | F5 Low: `tor_password` 用 `secrecy::SecretString` 包装；文档推荐 cookie auth |
+| 2026-05-13 | AUDIT-AUTH-002-FOLLOWUP-F | S8 / AUDIT-AUTH-002 | F6 Low/UX: `ConnectPeerWithPubkey` 回退查询 gossip `NodeAnnouncement.addresses` |
 
 ## 附录 C：修复建议
 
@@ -366,19 +388,24 @@
 | AUDIT-AUTH-001.F4 | 🟢 Low | 撤销 token 错误信息脱敏 | 未修复 |
 | AUDIT-AUTH-001.F5/F6/F7 | 🟢 Low | auth_notify local 旁路；BEARER 大小写不敏感；extract_node_id 日志降级 | 未修复 |
 | AUDIT-AUTH-001.F8 | 🟢 Low | 引入失败鉴权速率限制 | 未修复 |
+| AUDIT-AUTH-002.F1 | 🟡 Medium | inbound eviction 反序 + per-subnet 限额 | 未修复 |
+| AUDIT-AUTH-002.F2 | 🟡 Medium | `OnionConfig.onion_only` 模式（限制明文监听）| 未修复 |
+| AUDIT-AUTH-002.F3 | 🟢 Low | onion key load 校验 unix 0o600 | 未修复 |
+| AUDIT-AUTH-002.F4/F5/F6 | 🟢 Low | session 覆盖显式 disconnect / tor_password secrecy / connect_peer fallback gossip | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S8)
+## Phase 1 — 下一步建议 (Session S9)
 
-按 SKILL §三选取规则，S8 计划：
+按 SKILL §三选取规则，S9 计划：
 
-1. **AUDIT-AUTH-002** — Peer 身份绑定与 onion service（continues auth dimension）
-2. **AUDIT-MEM-001 / AUDIT-MEM-002** — 资源耗尽 / 数值溢出（与网络层相关，覆盖 NET 主题）
-3. **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期
+1. **AUDIT-MEM-001 / AUDIT-MEM-002** — 资源耗尽 / 数值溢出（与 AUTH-002.F1 同主题，深入资源管理；覆盖 gossip 消息存储 cap、actor mailbox、p2p 连接配额数值）
+2. **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期
+3. **AUDIT-INPUT-002** — Invoice 解析（bech32 / lightning-invoice）
 
 跟进遗留（按优先级）：
 - **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower 多租户 NodeId 冲突 PoC + 修复（高优先级，影响生产部署）
+- **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复（高优先级，低成本攻击）
 - **AUDIT-LOGIC-007-FOLLOWUP-A** — F1+F2+F3 协同 DoS PoC（高优先级，影响协议可用性）
 - **AUDIT-LOGIC-005-FOLLOWUP-A** — MPP 100x 超付 PoC
 - **AUDIT-LOGIC-004-FOLLOWUP-A** — `forward_amount=0` HTLC slot jamming PoC
@@ -386,6 +413,11 @@
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
 - **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce-reuse 动态验证
 - **AUDIT-CRYPTO-002-FOLLOWUP-A** — cross-channel onion replay 动态验证
+
+## Phase 1 — Session 8 已完成
+
+按计划完成：
+- ✅ **AUDIT-AUTH-002** — Peer 身份绑定与 onion service 完整审计（secio + gossip 签名 ✓、inbound eviction、onion service 隐私模式、tor key 权限、session 覆盖、tor_password 明文），发现 F1 Medium（inbound eviction Sybil DoS）+ F2 Medium（隐私模式实现-期望落差）+ F3-F6 Low
 
 ## Phase 1 — Session 7 已完成
 
