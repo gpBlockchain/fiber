@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v1** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 1 完成)
+> 版本: **v2** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 2 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -33,10 +33,11 @@
 
 - **总 TODO 项**: 31
 - ✅ 通过: 0
-- ⚠️ 建议改进: 1 (AUDIT-CRYPTO-003)
+- ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
+- ⚠️ 发现弱设计: 1 (AUDIT-CRYPTO-002 — Sphinx replay / timing)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 28
+- ⏳ 待审计: 26
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -54,13 +55,17 @@
     - [x] 现有测试覆盖：通道重连/重启路径有压力测试但**无对抗性 nonce 复用测试**
   - **发现记录**: 见 [`findings/AUDIT-CRYPTO-001.md`](./findings/AUDIT-CRYPTO-001.md)
 
-- [ ] 🔴 **AUDIT-CRYPTO-002** Sphinx 洋葱包解封与回放保护
-  - **关联代码**: `fiber/path.rs`、`fiber/channel.rs` TLC add 路径、`fiber-sphinx 2.3` 用法
+- [!] 🔴 **AUDIT-CRYPTO-002** Sphinx 洋葱包解封与回放保护 — **Medium × 1, Low × 1, Info × 1**
+  - **关联代码**: `crates/fiber-types/src/onion.rs`, `crates/fiber-lib/src/fiber/channel.rs:1279-1380`, `network.rs:2960-3110`
   - **审计内容**:
-    - HMAC 验证恒定时间
-    - shared secret 唯一性、replay cache 边界
-    - filler 处理
-    - 错误包构造路径上的 oracle 风险
+    - [x] assoc_data 绑定 payment_hash ✓
+    - [x] peel 错误统一映射 `InvalidOnionPayload` ✓ (无 oracle 泄露)
+    - [x] trampoline peel 失败 → `TemporaryNodeFailure` ✓
+    - [x] 错误包反向传播 (`TlcErrPacket::backward`) 符合 spec ✓
+    - [!] **F1 (Medium)**: 缺少应用层 shared-secret / 临时公钥 replay 缓存 (跨通道重放风险)
+    - [!] **F2 (Low)**: `TlcErrPacket::decode` 时间填充在 success/fail 路径不对称、用零密钥
+    - [i] **F3 (Info)**: `fiber-sphinx 2.3` 内部 HMAC 恒定时间、replay 原语需上游审计
+  - **发现记录**: 见 [`findings/AUDIT-CRYPTO-002.md`](./findings/AUDIT-CRYPTO-002.md)
 
 - [⚠️] 🔴 **AUDIT-CRYPTO-003** 钱包私钥加密/解密 — **多项建议改进**
   - **关联代码**: `crates/fiber-lib/src/utils/encrypt_decrypt_file.rs`、`crates/fiber-lib/src/ckb/config.rs:114-146` (`read_secret_key`)、`crates/fiber-lib/src/fiber/key.rs` (P2P key, **明文落盘**)
@@ -95,7 +100,18 @@
 
 ## 第 3 章 DIM-INPUT / DIM-SERDE 输入与反序列化
 
-- [ ] 🔴 **AUDIT-INPUT-001** P2P 消息解析 (Molecule) 抗畸形
+- [~] 🔴 **AUDIT-INPUT-001** P2P 消息解析 (Molecule) 抗畸形 — **Low × 1, Improvement × 3; 大部分通过**
+  - **关联代码**: `crates/fiber-lib/src/fiber/types.rs:933`, `network.rs:126`, `gossip.rs:3123`
+  - **审计内容**:
+    - [x] 帧上限 130 KB 在 tentacle 层强制 ✓
+    - [x] Molecule `from_slice` 内部长度校验稳健 ✓
+    - [x] Onion hop_data 长度头 (`checked_add`/`try_from`) ✓
+    - [x] 现有 9 个 fuzz 目标覆盖：fiber/gossip 消息、TlcErr、Pubkey、Cursor、HopData、Sphinx packet、Invoice、Bincode store ✓
+    - [!] **Low**: `MAX_SERVICE_PROTOCOAL_DATA_SIZE` 常量拼写错误 (cosmetic)
+    - [⚠️] **Improvement A**: `fuzz_molecule_types` 仅覆盖 4/~17 个 fiber/gossip 子类型的二阶 TryFrom
+    - [⚠️] **Improvement B**: CI 中缺少 weekly fuzz cron / OSS-Fuzz 集成
+    - [⚠️] **Improvement C**: 缺少 `TlcErrPacket::decode` / store migration / RPC JSON 参数的 fuzz 目标
+  - **发现记录**: 见 [`findings/AUDIT-INPUT-001.md`](./findings/AUDIT-INPUT-001.md)
 - [ ] 🔴 **AUDIT-INPUT-002** Invoice 解析 (bech32 / lightning-invoice)
 - [ ] 🟠 **AUDIT-INPUT-003** JSON-RPC 参数校验
 - [ ] 🟠 **AUDIT-INPUT-004** 存储反序列化 (bincode) 与迁移
@@ -147,6 +163,8 @@
 | 2026-05-13 | S1 | AUDIT-CRYPTO-001 | MuSig2 nonce 纯确定性派生，缺少 message/agg-pubkey/随机熵混合；存在与不同 message 重复签名场景下泄露 funding key 的设计性风险 | [?] 疑似 H/Critical — 需动态验证 |
 | 2026-05-13 | S1 | AUDIT-CRYPTO-003 | 钱包加密文件 VERSION 字段未校验；缺少长度检查触发 panic；`fs::read().unwrap()` 不优雅；无 zeroize；P2P 节点密钥 (`fiber/key.rs`) 仍明文落盘 | [!] Medium × 2，Low × 3 |
 | 2026-05-13 | S1 | AUDIT-DEP-001 | 12 个高敏依赖经 GitHub Advisory DB 检查无已知 CVE | [i] 信息性 |
+| 2026-05-13 | S2 | AUDIT-CRYPTO-002 | Sphinx peel 主路径稳健 (assoc_data ✓, 错误码统一 ✓)；但缺少 shared-secret 跨通道 replay 去重；`TlcErrPacket::decode` 时间填充实现不完美 | [!] Medium × 1, Low × 1, Info × 1 |
+| 2026-05-13 | S2 | AUDIT-INPUT-001 | 现有 9 个 fuzz 目标覆盖广泛；二阶 TryFrom 子类型 fuzz 较浅；CI 未集成定期 fuzz | [~] Low × 1, Improvement × 3 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -156,6 +174,12 @@
 | 2026-05-13 | AUDIT-CRYPTO-001-FOLLOWUP-B | S1 / AUDIT-CRYPTO-001 | 需评估 `get_or_create_local_channel_announcement_signature` 缓存逻辑：缓存 invalidation 时是否可在不同 `message_to_sign` 下复用同一 secnonce |
 | 2026-05-13 | AUDIT-CRYPTO-003-FOLLOWUP-A | S1 / AUDIT-CRYPTO-003 | `fiber/key.rs::KeyPair` (P2P node identity key) 明文落盘 — 评估是否纳入加密路径 |
 | 2026-05-13 | AUDIT-INPUT-006 | S1 / AUDIT-CRYPTO-003 | 钱包加密文件存在 panic 路径 (decrypt_from_file)；归入 DIM-INPUT/DIM-SERDE 同时审查所有 `fs::read().unwrap()` |
+| 2026-05-13 | AUDIT-CRYPTO-002-FOLLOWUP-A | S2 / AUDIT-CRYPTO-002 | 动态验证 — 控制双 peer，向本节点的两条入站通道发送相同 onion，观察是否被分别处理（cross-channel replay oracle） |
+| 2026-05-13 | AUDIT-CRYPTO-002-FOLLOWUP-B | S2 / AUDIT-CRYPTO-002 | 单独立项审计 `fiber-sphinx 2.3` 上游源码：HMAC 比较恒定时间、replay 原语、`xor_cipher_stream(zero_key)` 是否被编译器优化 |
+| 2026-05-13 | AUDIT-CRYPTO-002-FOLLOWUP-C | S2 / AUDIT-CRYPTO-002 | 新增 fuzz 目标 `fuzz_tlc_err_packet_decode`（输入：onion_packet 字节 + session_key + hops） |
+| 2026-05-13 | AUDIT-INPUT-001-FOLLOWUP-A | S2 / AUDIT-INPUT-001 | 扩展 `fuzz_molecule_types` 覆盖剩余 ~13 个 fiber/gossip 子类型的二阶 TryFrom |
+| 2026-05-13 | AUDIT-INPUT-001-FOLLOWUP-B | S2 / AUDIT-INPUT-001 | CI 中集成 weekly fuzz cron 或采纳 OSS-Fuzz / ClusterFuzzLite |
+| 2026-05-13 | AUDIT-INPUT-001-FOLLOWUP-C | S2 / AUDIT-INPUT-001 | 新增 fuzz 目标：store 跨版本迁移、RPC JSON-RPC 参数 |
 
 ## 附录 C：修复建议
 
@@ -168,16 +192,27 @@
 | AUDIT-CRYPTO-003.d | 🟢 Low | 引入 `zeroize` crate；将 scrypt 输出、解密后明文、密码字节包装为 `Zeroizing<Vec<u8>>` | 未修复 |
 | AUDIT-CRYPTO-003.e | 🟡 Medium (设计) | 评估 P2P 身份密钥 `fiber/key.rs::KeyPair` 是否应同样加密保存 | 未修复 |
 | AUDIT-DEP-001 | 🟢 Low | 在 CI 中加入 `cargo audit` 或 `cargo deny advisories` 步骤；建议在 PR 标签或 weekly cron 触发 | 未实施 |
+| AUDIT-CRYPTO-002.F1 | 🟡 Medium | 增加 `seen_onion_ephemeral_keys: LruCache<PublicKey, Instant>` 跨通道 replay 去重；命中返回 `InvalidOnionPayload` | 未修复 |
+| AUDIT-CRYPTO-002.F2 | 🟢 Low | 重写 `TlcErrPacket::decode` 填充：success/fail 对称、用非零密钥、`subtle` 恒定时间原语；硬上限 path_hops ≤ 27 | 未修复 |
+| AUDIT-INPUT-001.Low | 🟢 Low | 重命名 `MAX_SERVICE_PROTOCOAL_DATA_SIZE` → `MAX_SERVICE_PROTOCOL_DATA_SIZE` | 未修复 |
+| AUDIT-INPUT-001.Improvement | ⚠️ | 扩展 `fuzz_molecule_types` + CI weekly fuzz cron + 新增三个 fuzz 目标 | 未实施 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S2)
+## Phase 1 — 下一步建议 (Session S3)
 
-按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据）：
+按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S3 计划：
 
-1. **AUDIT-CRYPTO-002** — Sphinx 洋葱包解封与回放保护
-2. **AUDIT-INPUT-001** — P2P Molecule 消息抗畸形 (与 fuzz harness 覆盖度评估并行)
+1. **AUDIT-LOGIC-001** — 通道状态机非法转移（State 枚举与 `handle_*` 路径）
+2. **AUDIT-LOGIC-003** — Commitment 序号 & revocation key（旧 commitment 重放、watchtower 通知漏失）
 
-同时跟进 S1 遗留：
-- **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — 动态验证 nonce 复用攻击是否可达
-- 与 fiber 维护者确认 musig2 nonce 设计的预期与已知论证
+同时跟进 S1/S2 遗留：
+- **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — 动态验证 MuSig2 nonce-reuse 是否可达；与 fiber 维护者确认设计
+- **AUDIT-CRYPTO-002-FOLLOWUP-A** — 动态验证 cross-channel onion replay 是否可达
+- **AUDIT-CRYPTO-002-FOLLOWUP-B** — 单独立项审计 `fiber-sphinx 2.3` 上游源码
+
+## Phase 1 — Session 2 已完成
+
+按计划完成：
+- ✅ **AUDIT-CRYPTO-002** — Sphinx 洋葱包解封与回放保护
+- ✅ **AUDIT-INPUT-001** — P2P Molecule 消息抗畸形 + fuzz 覆盖度评估

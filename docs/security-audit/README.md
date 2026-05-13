@@ -18,18 +18,19 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 3. **Phase 2** — Doc updates after every session (status, findings, new attack-surface items).
 4. **Phase 3** — Final report.
 
-## Status (TODO v1, 2026-05-13)
+## Status (TODO v2, 2026-05-13)
 
 | Bucket | Count |
 |---|---|
 | Total TODO items | 31 |
 | ✅ Passed | 0 |
-| ⚠️ Advisory (improvement suggested) | 1 (AUDIT-CRYPTO-003) |
+| ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
+| ⚠️ Weak design | 1 (AUDIT-CRYPTO-002 — Sphinx replay / timing) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001 — no known CVE in surveyed deps) |
-| ⏳ Pending | 28 |
+| ⏳ Pending | 26 |
 
-## Next session (S2) — planned
+## Next session (S3) — planned
 
-- AUDIT-CRYPTO-002 — Sphinx onion decrypt & replay protection
-- AUDIT-INPUT-001 — Molecule P2P message parsing (assess fuzz coverage)
+- AUDIT-LOGIC-001 — Channel state-machine illegal transitions
+- AUDIT-LOGIC-003 — Commitment number & revocation key
