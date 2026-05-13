@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v2** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 2 完成)
+> 版本: **v3** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 3 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 1 (AUDIT-CRYPTO-002 — Sphinx replay / timing)
+- ⚠️ 发现弱设计: 3 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001, AUDIT-LOGIC-003)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 26
+- ⏳ 待审计: 24
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -90,9 +90,31 @@
 
 ## 第 2 章 DIM-LOGIC 业务逻辑 / 状态机
 
-- [ ] 🔴 **AUDIT-LOGIC-001** 通道状态机非法转移
+- [~] 🔴 **AUDIT-LOGIC-001** 通道状态机非法转移 — **Medium × 1, Low × 3, Info × 2; 大量 Pass**
+  - **关联代码**: `crates/fiber-types/src/channel.rs:236-298`, `crates/fiber-lib/src/fiber/channel.rs:448-828`
+  - **审计内容**: 17 种 P2P 消息的 (状态 × 消息) 矩阵
+  - **审计内容**:
+    - [x] `CommitmentSigned` / `Shutdown` / `AcceptChannel` / `ReestablishChannel` 守卫完整 ✓
+    - [x] `check_for_tlc_update` 集中校验 TLC 操作 ✓
+    - [x] Reestablishing 时正确门控非 reestablish 消息 ✓
+    - [!] **F4 (Medium)**: `UpdateTlcInfo` 完全无状态守卫 (channel.rs:755-759) — 任意状态下污染 `remote_tlc_info` + 网络图
+    - [!] **F1/F2/F5/F6 (Low × 4)**: `TxSignatures` / `AnnouncementSignatures` / `ClosingSigned` / `TxAbort` 缺少显式状态匹配或静默忽略
+    - [i] **F3/F7 (Info × 2)**: `RevokeAndAck` 缺显式状态匹配；reestablishing 期间静默丢弃消息无限速
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-001.md`](./findings/AUDIT-LOGIC-001.md)
 - [ ] 🔴 **AUDIT-LOGIC-002** TLC / PTLC 生命周期与时间锁
-- [ ] 🔴 **AUDIT-LOGIC-003** Commitment 序号 & revocation key
+- [!] 🔴 **AUDIT-LOGIC-003** Commitment 序号 & revocation key — **Medium × 3, Low × 2; 协议层 Pass**
+  - **关联代码**: `crates/fiber-types/src/channel.rs:308-346`, `channel.rs:5524-5640, 6841-6937, 7270-7407, 7409-7587`, `watchtower/actor.rs:230-330`
+  - **审计内容**:
+    - [x] 序号增长对称性 (6 个 increment 点全部分析) ✓
+    - [x] `reestablish` 边界 `abs_diff <= 1` ✓
+    - [x] `last_revoke_ack_msg` 缓存重发避免 nonce 复用 ✓
+    - [x] revocation_data 通知链路 (actor → event → watchtower) ✓
+    - [!] **F3 (Medium)**: watchtower `lock_args[28..36]` 缺长度检查 → 协作关闭 close_script 短 args 可触发 panic-DoS，注释 `"checked length"` 误导
+    - [!] **F6 (Medium)**: watchtower revocation_data 仅存最新一轮，覆盖式写入 — 若链上 commitment-lock 合约绑定 commitment_number，peer 选择性上链更早旧 commitment 可能逃避惩罚
+    - [!] **F1 (Medium)**: `CommitmentNumbers::increment_*` 用裸 `+= 1` 无溢出检查
+    - [!] **F2 (Low)**: `get_*_commitment_number() - 1` 用裸 `-1`，当前路径不可达但缺防御
+    - [!] **F4 (Low)**: watchtower 只查询最新 1 笔 tx，无 confirmation 阈值/历史去重
+  - **发现记录**: 见 [`findings/AUDIT-LOGIC-003.md`](./findings/AUDIT-LOGIC-003.md)
 - [ ] 🟠 **AUDIT-LOGIC-004** 多跳支付转发金额/费用一致性
 - [ ] 🟠 **AUDIT-LOGIC-005** MPP / Trampoline 拆分一致性
 - [ ] 🟠 **AUDIT-LOGIC-006** Watchtower 反应路径
@@ -165,6 +187,8 @@
 | 2026-05-13 | S1 | AUDIT-DEP-001 | 12 个高敏依赖经 GitHub Advisory DB 检查无已知 CVE | [i] 信息性 |
 | 2026-05-13 | S2 | AUDIT-CRYPTO-002 | Sphinx peel 主路径稳健 (assoc_data ✓, 错误码统一 ✓)；但缺少 shared-secret 跨通道 replay 去重；`TlcErrPacket::decode` 时间填充实现不完美 | [!] Medium × 1, Low × 1, Info × 1 |
 | 2026-05-13 | S2 | AUDIT-INPUT-001 | 现有 9 个 fuzz 目标覆盖广泛；二阶 TryFrom 子类型 fuzz 较浅；CI 未集成定期 fuzz | [~] Low × 1, Improvement × 3 |
+| 2026-05-13 | S3 | AUDIT-LOGIC-001 | 17 种 P2P 消息状态守卫矩阵 — 大部分有显式 match；`UpdateTlcInfo` 完全无状态守卫；4 处缺少显式状态匹配；Reestablishing 期间静默丢弃无限速 | [~] Medium × 1, Low × 4, Info × 2 |
+| 2026-05-13 | S3 | AUDIT-LOGIC-003 | Commitment 序号管理协议层严谨；watchtower 层有两个 Medium：`lock_args[28..36]` 缺长度检查 (panic-DoS)、revocation_data 覆盖式存储可能无法惩罚选择性上链 | [!] Medium × 3, Low × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -180,6 +204,9 @@
 | 2026-05-13 | AUDIT-INPUT-001-FOLLOWUP-A | S2 / AUDIT-INPUT-001 | 扩展 `fuzz_molecule_types` 覆盖剩余 ~13 个 fiber/gossip 子类型的二阶 TryFrom |
 | 2026-05-13 | AUDIT-INPUT-001-FOLLOWUP-B | S2 / AUDIT-INPUT-001 | CI 中集成 weekly fuzz cron 或采纳 OSS-Fuzz / ClusterFuzzLite |
 | 2026-05-13 | AUDIT-INPUT-001-FOLLOWUP-C | S2 / AUDIT-INPUT-001 | 新增 fuzz 目标：store 跨版本迁移、RPC JSON-RPC 参数 |
+| 2026-05-13 | AUDIT-LOGIC-003-FOLLOWUP-A | S3 / AUDIT-LOGIC-003 | **动态验证** — 检查链上 commitment-lock 合约源码 ([fiber-scripts](https://github.com/nervosnetwork/fiber-scripts))：lock_args 中 commitment_number 是否与 witness 中 commitment_number 做绑定比对，决定 F6 是否成立 |
+| 2026-05-13 | AUDIT-LOGIC-003-FOLLOWUP-B | S3 / AUDIT-LOGIC-003 | **PoC** — 构造 peer 在协作关闭中提供 < 36 字节 `close_script.args`，观测受害方 watchtower 是否 panic |
+| 2026-05-13 | AUDIT-LOGIC-001-FOLLOWUP-A | S3 / AUDIT-LOGIC-001 | **PoC** — `UpdateTlcInfo` 在 `NegotiatingFunding` / `Closed` 状态下发送，验证 `remote_tlc_info` / 网络图是否被污染 |
 
 ## 附录 C：修复建议
 
@@ -196,20 +223,35 @@
 | AUDIT-CRYPTO-002.F2 | 🟢 Low | 重写 `TlcErrPacket::decode` 填充：success/fail 对称、用非零密钥、`subtle` 恒定时间原语；硬上限 path_hops ≤ 27 | 未修复 |
 | AUDIT-INPUT-001.Low | 🟢 Low | 重命名 `MAX_SERVICE_PROTOCOAL_DATA_SIZE` → `MAX_SERVICE_PROTOCOL_DATA_SIZE` | 未修复 |
 | AUDIT-INPUT-001.Improvement | ⚠️ | 扩展 `fuzz_molecule_types` + CI weekly fuzz cron + 新增三个 fuzz 目标 | 未实施 |
+| AUDIT-LOGIC-001.F4 | 🟡 Medium | `UpdateTlcInfo` 增加 `ChannelState::ChannelReady`/`ShuttingDown` 守卫 + 版本号防重 | 未修复 |
+| AUDIT-LOGIC-001.F1/F2/F5/F6 | 🟢 Low | `TxSignatures` / `AnnouncementSignatures` / `ClosingSigned` / `TxAbort` 增加显式状态匹配；`AnnouncementSignatures` 完成签名验证 TODO | 未修复 |
+| AUDIT-LOGIC-003.F3 | 🟡 Medium | watchtower 在 `lock_args[28..36]` 切片前显式 `if lock_args.len() < 36 { continue }`；修正注释 | 未修复 |
+| AUDIT-LOGIC-003.F6 | 🟡 Medium | watchtower `revocation_data` 改为 `BTreeMap<commitment_number, RevocationData>`，按链上 commitment_number 精确查找 | 未修复 (待动态验证链上脚本) |
+| AUDIT-LOGIC-003.F1 | 🟡 Medium | `CommitmentNumbers::increment_*` 改为 `checked_add(1)`；溢出时强制 close 通道 | 未修复 |
+| AUDIT-LOGIC-003.F2 | 🟢 Low | `get_*_commitment_number() - 1` 改为 `checked_sub(1).ok_or(InvalidState)?` | 未修复 |
+| AUDIT-LOGIC-003.F4 | 🟢 Low | watchtower 添加 confirmation 阈值 + 历史 tx 去重缓存 | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S3)
+## Phase 1 — 下一步建议 (Session S4)
 
-按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S3 计划：
+按 SKILL §三选取规则（P0 > P1；底层 > 上层；外部输入 > 内部；资金/密钥 > 数据），S4 计划：
 
-1. **AUDIT-LOGIC-001** — 通道状态机非法转移（State 枚举与 `handle_*` 路径）
-2. **AUDIT-LOGIC-003** — Commitment 序号 & revocation key（旧 commitment 重放、watchtower 通知漏失）
+1. **AUDIT-LOGIC-002** — TLC / PTLC 生命周期与时间锁（HTLC timeout、相对/绝对锁定、过期处理）
+2. **AUDIT-LOGIC-006** — Watchtower 反应路径（补 S3 watchtower 审计的剩余面：preimage 监控、settle 路径、HTLC-success/timeout 交易）
 
-同时跟进 S1/S2 遗留：
-- **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — 动态验证 MuSig2 nonce-reuse 是否可达；与 fiber 维护者确认设计
-- **AUDIT-CRYPTO-002-FOLLOWUP-A** — 动态验证 cross-channel onion replay 是否可达
-- **AUDIT-CRYPTO-002-FOLLOWUP-B** — 单独立项审计 `fiber-sphinx 2.3` 上游源码
+同时跟进遗留：
+- **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计（决定 F6 是否成立）
+- **AUDIT-LOGIC-003-FOLLOWUP-B** / **AUDIT-LOGIC-001-FOLLOWUP-A** — PoC 验证 panic-DoS / 网络图污染
+- **AUDIT-CRYPTO-001-FOLLOWUP-A/B** — MuSig2 nonce 复用动态验证
+- **AUDIT-CRYPTO-002-FOLLOWUP-A** — cross-channel onion replay 动态验证
+- **AUDIT-CRYPTO-002-FOLLOWUP-B** — `fiber-sphinx 2.3` 上游源码审计
+
+## Phase 1 — Session 3 已完成
+
+按计划完成：
+- ✅ **AUDIT-LOGIC-001** — 通道状态机非法转移（17 种消息状态守卫矩阵）
+- ✅ **AUDIT-LOGIC-003** — Commitment 序号 & revocation key（含 watchtower 链上反应路径）
 
 ## Phase 1 — Session 2 已完成
 
