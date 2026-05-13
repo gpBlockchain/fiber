@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v9** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 9 完成)
+> 版本: **v10** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 10 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 11 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001)
+- ⚠️ 发现弱设计: 12 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..007, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 17
+- ⏳ 待审计: 16
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -259,7 +259,20 @@
     - [i] **F8 (Pass)**: NodeAnnouncement 在 `announce_private_addr=false` 时拒收私网-only address
   - **最严重场景 (F1)**: 攻击者建立 inbound 连接（配合 AUTH-002.F1 控制 16 槽位），通过 `BroadcastMessagesFilterResult` 持续推送伪造 `ChannelUpdate`（随机签名 + 不存在的 channel_outpoint）。每帧 130 KB 携带 1000 条 broadcast，`insert_message_to_be_saved_list` 不验签直接入 HashSet。`prune` 不清理（依赖未到位），`spawn_query_tasks` saturate 后停止 remove。50 MB/s RAM 增长，分钟级 OOM；与 AUTH-001.F1 (watchtower 多租户) 协同：受害节点 OOM 时错过 revocation 信号 → cheat 成功
   - **发现记录**: 见 [`findings/AUDIT-MEM-001.md`](./findings/AUDIT-MEM-001.md)
-- [ ] 🟠 **AUDIT-MEM-002** 金额 / 费用 / 高度数值溢出
+- [!] 🟠 **AUDIT-MEM-002** 数值溢出与边界 — **整体 Medium / Low × 3 + Info × 2 + Pass × 4**
+  - **关联代码**: `crates/fiber-lib/src/fiber/fee.rs:115-135` (`calculate_fee_with_base`), `fee.rs:188` (`commitment_fee * 2 未检查`), `channel.rs:5518` (`get_liquid_capacity 未检查 +`), `channel.rs:6425-6450` (`check_tlc_limits .fold 未 checked_add`), `channel.rs:8266-8272` (`build_settlement_data 链式 +/-未检查`), `channel.rs:5320-5329` (`available_max_fee u128 as u64 截断`), `channel.rs:5824-5849` (`apply_remove_tlc checked_* 典范`), `channel.rs:4408-4413` (`funding_amount < u64::MAX cap`), `channel.rs:6410-6411` (`add_amount==0 拒绝`), `payment.rs:196`, `graph.rs:1538,1543,1984`, `types.rs:2070` (含 u64::MAX overflow 单元测试), `settle_tlc_set_command.rs:174` (`MPP saturating_add`), `network.rs:177-253` (`retry/backoff saturating_*`)
+  - **审计内容**:
+    - [!] **F1 (Low)**: `channel.rs:6425-6431 / 6444-6450 check_tlc_limits` 内 `.fold(0_u128, |sum, tlc| sum + tlc.amount) + add_amount` 使用 unchecked u128 累加。当用户配置 `max_tlc_value_in_flight < u128::MAX` 时理论上可 wrap → 绕过 limit；默认 `u128::MAX` 时无业务后果。属"depth in defense"缺口。
+    - [!] **F2 (Low)**: `channel.rs:8266-8272 build_settlement_data` 链式 `to_local_amount + received_fulfilled - offered_pending - offered_fulfilled` 4 个加减全部未 checked，release 下静默 wrap。依赖状态机不变式；与状态机 bug 协同可产生异常 settlement output；对端可能利用差异化拒绝（force-close 路径）。最有价值的修复：改造成与 `apply_remove_tlc:5824-5849 checked_*` 风格一致。
+    - [!] **F3 (Low)**: F3a `fee.rs:188 commitment_fee * 2 > reserved_fee` u64 unchecked mul，攻击者可设 `commitment_fee_rate = u64::MAX` 触发 wrap → 接受异常 fee_rate → 后续 commitment_tx 上链失败 (DoS / channel-stuck)；F3b `channel.rs:5324 self.to_local_amount as u64` 静默截断高 64 位，依赖 line 4408 的 funding < u64::MAX 不变式。
+    - [i] **F4 (Info)**: `channel.rs:5824-5849 apply_remove_tlc` 注释明确"double confirm everything is correct with checked_* methods" 是正面典范。
+    - [i] **F5 (Info)**: `channel.rs:4408 get_funding_and_reserved_amount` 显式拒绝 `total_amount >= u64::MAX` for native CKB，保证 u128→u64 截断安全。
+    - [✓] **F6 (Pass)**: payment/graph/onion 输入 checked_add 完整 — `payment.rs:196`, `graph.rs:1538,1543,1984`, `types.rs:2070` (含 `test_unpack_hop_data_v0_u64_max_overflow` 单元测试)。
+    - [✓] **F7 (Pass)**: 时间戳与指数退避 saturating — `network.rs:177-253 funding_retry_delay / compute_peer_reconnect_delay` shift cap + saturating/checked_mul + min(MAX)。
+    - [✓] **F8 (Pass)**: MPP `settle_tlc_set_command.rs:174 accumulated_amount.saturating_add`。
+    - [✓] **F9 (Pass)**: `channel.rs:6410 check_tlc_limits` 显式拒绝 `add_amount == 0`。
+  - **总体评价**: 与 MEM-001 形成鲜明对比 —— 数值算术整体**接近正确**。`apply_remove_tlc` 注释清楚说明 "deep defense" 意图；HopData 解析甚至有针对 u64::MAX overflow 的专门单元测试。3 个 Low 均属 "defense-in-depth" 缺口，实际触发需要前置状态机 bug。
+  - **发现记录**: 见 [`findings/AUDIT-MEM-002.md`](./findings/AUDIT-MEM-002.md)
 - [ ] 🟡 **AUDIT-MEM-003** Actor mailbox 阻塞
 
 ## 第 6 章 DIM-ERRINFO 错误信息与隐私
@@ -308,6 +321,7 @@
 | 2026-05-13 | S7 | AUDIT-AUTH-001 | biscuit ed25519/撤销/时间机制健壮；F1 High: standalone watchtower `enable_auth=false` 时所有客户端共享 NodeId::local() 空命名空间，攻击者可覆盖受害者 revocation_data；F2/F3 Medium: middleware fail-open + CORS Any | [!] High × 1, Medium × 2, Low × 5, Pass × 2 |
 | 2026-05-13 | S8 | AUDIT-AUTH-002 | secio + gossip 签名验证完整；F1 Medium: inbound 驱逐顺序倒置(踢老留新)→ Sybil eviction DoS；F2 Medium: `listen_on_onion=true` 仍开明文 TCP 监听，隐私模式失效；F3-F6 Low: tor key 权限/session 覆盖/tor_password 明文/connect_peer 不查 gossip | [!] Medium × 2, Low × 4, Pass × 4 |
 | 2026-05-13 | S9 | AUDIT-MEM-001 | F1 High: gossip `messages_to_be_saved` 入存不验签 + 无 per-peer 上限 + prune 不清理孤儿消息 → 50 MB/s RAM 增长可分钟级 OOM；F2 Medium: ractor mailbox unbounded + 入站无 rate-limit；F3 Medium: spawn_query_tasks 内 incomplete_messages 完整 clone × 10 放大 F1；F4-F6 Low: TLC_VALUE_IN_FLIGHT=u128::MAX / 单帧 1000 broadcasts / prune 无 TTL；F7-F8 Pass: ToBeAcceptedChannels 限额、NodeAnnouncement 私网过滤 | [!] High × 1, Medium × 2, Low × 3, Pass × 2 |
+| 2026-05-13 | S10 | AUDIT-MEM-002 | 整体 Medium，数值算术接近正确：F1 Low: check_tlc_limits fold 未 checked_add (max_tlc_value_in_flight 默认 u128::MAX 时无后果)；F2 Low: build_settlement_data 链式 +/- 未 checked，依赖状态机不变式 (force-close 路径最有价值修复)；F3 Low: commitment_fee*2 未 checked_mul / u128 as u64 截断；F4 Info: apply_remove_tlc checked_* 正面典范；F5 Info: funding < u64::MAX 显式 cap；F6-F9 Pass: payment/graph/onion checked_add 完整、retry/backoff saturating、MPP saturating_add、add_amount==0 拒绝 | [!] Low × 3, Info × 2, Pass × 4 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -360,6 +374,10 @@
 | 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-C | S9 / AUDIT-MEM-001 | F3 Medium: `spawn_query_tasks` 内 truncate `incomplete_messages` 上限；query 响应回灌前验签 |
 | 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-D | S9 / AUDIT-MEM-001 | F4 Low: 重设 `DEFAULT_MAX_TLC_VALUE_IN_FLIGHT` 为 channel capacity 比例；文档强制配置 |
 | 2026-05-13 | AUDIT-MEM-001-FOLLOWUP-E | S9 / AUDIT-MEM-001 | F5+F6 Low: 调小 `MAX_NUM_OF_BROADCAST_MESSAGES` (1000→100/200)；prune 增加 TTL 字段清理永不完成消息 |
+| 2026-05-13 | AUDIT-MEM-002-FOLLOWUP-A | S10 / AUDIT-MEM-002 | F1 Low: `check_tlc_limits` fold 改 `try_fold` + `checked_add`，与 `apply_remove_tlc` 风格一致 |
+| 2026-05-13 | AUDIT-MEM-002-FOLLOWUP-B | S10 / AUDIT-MEM-002 | **最有价值修复** — F2 Low: `build_settlement_data` 链式 +/- 拆分为分步 `checked_*` + 返回 `InternalError` (force-close 路径) |
+| 2026-05-13 | AUDIT-MEM-002-FOLLOWUP-C | S10 / AUDIT-MEM-002 | F3 Low: `fee.rs:188 commitment_fee.checked_mul(2)`；`channel.rs:5324 u64::try_from(to_local_amount)` 替代 `as u64` |
+| 2026-05-13 | AUDIT-MEM-002-FOLLOWUP-D | S10 / AUDIT-MEM-002 | (维护) 评估在 release profile 启用 `overflow-checks = true`，权衡性能代价 ~5% 与消除静默 wrap 风险 |
 
 ## 附录 C：修复建议
 
@@ -413,25 +431,32 @@
 | AUDIT-MEM-001.F1 | 🟠 High | gossip `messages_to_be_saved` 入存验签 + per-peer 上限 | 未修复 |
 | AUDIT-MEM-001.F2/F3 | 🟡 Medium | mailbox/incoming-rate 限制；spawn_query_tasks truncate + 验签 | 未修复 |
 | AUDIT-MEM-001.F4/F5/F6 | 🟢 Low | TLC_VALUE_IN_FLIGHT 默认 / 单帧 broadcast 数 / prune TTL | 未修复 |
+| AUDIT-MEM-002.F1/F2/F3 | 🟢 Low | check_tlc_limits fold checked_add / build_settlement_data checked_* / commitment_fee*2 checked_mul + u128→u64 try_from | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S10)
+## Phase 1 — 下一步建议 (Session S11)
 
-按 SKILL §三选取规则，S10 计划：
+按 SKILL §三选取规则，S11 计划：
 
-1. **AUDIT-MEM-002** — 数值溢出与边界（承接 MEM-001 资源管理主题；覆盖 fee 计算、HTLC amount + capacity、channel_state 状态机数值）
-2. **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期
-3. **AUDIT-INPUT-002** — Invoice 解析（bech32 / lightning-invoice）
+1. **AUDIT-LOGIC-008** — CCH 跨链 HTLC 依赖与到期（剩余 LOGIC 章节）
+2. **AUDIT-INPUT-002** — Invoice 解析（bech32 / lightning-invoice）
+3. **AUDIT-ERR-001** — 支付错误码与 payment probing
 
 跟进遗留（按优先级）：
 - **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复（最高优先级，远程零成本 OOM 攻击链关键节点）
 - **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower 多租户 NodeId 冲突 PoC + 修复
 - **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复
 - **AUDIT-LOGIC-007-FOLLOWUP-A** — 协同 DoS PoC
+- **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造（局部、低风险、高价值）
 - **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 10 已完成
+
+按计划完成：
+- ✅ **AUDIT-MEM-002** — 数值溢出与边界审计（fee 计算、HTLC amount、capacity、状态机数值），发现 F1-F3 Low（防御深度缺口）+ F4-F5 Info + F6-F9 Pass。整体评价：与 MEM-001 形成鲜明对比，数值算术整体接近正确（`apply_remove_tlc` checked_* 是典范，HopData 解析有 u64::MAX overflow 单元测试）。
 
 ## Phase 1 — Session 9 已完成
 
