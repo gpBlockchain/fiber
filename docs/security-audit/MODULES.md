@@ -1,6 +1,6 @@
 # Fiber Network Node — 模块关系图（安全审计视角）
 
-> 版本: **v2** | 最后更新: 2026-05-14 (S28) | 配套文档: [`SECURITY_AUDIT_TODO.md`](./SECURITY_AUDIT_TODO.md), [`REPORT.md`](./REPORT.md)
+> 版本: **v3** | 最后更新: 2026-05-14 (S29) | 配套文档: [`SECURITY_AUDIT_TODO.md`](./SECURITY_AUDIT_TODO.md), [`REPORT.md`](./REPORT.md)
 
 ## 0. 文档目的
 
@@ -8,7 +8,7 @@
 
 1. 给出 9 个 crates / 8 个核心子模块的**职责分工**与**调用方向**；
 2. 在每条跨模块边上标注**信任级别**（攻击者控制度）、**关键序列化格式**、**actor 通信类型**；
-3. 给所有已发现的 XMOD-001..011 跨模块攻击链**画出明确的连通边**，便于回归测试规划。
+3. 给所有已发现的 XMOD-001..016 跨模块攻击链**画出明确的连通边**，便于回归测试规划。
 
 > **范围**：本文聚焦"攻击面图"，不重复每个 finding 的细节（细节看 `findings/AUDIT-*.md`）。
 
@@ -187,6 +187,8 @@
 | **XMOD-012** | E2 (final-hop) + payment 错误码透传 | invoice ↔ channel ↔ payment | final-hop 错误码与 BOLT-04 偏离 → probing oracle |
 | **XMOD-013** | E10 + 内部 signer + E8 | bin ↔ env ↔ key ↔ store ↔ ckb signer | 凭据生命周期跨 5 模块；env/内存/磁盘 3 个泄露面 |
 | **XMOD-014** | E9 + 隐式跨 tab 边 | wasm-db ↔ store ↔ channel | 多 tab 双签 → 资金罚没 |
+| **XMOD-015** | I5/I8 + E6 + 4-confs 常量 | network ↔ ckb/tx_tracing ↔ channel ↔ watchtower ↔ store | `CKB_TX_TRACING_CONFIRMATIONS=4` + 无 reorg rollback → funding/closing reorg-out 资金 brick |
+| **XMOD-016** | onion_service ↔ network ↔ O1/E5 | onion_service ↔ network ↔ gossip ↔ rpc | `announced_addrs` 合并 clearnet+onion → NodeAnnouncement 全网广播签名身份与 clearnet IP 关联 |
 
 ---
 
@@ -211,6 +213,8 @@
 | **INV-13** | final-hop 错误响应必须与 BOLT-04 对齐，统一返回 `IncorrectOrUnknownPaymentDetails`，不暴露 invoice 状态分支 | E2 final-hop | ❌ XMOD-012 |
 | **INV-14** | 钱包凭据（env / 内存 / 磁盘）全生命周期受保护：env 启动后清空 / `Privkey` Zeroize on Drop / DB 0o600 / dumpable=0 | E8 + E10 + 全内核 | ❌ XMOD-013 |
 | **INV-15** | 浏览器场景下同一 wallet 在同一时刻仅允许一个 tab 持有写权限（Web Locks + commitment_number 回退检测） | E9 + I 跨 tab 边 | ❌ XMOD-014 |
+| **INV-16** | CKB tx 确认必须有"reorg rollback 反向事件"——funding/closing/settlement 任一在 ≥N 块 reorg 后必须能撤销 channel 状态机的对应推进；confs 阈值应足够深（≥ 1 量级于 LN 主网经验） | I5, I8 + tx_tracing 出站 | ❌ XMOD-015 |
+| **INV-17** | 启用 onion service 隐私模式时，节点的广播身份（NodeAnnouncement）与 RPC 公开身份（`node_info`）不得泄露 clearnet IP；地址类型需在编译期分流 | onion_service + O1/E5 | ❌ XMOD-016 |
 
 ---
 
@@ -234,6 +238,8 @@
 - INV-13 ↔ ERR-001 + AUDIT-XMOD-012（新发现）
 - INV-14 ↔ CRYPTO-003 + STORE-001 + AUDIT-XMOD-013（新发现）
 - INV-15 ↔ WASM-001/002 + STORE-001 + AUDIT-XMOD-014（新发现）
+- INV-16 ↔ LOGIC-003 + AUDIT-XMOD-006 + AUDIT-XMOD-015（新发现）
+- INV-17 ↔ AUTH-002.F2/F3 + AUDIT-XMOD-016（新发现）
 
 ---
 

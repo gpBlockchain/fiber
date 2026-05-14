@@ -4,7 +4,7 @@
 |---|---|
 | 项目 | gpBlockchain/fiber (Fiber Network Node, FNN) |
 | 分支/快照 | `copilot/create-security-audit-plan` (HEAD at audit close) |
-| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S28, 28 个会话；Phase 1 = S1-S26 33 项 + Phase 1.5 = S27-S28 跨模块 XMOD-001..014 补强 + 模块关系文档) |
+| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S29, 29 个会话；Phase 1 = S1-S26 33 项 + Phase 1.5 = S27-S29 跨模块 XMOD-001..016 补强 + 模块关系文档) |
 | 审计范围 | 工作区全部 9 crates ~144k 行 Rust；Cargo.lock 锁定的依赖图 |
 | 审计方法 | 静态阅读 + ripgrep + 编译期类型/匹配收口 + bincode/molecule 实测 (`/tmp/bctest`)，**无动态 PoC** (所有 ⚠️ 标 "[?]" 的项明确标识 "需动态验证") |
 | 工具 | GitHub Advisory DB (DEP-001)、`grep`/`view` + 仓库自带 fuzz 目标审阅 |
@@ -272,13 +272,13 @@ Fiber 是 CKB 之上的 Layer-2 支付网络节点（Lightning Network 类设计
 
 ---
 
-*报告版本：v1.2（Phase 1 final + Phase 1.5 跨模块审计补强 XMOD-001..014 + MODULES.md）*  *最后更新：2026-05-14 (S28)*  *分支：`copilot/create-security-audit-plan`*
+*报告版本：v1.3（Phase 1 final + Phase 1.5 跨模块审计补强 XMOD-001..016 + MODULES.md v3）*  *最后更新：2026-05-14 (S29)*  *分支：`copilot/create-security-audit-plan`*
 
 ---
 
 ## 11. Phase 1.5 — 跨模块审计补强 (XMOD)
 
-> Phase 1 按"维度 × 章节"完成 33 项静态审计后，本节做一次**横向**复盘：把那些"单 finding 严重度只 Medium、组合后 High"的攻击面提级为独立的 XMOD 项，方便修复规划与回归测试。详见 [`SECURITY_AUDIT_TODO.md` 附录 C](./SECURITY_AUDIT_TODO.md#附录-c跨模块审计-phase-15)；XMOD-001 ~ XMOD-014 每条均有独立 finding 文件，见 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md) … [`findings/AUDIT-XMOD-014.md`](./findings/AUDIT-XMOD-014.md)。模块间关系与不变量速查见 [`MODULES.md`](./MODULES.md)。
+> Phase 1 按"维度 × 章节"完成 33 项静态审计后，本节做一次**横向**复盘：把那些"单 finding 严重度只 Medium、组合后 High"的攻击面提级为独立的 XMOD 项，方便修复规划与回归测试。详见 [`SECURITY_AUDIT_TODO.md` 附录 C](./SECURITY_AUDIT_TODO.md#附录-c跨模块审计-phase-15)；XMOD-001 ~ XMOD-016 每条均有独立 finding 文件，见 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md) … [`findings/AUDIT-XMOD-016.md`](./findings/AUDIT-XMOD-016.md)。模块间关系与不变量速查见 [`MODULES.md`](./MODULES.md)。
 
 ### 11.1 XMOD 项概览
 
@@ -298,6 +298,8 @@ Fiber 是 CKB 之上的 Layer-2 支付网络节点（Lightning Network 类设计
 | **XMOD-012** | invoice ↔ channel ↔ payment | 🟡 Medium | fiber 在 BOLT-04 之外引入 `InvoiceExpired=PERM|16` / `InvoiceCancelled=PERM|17` / `FinalIncorrect*` 四类细分 → probing oracle 泄露 invoice 状态 | ERR-001, ERR-002 |
 | **XMOD-013** | bin ↔ env ↔ key ↔ store ↔ ckb signer | 🟡 Medium | 钱包凭据端到端生命周期跨 5 模块；env 残留 / 0o644 DB / 无 zeroize / 无 mlock / dumpable=1 | CRYPTO-003, STORE-001 |
 | **XMOD-014** | fiber-wasm-db-* ↔ store ↔ channel | 🟠 **High** | 浏览器多 tab 同 wallet → 各自 ChannelActor 推进 commitment number → 最后写者赢 → 旧 commitment 重签后被对端视为 cheat → **资金罚没**；migration 非原子；无 Web Locks | WASM-001, WASM-002, STORE-001 |
+| **XMOD-015** | network ↔ ckb/tx_tracing ↔ channel ↔ watchtower ↔ store | 🟠 **High** | `CKB_TX_TRACING_CONFIRMATIONS=4` (~40s) + tracer 回调后立即 `swap_remove` 不回退；funding/closing/settlement 三类资金 tx 共用同一浅深度；无 `FundingTransactionReorged` 反向事件 → ≥4-block CKB reorg 后 channel 状态机推进不可逆 → funding reorg-out 资金 brick / settlement reorg-out 反 cheat 失效 | LOGIC-003, XMOD-002, XMOD-006 |
+| **XMOD-016** | onion_service ↔ network ↔ gossip ↔ rpc | 🟡 Medium | `announced_addrs: Vec<Multiaddr>` 把 clearnet listening + 配置 + onion 三类地址合并；`get_or_create_new_node_announcement_message` 全量签名进 NodeAnnouncement gossip 全网广播；`NodeInfo` RPC 同样回全量 → Tor 隐私模式失效（pubkey ↔ clearnet IP ↔ .onion 三元关联） | AUTH-002.F2/F3 |
 
 ### 11.2 跨模块协同链 — 扩展（§4 链 A/B/C 之外的链 D/E/F）
 
@@ -457,6 +459,68 @@ attacker (open channel side)
 - XMOD-014.FOLLOWUP-B：browser 后端 IndexedDB transaction 包裹 migration + state 写入；
 - XMOD-014.FOLLOWUP-C：启动时检测 `commitment_number` 回退即主动 force-close。
 
+#### 链 K：CKB chain reorg 资金 brick / 反 cheat 防线断裂（XMOD-015 + LOGIC-003 + XMOD-006）
+
+```
+attacker 与受害者 open channel + 4-confs 推进
+                │
+                ▼  network.rs:119 CKB_TX_TRACING_CONFIRMATIONS=4 (~40s)
+       tx_tracing_actor.rs:269-278  callback 触发 → tracer swap_remove (不可回退)
+                │
+                ▼
+       NetworkActorEvent::FundingTransactionConfirmed
+                │
+                ▼  channel.rs:3054-3084  state.funding_tx_confirmed_at = Some(...)
+       ChannelActor → AwaitingChannelReady → ChannelReady
+                │
+                ▼  双方累积 commitment_number / TLC
+                │
+        ╔═══════╧═══════╗
+        ▼               ▼
+   场景 K1：              场景 K2：
+   funding tx 被 ≥4-blk    settlement / closing tx 被 ≥4-blk
+   reorg 走                 reorg 走 (watchtower 路径)
+        │                   │
+        ▼                   ▼
+   channel 状态仍 "Ready"     反 cheat 已"完成"标记，但链上回退
+   后续 force-close 无 input    cheating tx 在另一条链上 confirm
+        │                   │
+        ▼                   ▼
+   **资金永久 brick**         **资金直损**（与链 A 协同）
+```
+
+**资金直损 / brick 双链路**：fiber 4-confs (≈40s) 比 BTC LN 6-confs (≈60min) 浅一个数量级；CKB NC-Max 下自发深 reorg 概率低但**网络分区 / selfish-mining / 矿池协同**可以放大；攻击者制造小幅 reorg 的代价远低于此。
+
+**核心修复**：XMOD-015.FOLLOWUP-1 提高并分拆 `FUNDING_CONFIRMATIONS=24` / `CLOSING_CONFIRMATIONS=12` / `SETTLEMENT_CONFIRMATIONS=24`；F2/F3 引入 `FundingTransactionReorged` 反向事件 + ChannelActor `ReorgRecovery` 子状态；F4 watchtower 收到 reorg 事件重新扫描。
+
+#### 链 L：Tor 隐私模式下 NodeAnnouncement 主动泄露 clearnet 身份（XMOD-016 + AUTH-002）
+
+```
+deployer 配置 listen_on_onion=true（预期：Tor-only）
+                │
+                ▼  network.rs:5676-5742
+   announced_addrs.push(clearnet_listen_addr)      ← announce_listening_addr 默认 true
+   announced_addrs.extend(config.announced_addrs)  ← yaml 显式
+                │
+                ▼  network.rs:5744-5765
+   announced_addrs.push(onion_addr)                ← 追加，不替换
+                │
+                ▼  network.rs:3734-3760  + gossip 出站
+   NodeAnnouncement.addresses = [clearnet_ip:port, onion_addr.onion:port]
+                │  (节点 secp256k1 签名)
+                ▼  gossip 全网邻居持久化 save_node_announcement
+   任一邻居：pubkey ↔ clearnet IP ↔ onion 三元组永久关联
+                │
+                ▼
+   1) AUTH-002.F2/F3 同时未关闭明文 TCP → 直连验证 IP 真实可达；
+   2) 即便防火墙堵入站，主动广播仍泄露；
+   3) `info_node` RPC 同样回 full Vec → 鉴权穿透 (XMOD-005) 时二次泄露。
+```
+
+**隐私穿透**：fiber 节点 onion 化的核心承诺被破坏。运营商、活动人士、记者、审查环境用户预期"Tor-only" 时仍泄露真实 IP，与其它服务关联扩大攻击面。
+
+**核心修复**：XMOD-016.FOLLOWUP-1 加 `OnionServiceConfig::tor_strict_mode`；F2 出站 NodeAnnouncement / `node_info` 过滤；F3 把 `announced_addrs` 类型重构为 `AnnouncedAddrs { tor, clearnet }` 在编译期强制分流。
+
 ### 11.3 修复优先级（含 XMOD）
 
 合并 §6 与 XMOD 后的统一 P0/P1 列表：
@@ -471,6 +535,7 @@ attacker (open channel side)
 - **XMOD-008.FOLLOWUP-A**（3 处 MuSig2 partial 统一 `verify_partial` 预校验）
 - **XMOD-009.FOLLOWUP-1..3**（RPC 显式 timeout + ractor bounded + 移除 `.expect(ASSUME_*)`）
 - **XMOD-014.FOLLOWUP-A/B**（浏览器 Web Locks + IndexedDB transaction 包裹 migration）
+- **XMOD-015.FOLLOWUP-1..3**（confs 提高并分拆 + `FundingTransactionReorged` 反向事件 + ChannelActor `ReorgRecovery` 子状态）
 
 #### P1
 - CRYPTO-001 PoC（同 §6）
@@ -481,6 +546,8 @@ attacker (open channel side)
 - **XMOD-010**：`Pubkey::tweak` 返回 Result + handler 预派生验证
 - **XMOD-013**：钱包凭据生命周期硬化（zeroize + mlock + dumpable=0 + env 立即清空）
 - **XMOD-014.FOLLOWUP-C/D**：commitment_number 回退检测 + SQLite advisory lock
+- **XMOD-015.FOLLOWUP-4..5**：watchtower 收到 reorg 事件重新扫描 + 文档化 reorg-depth 假设
+- **XMOD-016.FOLLOWUP-1..3**：`tor_strict_mode` + NodeAnnouncement/RPC 出站过滤 + `AnnouncedAddrs` 编译期分流
 - NET-001.F4（UPnP 开关）/ MEM-003 / STORE-001（同 §6）
 - NET-001.F1 持久 ban list（XMOD-006 和 XMOD-008 都依赖）
 
@@ -488,15 +555,18 @@ attacker (open channel side)
 - **XMOD-007**：SPEC-001 规范补 Init chain_hash + funding 双校验
 - **XMOD-011**：`Preimage` newtype + 日志 redact + biscuit token 移除 Display
 - **XMOD-012**：final-hop 错误码与 BOLT-04 对齐 + 差分时序防御
+- **XMOD-016.FOLLOWUP-4..6**：规范层补 *节点身份与广播地址隐私* 章节、`info_node` RPC 隐私策略、启动检测警告
 
 ### 11.4 Phase 1.5 交付
 
 | 项 | 状态 |
 |---|---|
-| TODO 附录 C（14 条 XMOD 项 + 链 D/E/F/G/H/I/J 链路图） | ✅ 本提交（v28） |
+| TODO 附录 C（16 条 XMOD 项 + 链 D/E/F/G/H/I/J/K/L 链路图） | ✅ 本提交（v29） |
 | `findings/AUDIT-XMOD-001.md`（payment ↔ gossip slander 放大） | ✅ S27 |
 | `findings/AUDIT-XMOD-008.md`（MuSig2 partial-sig 不一致） | ✅ S28 |
-| `MODULES.md`（模块关系图 + 入出站边表 + 12 条 INV 不变量） | ✅ 本提交 |
+| `findings/AUDIT-XMOD-015.md`（CKB reorg ↔ channel ↔ watchtower 4-confs + 无 rollback） | ✅ 本提交（S29） |
+| `findings/AUDIT-XMOD-016.md`（onion_service ↔ network ↔ gossip Tor 隐私边界） | ✅ 本提交（S29） |
+| `MODULES.md`（模块关系图 + 入出站边表 + 17 条 INV 不变量） | ✅ 本提交（v3） |
 | XMOD-002..007 / 009..014 是否需要独立 finding 文件 | 后续按需补；当前 TODO 附录 C 详细节 + MODULES.md 边映射足以追踪 |
-| Phase 2 PoC 列表 | 在 §7 路线图基础上追加：(a) channel_update gossip 放大 PoC (b) cch 24h 窗口实战 PoC (c) **ClosingSigned bad partial channel-stuck PoC** (d) **OpenChannel `(T,Q)` 构造永久 brick PoC** (e) **慢响应 chain actor 触发 RPC 雪崩 PoC** (f) **final-hop 错误码 probing oracle PoC** (g) **浏览器双 tab wallet revocation 罚没 PoC** |
+| Phase 2 PoC 列表 | 在 §7 路线图基础上追加：(a) channel_update gossip 放大 PoC (b) cch 24h 窗口实战 PoC (c) **ClosingSigned bad partial channel-stuck PoC** (d) **OpenChannel `(T,Q)` 构造永久 brick PoC** (e) **慢响应 chain actor 触发 RPC 雪崩 PoC** (f) **final-hop 错误码 probing oracle PoC** (g) **浏览器双 tab wallet revocation 罚没 PoC** (h) **CKB ≥4-block reorg → funding/closing reorg-out PoC**（mock chain actor）(i) **listen_on_onion=true 下 NodeAnnouncement clearnet 泄露断言 PoC** |
 
