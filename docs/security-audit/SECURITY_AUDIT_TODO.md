@@ -92,9 +92,16 @@
     - [x] **F7-F11 (Pass)**: `CommitmentSigned.verify_and_complete_tx` 正确预校验 / 三签全验 + on-chain 绑定 / Pubkey::from_slice 拒绝 identity / 编译期类型隔离 / Broadcast 依赖排序
   - **发现记录**: 见 [`findings/AUDIT-CRYPTO-004.md`](./findings/AUDIT-CRYPTO-004.md)
 
-- [ ] 🟠 **AUDIT-CRYPTO-005** PTLC 点/标量代数操作
-  - **关联代码**: `fiber/channel.rs`, `fiber/types.rs`
-  - **审计内容**: 点加 / 标量乘 是否处理 identity / order-边界；scalar tweak 域分离
+- [x] 🟠 **AUDIT-CRYPTO-005** PTLC 点/标量代数操作 — **High × 1, Low × 2, Info × 1, Pass × 2**
+  - **关联代码**: `fiber-types/src/primitives.rs:403-412,511-519`, `fiber-types/src/channel.rs:1158-1179`, `fiber-lib/src/fiber/channel.rs:6097-6126,8748-8762`, `fiber-types/src/schema/fiber.mol:41-42,58-59`
+  - **审计结果**:
+    - [!] **F1 (High)**: `Pubkey::tweak` 末 `.not_inf().expect(...)` + `OpenChannel.tlc_basepoint` 与 `first_per_commitment_point` **同条消息双 attacker-controlled** → 攻击者可一次性构造 (T, Q) 使 `T + blake2b(Q)·G = O`，受害方在首次 `derive_tlc_pubkey` 时 **永久 panic 该通道**，强迫链上 force-close；状态被持久化，重启不能自愈
+    - [!] **F2 (Low)**: `Privkey::tweak` 的 `.not_zero().expect(...)` — 当前 secret 总是本地的，blake2b 第二原像不可行 → 不可远程触发；但 API 设计脆弱，需与 F1 一起 refactor 为 `Result`
+    - [!] **F3 (Low)**: `Scalar::from_slice(...).expect(...)` — blake2b 输出 ≥n 概率 ~2^-128 不可远程构造；但 expect message 回显输入字节进 panic stderr，建议改 `Result` + 固定串
+    - [!] **F4 (Info)**: scalar tweak 缺域分离 tag — fiber 协议内多种 hash 用途共享 ckb-default personalization，future-proofing 应加 prefix tag（与 CRYPTO-004.F6 合并）
+    - [x] **F5 (Pass)**: `Pubkey::from_slice` 正确返回 `Result<_, secp256k1::Error>`，是同文件的"正确范本"
+    - [x] **F6 (Pass)**: musig2 0.2.x 库本身已暴露 `not_inf()/not_zero()` Option API — fiber 选择 `.expect()` 是调用方过错
+  - **发现记录**: 见 [`findings/AUDIT-CRYPTO-005.md`](./findings/AUDIT-CRYPTO-005.md)
 
 ## 第 2 章 DIM-LOGIC 业务逻辑 / 状态机
 
