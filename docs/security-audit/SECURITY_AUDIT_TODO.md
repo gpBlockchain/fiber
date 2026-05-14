@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v25** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成** (Sessions S1-S26, 33/33 items audited) — 进入 Phase 3 (Final REPORT.md)
+> 版本: **v26** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成 + Phase 1.5 跨模块审计补强 (XMOD)** — 见 [附录 C](#附录-c跨模块审计-phase-15)
 
 ## 项目概况 (Project Profile)
 
@@ -853,3 +853,110 @@
 按计划完成：
 - ✅ **AUDIT-CRYPTO-002** — Sphinx 洋葱包解封与回放保护
 - ✅ **AUDIT-INPUT-001** — P2P Molecule 消息抗畸形 + fuzz 覆盖度评估
+
+---
+
+## 附录 C：跨模块审计 (Phase 1.5)
+
+Phase 1 按"维度 × 章节"切片做完 33 项后，**横向**复盘暴露出多条"单一 finding 不足以体现严重度、组合后形成 High"的跨模块攻击面。本附录把这些**跨章节攻击链**独立提级为 XMOD 系列项，方便修复与回归测试规划。
+
+每条 XMOD 已与 Phase 1 finding 交叉引用；XMOD-001 另有独立 finding 文件 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md)。
+
+### XMOD 项总览
+
+| ID | 跨越模块 | 严重度 | 涉及 Phase 1 findings | 状态 |
+|---|---|---|---|---|
+| **AUDIT-XMOD-001** | payment ↔ gossip ↔ network | 🟠 **High** | ERR-001.F2, MEM-001 | [!] 见独立 finding |
+| **AUDIT-XMOD-002** | cch ↔ watchtower ↔ channel | 🟠 **High** | LOGIC-008, INPUT-005, LOGIC-002 | [!] 见下方 |
+| **AUDIT-XMOD-003** | store ↔ migration ↔ network/bin | 🟡 Medium | STORE-001.F1, INPUT-004.F1/F2 | [!] 见下方 |
+| **AUDIT-XMOD-004** | rpc ↔ invoice ↔ cch ↔ process | 🟠 **High** | INPUT-002, INPUT-003, SPEC-002.F6/F7 | [!] 见下方 |
+| **AUDIT-XMOD-005** | rpc ↔ auth ↔ biscuit ↔ network | 🟠 **High** | INPUT-003.F5, AUTH-001.F1, AUTH-003.F1/F4 | [!] 见下方 |
+| **AUDIT-XMOD-006** | watchtower ↔ ckb ↔ channel ↔ gossip | 🟠 **High** | INPUT-005, LOGIC-003.F6, CRYPTO-004.F2, AUTH-002.F1, NET-001.F1 | [!] 见下方 |
+| **AUDIT-XMOD-007** | network ↔ store ↔ chain hash | 🟡 Medium | NET-001.F1, AUTH-002.F8, SPEC-001.F7 | [!] 见下方 |
+
+### AUDIT-XMOD-001 — Payment → Gossip channel_update slander 全网放大
+
+详见 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md)。要点：`update_graph_with_tlc_fail` (`payment.rs:1083-1098`) 不只在本地图 `mark_channel_failed`，还**主动调用 `NetworkActorCommand::BroadcastMessages` 把 attacker-controlled `channel_update` 推进 gossip 广播池**。这把 ERR-001.F2 的"本地图 slander" 升级成"全网 gossip 污染"，与 MEM-001 (gossip OOM) 协同。
+
+### AUDIT-XMOD-002 — CCH ↔ Watchtower ↔ Channel 时序错配 24h 窗口
+
+**关联代码**：
+- `crates/fiber-lib/src/cch/config.rs:6-12`：`DEFAULT_ORDER_EXPIRY_DELTA_SECONDS=36h` vs `DEFAULT_BTC_FINAL_TLC_EXPIRY_DELTA_BLOCKS=360 (~60h)` vs `DEFAULT_CKB_FINAL_TLC_EXPIRY_DELTA_SECONDS=60h`
+- `crates/fiber-lib/src/cch/scheduler.rs:262-301`：`expire_order` 现已 `is_final()` 跳过 final 订单（line 273），但未拒绝 *InFlight* 订单（已托付资金）强制 Failed
+- `crates/fiber-lib/src/watchtower/actor.rs:173-183`：preimage 落地后写入 watchtower store，无与 CCH order status 的双向同步
+
+**问题**：CCH 在 T=36h 把仍 InFlight 的订单强制 Failed → 后续 watchtower 在 T=36h..60h 区间检测到链上 preimage 揭示（cheat-detect path）→ CCH `get_active_order_or_none` 已返回 None → preimage 事件被丢弃 → 跨链 settle 失败 → **CCH 单边资金损失**（已记录在 LOGIC-008，但本条强调跨 cch / watchtower / channel 三模块的时序不变量缺失）。
+
+**修复 (FOLLOWUP)**：(a) 启动时强制 `order_expiry > btc_final_tlc * block_seconds + safety_margin`；(b) `expire_order` 仅对 status==`Pending` 生效，InFlight 必须等链上 settle/timeout 后再判定；(c) watchtower 检测到 preimage 必须把事件持久化重放，即便订单已 Failed 也回填到 CCH。
+
+### AUDIT-XMOD-003 — Store 权限 + Migration 版本无完整性 + bincode 宽松默认
+
+**关联代码**：
+- `crates/fiber-store/src/native.rs:17-105` (DB 0o644/0o755)
+- `crates/fiber-store/src/migration.rs:41,152-156,255-262` (`MIGRATION_VERSION_KEY = b"db-version"` 无签名 / `auto_migrate.pending.is_empty()→stamp latest`)
+- `crates/fiber-store/Cargo.toml:19-25` (bincode 1.3.3 + serde — 实测默认接受 trailing bytes + struct prefix-overlap)
+
+**三层叠加**：同主机非特权用户 → 因 0o644 可读写 DB → 改写 `db-version` 字面值到 LATEST 或未来版本号 → 重启时 `auto_migrate.pending.is_empty()` 命中 → 实际 OLD bytes 被反序列化为 NEW 类型 → bincode 1.x 静默接受 prefix-overlap → 配合"删字段"或"重命名"型 mig **永久不会重跑** → 节点静默运行错位 schema。
+
+**修复 (FOLLOWUP)**：(a) STORE-001.F1 0o700/0o600；(b) INPUT-004.F1 用 `bincode::Options::with_no_trailing_bytes()` + `reject_trailing_bytes()`；(c) `db-version` key 增加 HMAC(node_key)。
+
+### AUDIT-XMOD-004 — RPC ↔ Invoice 解析 panic 多入口共享
+
+**关联代码 (共享 panic 面 `invoice.rs:887,902,1023,1042,1052,1085,1088`)**：
+1. `crates/fiber-lib/src/rpc/invoice.rs:289-300` (`parse_invoice` JSON-RPC)
+2. `crates/fiber-lib/src/rpc/payment.rs:send_payment` (从 invoice 字符串解析)
+3. `crates/fiber-lib/src/cch/actor.rs:628` (`receive_btc` 调 invoice 解析)
+4. P2P gossip 入站若直接转发 invoice（需进一步确认）
+
+**问题**：INPUT-002 已记 invoice 内部 `.expect()`，但**四个跨模块入口**的"零授权远程攻击面"在 INPUT-002 章节没有统一画像；尤其 (3) CCH 入口接受 LND 上游 bolt11 — 攻击者把恶意 invoice 通过 LN 发给 CCH 即可 panic CCH。
+
+**修复 (FOLLOWUP)**：INPUT-002.F1/F2/F3 + 在所有 4 个入口包装 `catch_unwind`（短期止血），中长期改 `From → TryFrom`。
+
+### AUDIT-XMOD-005 — RPC 鉴权穿透链
+
+**关联代码**：
+- `crates/fiber-lib/src/rpc/middleware.rs:92-114` (`is_public_addr` 唯一 gate)
+- `crates/fiber-lib/src/rpc/mod.rs:128-129,207-235` (CORS 配置)
+- `crates/fiber-lib/src/rpc/biscuit.rs:234,260` (standalone watchtower NodeId)
+
+**穿透链**：
+1. INPUT-003.F5：私网/loopback 默认 `enable_auth=false` → 同主机多租户/Docker 共享网络命名空间下零鉴权
+2. AUTH-003.F1：若启用 CORS 且 `cors_allowed_origins=[]` → fall-through 到全通配 → 浏览器 evil.com 跨域 POST 成功
+3. AUTH-003.F4：无 Host header allowlist → DNS rebinding 攻击成立
+4. AUTH-001.F1：standalone watchtower 部署若关 `enable_auth` → `NodeId::local()` 空 Vec → 多客户端共享 keyspace 互踩
+
+**修复 (FOLLOWUP)**：(a) 敏感模块（payment / channel / cch / watchtower）一律强制 biscuit，不再依赖 `is_public_addr`；(b) `cors_enabled=true && cors_allowed_origins=[]` 启动 fail-fast；(c) Host header allowlist 默认要求 `127.0.0.1` / `[::1]` 字面值；(d) standalone watchtower 启动若 `biscuit_public_key.is_none()` 直接 `bail!`。
+
+### AUDIT-XMOD-006 — 反 cheat 三模块协同断裂
+
+报告 §4 链 A 已记。**XMOD 提级理由**：链 A 涉及 watchtower / ckb / channel / gossip 四模块的不变量同时被一次远程 cheat 利用。修复必须**按链顺序协同**：
+1. AUTH-002.F1 + NET-001.F1 (反序驱逐 + 持久 ban list) — 防 Sybil eviction 把合法 peer 推出视野
+2. INPUT-005.F1/F2 (lock_args / witness 长度守卫) — 防 watchtower 单 cheat panic 全 channel
+3. LOGIC-003.F6 (revocation_data 覆盖式 → append-only / per commitment_number indexed)
+4. CRYPTO-004.F2 (RevokeAndAck verify_partial)
+
+**回归测试**：四步攻击场景写一个 integration test，包括 Sybil eviction + cheat tx 上链 + watchtower 单次 panic 后能否在第二次 periodic check 中恢复。
+
+### AUDIT-XMOD-007 — Chain hash 校验防线跨模块缺位
+
+**关联代码**：
+- `crates/fiber-lib/src/fiber/network.rs:Init { chain_hash }` 字段
+- `docs/specs/p2p-message.md` （SPEC-001.F7：`Init` 完全无规范文档）
+- `crates/fiber-lib/src/fiber/network.rs:check_feature_compatibility` 路径
+
+**问题**：Init 消息 chain_hash 字段缺规范文档（SPEC-001.F7），AUTH-002.F8 + NET-001.F9 仅在实现侧守住；第三方实现可能漏校 → 攻击者构造跨网（mainnet ↔ testnet）peer 让 fiber 在不同链上误执行 funding/commitment。
+
+**修复 (FOLLOWUP)**：(a) SPEC-001 规范补 Init 字段表 + chain_hash 强制校验；(b) Init 不匹配时本端立即持久化 ban（与 NET-001.F1 配套）；(c) 在 funding tx 构造路径双校验 chain_hash（深度防御）。
+
+### Phase 1.5 修复优先级
+
+XMOD 项**继承** Phase 1 优先级，但要求**链式修复**（部分模块单独修复不解决问题）：
+
+| 优先级 | XMOD 项 | 触发条件 |
+|---|---|---|
+| **P0** | XMOD-002, XMOD-006 | 资金直损 |
+| **P0** | XMOD-001, XMOD-004 | 远程零授权放大/panic |
+| **P1** | XMOD-005 | 多租户/浏览器鉴权穿透 |
+| **P1** | XMOD-003 | 同主机离线攻击者持久化破坏 |
+| **P2** | XMOD-007 | 规范层防御纵深 |
+

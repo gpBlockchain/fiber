@@ -4,7 +4,7 @@
 |---|---|
 | 项目 | gpBlockchain/fiber (Fiber Network Node, FNN) |
 | 分支/快照 | `copilot/create-security-audit-plan` (HEAD at audit close) |
-| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S26, 26 个会话) |
+| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S27, 27 个会话；Phase 1 = S1-S26 33 项 + Phase 1.5 = S27 跨模块 XMOD 补强) |
 | 审计范围 | 工作区全部 9 crates ~144k 行 Rust；Cargo.lock 锁定的依赖图 |
 | 审计方法 | 静态阅读 + ripgrep + 编译期类型/匹配收口 + bincode/molecule 实测 (`/tmp/bctest`)，**无动态 PoC** (所有 ⚠️ 标 "[?]" 的项明确标识 "需动态验证") |
 | 工具 | GitHub Advisory DB (DEP-001)、`grep`/`view` + 仓库自带 fuzz 目标审阅 |
@@ -272,4 +272,93 @@ Fiber 是 CKB 之上的 Layer-2 支付网络节点（Lightning Network 类设计
 
 ---
 
-*报告版本：v1.0（Phase 1 final）*  *最后更新：2026-05-14 (S26)*  *分支：`copilot/create-security-audit-plan`*
+*报告版本：v1.1（Phase 1 final + Phase 1.5 跨模块审计补强）*  *最后更新：2026-05-14 (S27)*  *分支：`copilot/create-security-audit-plan`*
+
+---
+
+## 11. Phase 1.5 — 跨模块审计补强 (XMOD)
+
+> Phase 1 按"维度 × 章节"完成 33 项静态审计后，本节做一次**横向**复盘：把那些"单 finding 严重度只 Medium、组合后 High"的攻击面提级为独立的 XMOD 项，方便修复规划与回归测试。详见 [`SECURITY_AUDIT_TODO.md` 附录 C](./SECURITY_AUDIT_TODO.md#附录-c跨模块审计-phase-15) 与 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md)。
+
+### 11.1 XMOD 项概览
+
+| ID | 跨越模块 | 严重度 | 关键链/事实 | Phase 1 来源 |
+|---|---|---|---|---|
+| **XMOD-001** | payment → gossip → network | 🟠 High | `update_graph_with_tlc_fail` 经 `BroadcastMessages` 把 attacker-controlled `channel_update` 推进全网 gossip | ERR-001.F2, MEM-001 |
+| **XMOD-002** | cch ↔ watchtower ↔ channel | 🟠 High | order_expiry=36h vs TLC final_expiry=60h，24h 窗口内 CCH 强标 Failed 而 watchtower preimage 已落地 | LOGIC-008, INPUT-005 |
+| **XMOD-003** | store ↔ migration ↔ bin | 🟡 Medium | 0o644 + db-version 无签名 + bincode trailing-bytes/prefix-overlap 默认接受 → 同主机离线攻击 | STORE-001.F1, INPUT-004.F1/F2 |
+| **XMOD-004** | rpc ↔ invoice ↔ cch | 🟠 High | INPUT-002 panic 面共享 4 个入口：`parse_invoice`/`send_payment`/`cch.receive_btc`/（潜在 gossip） | INPUT-002, SPEC-002.F6/F7 |
+| **XMOD-005** | rpc ↔ auth ↔ biscuit | 🟠 High | `is_public_addr` 单 gate + CORS 全通配 fallback + 无 Host allowlist + standalone watchtower `NodeId::local()` | INPUT-003.F5, AUTH-001/003 |
+| **XMOD-006** | watchtower ↔ ckb ↔ channel ↔ gossip | 🟠 High | 反 cheat 链 (报告 §4 链 A) — 修复必须四模块同步 | INPUT-005, LOGIC-003, CRYPTO-004, AUTH-002, NET-001 |
+| **XMOD-007** | network ↔ spec ↔ store | 🟡 Medium | Init `chain_hash` 规范缺位 → 第三方实现漏校 → 跨网攻击 | SPEC-001.F7, AUTH-002.F8 |
+
+### 11.2 跨模块协同链 — 扩展（§4 链 A/B/C 之外的链 D/E/F）
+
+#### 链 D：payment-driven gossip pollution（XMOD-001 + MEM-001）
+
+```
+attacker (mid-hop)  ──TlcErr+channel_update──>  victim sender
+                                                      │
+                                                      ▼ (无 route-membership 校验)
+                                              BroadcastMessages
+                                                      │
+                                                      ▼
+                                                gossip pool (无验签 / 验签延迟)
+                                                      │
+                                                      ▼ N 邻居扩散
+                                                cluster-wide channel disable
+```
+
+**资金间损**：被诬陷的通道在全网被标 disabled → 该通道在网络中"消失" → 后续 N hop 路由失败 → fiber 网络可用性退化。
+
+**核心修复**：XMOD-001.FOLLOWUP-A 在 BroadcastMessages 之前加 route-membership 校验。
+
+#### 链 E：cross-chain preimage 失窃（XMOD-002 + LOGIC-008）
+
+`cch_order_expiry < htlc_final_expiry` 是协议层的**时序不变量违反**：
+- T=36h：CCH `expire_order` 强制 Failed（即便 InFlight）→ `get_active_order_or_none` → None
+- T=36h..60h：watchtower 检测到链上 cheat / settlement → preimage 落地 watchtower DB
+- T>36h：CCH 收到 `preimage_revealed` 事件 → 因订单 Failed 丢弃 → **跨链 settle 失败 → CCH 单边亏损**
+
+**核心修复**：(a) 启动时强制 `order_expiry > btc/ckb_final_tlc + safety_margin`；(b) `expire_order` 仅对 status==Pending 生效；(c) preimage 事件即便订单 Failed 也必须持久化重放。
+
+#### 链 F：offline persistence corruption（XMOD-003）
+
+同主机非特权用户（无 root）：
+1. STORE-001.F1：DB 目录 0o755 + 文件 0o644 → 可写
+2. INPUT-004.F2：`db-version` 无 HMAC/签名 → 改写到 `LATEST_DB_VERSION` 字面值
+3. INPUT-004.F1：bincode 1.x 默认 trailing-bytes-tolerant + struct-prefix-overlap → 重启后 OLD bytes 静默被反序列化为 NEW 类型字段（删字段 mig 永不重跑）
+4. 节点静默运行错位 schema → channel state 错位 → 后续 commitment 签名异常 → force-close
+5. **资金间损**（force-close penalty + CSV 锁定）
+
+**核心修复**：STORE-001.F1 (0o700/0o600) + INPUT-004.F1 (`reject_trailing_bytes`) + db-version HMAC。
+
+### 11.3 修复优先级（含 XMOD）
+
+合并 §6 与 XMOD 后的统一 P0/P1 列表：
+
+#### P0 — 立即修复
+- LOGIC-008.F1（CCH expire_order 仅 Pending）— **包含在 XMOD-002**
+- INPUT-002.F1/F2/F3（Invoice panic）— **多入口共享，XMOD-004 强调跨模块**
+- INPUT-005.F1/F2（watchtower len 守卫）— **包含在 XMOD-006**
+- AUTH-001.F1（standalone watchtower）— **包含在 XMOD-005**
+- MEM-001.F1（gossip 入存验签 + per-peer 上限）— **与 XMOD-001 协同**
+- **XMOD-001.FOLLOWUP-A**（route-membership 校验 + 速率限制 channel_update 出站转发）
+
+#### P1
+- CRYPTO-001 PoC（同 §6）
+- LOGIC-007 协同补丁（同 §6）
+- CRYPTO-004 verify_partial（同 §6）
+- **XMOD-005**：敏感模块强制 biscuit + CORS 启用空列表 fail-fast + Host allowlist
+- **XMOD-003**：store 0o700/0o600 + bincode strict + db-version HMAC
+- NET-001.F4（UPnP 开关）/ MEM-003 / STORE-001（同 §6）
+
+### 11.4 Phase 1.5 交付
+
+| 项 | 状态 |
+|---|---|
+| TODO 附录 C（7 条 XMOD 项 + 链 D/E/F 链路图） | ✅ 本提交 |
+| `findings/AUDIT-XMOD-001.md`（独立详细） | ✅ 本提交 |
+| XMOD-002..007 是否需要独立 finding 文件 | 后续按需补；当前已有 ≥2 个 Phase 1 finding 引用足以追踪 |
+| Phase 2 PoC 列表 | 在 §7 路线图基础上追加：(a) channel_update gossip 放大 PoC (b) cch 24h 窗口实战 PoC |
+
