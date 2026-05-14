@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v18** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 18 完成)
+> 版本: **v19** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 19 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 19 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001, AUDIT-INPUT-003, AUDIT-ERR-002, AUDIT-AUTH-003)
+- ⚠️ 发现弱设计: 20 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 9
+- ⏳ 待审计: 8
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -256,7 +256,22 @@
   - **最严重场景 (F1+F2 协同)**：同主机攻击者写 `db-version = LATEST_DB_VERSION` 字面值 → migration 完全跳过；下次新 binary 启动 deserialize OLD 字节为 NEW 类型 → `panic!("deserialization of ChannelActorState failed")` → boot-loop；或 F1 路径下未来某 mig 走"删字段"型 → bincode 静默接受 → `skipped++` → OLD 记录永不迁移 → 业务读到错误的默认字段值
   - **总体评价**：bincode + migration 框架的**外形**专业（snapshot deps trick、`DatabaseTooNew/Old` 边界、`check_validate` 实现），但**内核**有两类系统性脆弱：bincode 1.3 默认配置过于宽松（实测 trailing bytes + prefix-overlap 静默成功）+ migration 版本号缺乏完整性保护。修复成本均低（每条 < 30 行）但需要项目层引入 strict bincode + schema-version-byte 约定。
   - **发现记录**: 见 [`findings/AUDIT-INPUT-004.md`](./findings/AUDIT-INPUT-004.md)
-- [ ] 🟡 **AUDIT-INPUT-005** CKB Tx / Cell 数据
+- [!] 🟠 **AUDIT-INPUT-005** CKB Tx / Cell 数据校验 — **整体 High / High × 2 + Medium × 4 + Low × 2 + Info × 1 + Pass × 3**
+  - **关联代码**: `crates/fiber-lib/src/watchtower/actor.rs:266-275,1577-1592,1697-1726`, `crates/fiber-lib/src/ckb/{client.rs:37-39,70-72, contracts.rs:34-47, funding/funding_tx.rs:404-407,494,269-282}`, `crates/fiber-lib/src/fiber/network.rs:226-244`
+  - **审计内容**:
+    - [!] **F1 (High)**: `run_periodic_check` 对 attacker-controlled output `lock_args` 直接 `lock_args[0..20]`/`lock_args[28..36]` slice，无 `commitment_lock.code_hash()` 校验也无 len 守卫；cheating peer/第三方放任意 lock 上链即触发 panic → spawn_blocking 任务退出 → 该轮所有 channel 跳过 → 与 LOGIC-006 形成完整反应链断裂 → cheat 不被惩罚 → 资金损失。`expect("checked length")` 注释撒谎。
+    - [!] **F2 (High)**: `Htlc::build_from_witness` 公共 API 不返回 `Option`，全 `unwrap()`；`SettlementWitness::build_from_witness` 入口 `witness[1]` 无 `len >= 2` 前置守卫即读 → 空字节 panic。当前 `Htlc` 调用点局部安全（`step_by(85)` + 1702 长度预检）但反模式扩散，与 STORE-001.F3/INPUT-002.F4/INPUT-004.F3 同质。`Unlock::build_from_witness` (1660-1683) 是同文件正确范本。
+    - [!] **F3 (Medium)**: `CkbRpcClient::From` 用 `panic!("bytes response format not used")` 处理 ckb-node 返回 bytes-format response；运维零容错地雷 + ckb-node 升级风险；同时 watchtower 235-236 `expect("create ckb rpc client should not fail")` 同模式扩散。
+    - [!] **F4 (Medium)**: `FundingTxBuilder` UDT cell 数据 `cell.output_data.as_ref()[0..16]` 无长度校验；attacker 在公链放同 type_script 但 `data.len() < 16` 的 cell → cell_collector 持久返回 → funding 流程 panic 持久化 DoS。
+    - [!] **F5 (Medium)**: `get_chain_hash() = OnceCell.get().cloned().unwrap_or_default()` 全零 fallback；测试/集成路径若漏 `init_chain_hash` → `check_chain_hash(全零)` 通过 → 跨链 replay。是 AUTH-002.F8 在 chain identity 维度的对称实例。
+    - [!] **F6 (Medium)**: `ScriptCellDep::From<config::ScriptCellDep>` 配置 panic（同时给 cell_dep+type_id 或都不给）；`From` 不能返回 Result → 节点启动 panic 而非友好报错；与 INPUT-002.F1 同质 `From → TryFrom` 问题。
+    - [!] **F7 (Low)**: `funding_tx.rs:494 outputs_data.get(i).unwrap_or_default()` peer-tx 字段长度不对齐时静默用空 Bytes 填充 → 失败延迟到广播阶段。
+    - [!] **F8 (Low)**: `watchtower/actor.rs:235 expect("create ckb rpc client should not fail")` per-channel 构造失败即 panic（DNS 抖动/URL 改变热加载等真实场景）。
+    - [i] **F9 (Info)**: `tx_tracing_actor` 对 ckb-node reorg / inconsistent status 容错未审计 — 建议下个 session 单独审计。
+    - [✓] **F10/F11/F12 Pass**: `FundingTxBuilder` UDT/CKB amount 全部 `checked_add`+错误路径 (与 MEM-002.F4 并列范本)；`Unlock::build_from_witness` 长度守卫+`Option<Self>` 是 F2 修复参考；funding tx integrity 多维校验完备。
+  - **最严重场景**: cheating peer 把旧 commitment_tx 上链时使用 `args.len() < 36` 的 lock script → watchtower F1 panic → 该 channel 反应能力丢失 → 60h+ revocation 窗口超时 → cheat 成功 → 受害者全额损失。
+  - **总体评价**：CKB 数据校验在**正路径**（funding 算术 + peer-tx 完整性，F10/F12）稳健，但在**异常路径**（attacker 任意上链 → watchtower 强行解析）有系统性 panic 漏洞 (F1/F2)。watchtower 是反 cheat 防线本身，不允许 panic。修复成本均低（F1≈8 行、F2≈30 行）。
+  - **发现记录**: 见 [`findings/AUDIT-INPUT-005.md`](./findings/AUDIT-INPUT-005.md)
 
 ## 第 4 章 DIM-AUTH 认证与鉴权
 
