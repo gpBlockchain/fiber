@@ -4,7 +4,7 @@
 |---|---|
 | 项目 | gpBlockchain/fiber (Fiber Network Node, FNN) |
 | 分支/快照 | `copilot/create-security-audit-plan` (HEAD at audit close) |
-| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S28, 28 个会话；Phase 1 = S1-S26 33 项 + Phase 1.5 = S27-S28 跨模块 XMOD-001..011 补强) |
+| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S28, 28 个会话；Phase 1 = S1-S26 33 项 + Phase 1.5 = S27-S28 跨模块 XMOD-001..014 补强 + 模块关系文档) |
 | 审计范围 | 工作区全部 9 crates ~144k 行 Rust；Cargo.lock 锁定的依赖图 |
 | 审计方法 | 静态阅读 + ripgrep + 编译期类型/匹配收口 + bincode/molecule 实测 (`/tmp/bctest`)，**无动态 PoC** (所有 ⚠️ 标 "[?]" 的项明确标识 "需动态验证") |
 | 工具 | GitHub Advisory DB (DEP-001)、`grep`/`view` + 仓库自带 fuzz 目标审阅 |
@@ -272,13 +272,13 @@ Fiber 是 CKB 之上的 Layer-2 支付网络节点（Lightning Network 类设计
 
 ---
 
-*报告版本：v1.1（Phase 1 final + Phase 1.5 跨模块审计补强）*  *最后更新：2026-05-14 (S27)*  *分支：`copilot/create-security-audit-plan`*
+*报告版本：v1.2（Phase 1 final + Phase 1.5 跨模块审计补强 XMOD-001..014 + MODULES.md）*  *最后更新：2026-05-14 (S28)*  *分支：`copilot/create-security-audit-plan`*
 
 ---
 
 ## 11. Phase 1.5 — 跨模块审计补强 (XMOD)
 
-> Phase 1 按"维度 × 章节"完成 33 项静态审计后，本节做一次**横向**复盘：把那些"单 finding 严重度只 Medium、组合后 High"的攻击面提级为独立的 XMOD 项，方便修复规划与回归测试。详见 [`SECURITY_AUDIT_TODO.md` 附录 C](./SECURITY_AUDIT_TODO.md#附录-c跨模块审计-phase-15) 与 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md)。
+> Phase 1 按"维度 × 章节"完成 33 项静态审计后，本节做一次**横向**复盘：把那些"单 finding 严重度只 Medium、组合后 High"的攻击面提级为独立的 XMOD 项，方便修复规划与回归测试。详见 [`SECURITY_AUDIT_TODO.md` 附录 C](./SECURITY_AUDIT_TODO.md#附录-c跨模块审计-phase-15) 与 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md) / [`findings/AUDIT-XMOD-008.md`](./findings/AUDIT-XMOD-008.md)；模块间关系与不变量速查见 [`MODULES.md`](./MODULES.md)。
 
 ### 11.1 XMOD 项概览
 
@@ -295,6 +295,9 @@ Fiber 是 CKB 之上的 Layer-2 支付网络节点（Lightning Network 类设计
 | **XMOD-009** | rpc ↔ all-actors ↔ ractor | 🟠 High | RPC `handle_actor_call!` 全 `call!` 无 timeout + ractor 0.15 默认无界 mailbox + `.expect(ASSUME_*)` 死路 panic | MEM-003, INPUT-003 |
 | **XMOD-010** | primitives ↔ channel ↔ store | 🟡 Medium | `Pubkey::tweak` `.not_inf().expect` + 同条 `OpenChannel` 两 attacker-controlled 公钥无关系校验 + channel state 已持久化先于 panic → 重启再 panic = **永久 brick** | （新发现，与 CRYPTO-001 同模块但不同问题） |
 | **XMOD-011** | watchtower ↔ tracing ↔ rpc | 🟡 Medium | `watchtower/actor.rs:181` 主动 ERROR 级别打印 `preimage:?` 全 hex；`Preimage` 复用 `Hash256` 类型系统无防护；biscuit token Display | （新发现：日志卫生） |
+| **XMOD-012** | invoice ↔ channel ↔ payment | 🟡 Medium | fiber 在 BOLT-04 之外引入 `InvoiceExpired=PERM|16` / `InvoiceCancelled=PERM|17` / `FinalIncorrect*` 四类细分 → probing oracle 泄露 invoice 状态 | ERR-001, ERR-002 |
+| **XMOD-013** | bin ↔ env ↔ key ↔ store ↔ ckb signer | 🟡 Medium | 钱包凭据端到端生命周期跨 5 模块；env 残留 / 0o644 DB / 无 zeroize / 无 mlock / dumpable=1 | CRYPTO-003, STORE-001 |
+| **XMOD-014** | fiber-wasm-db-* ↔ store ↔ channel | 🟠 **High** | 浏览器多 tab 同 wallet → 各自 ChannelActor 推进 commitment number → 最后写者赢 → 旧 commitment 重签后被对端视为 cheat → **资金罚没**；migration 非原子；无 Web Locks | WASM-001, WASM-002, STORE-001 |
 
 ### 11.2 跨模块协同链 — 扩展（§4 链 A/B/C 之外的链 D/E/F）
 
@@ -422,6 +425,38 @@ attacker (open channel side)
 
 **核心修复**：XMOD-010.FOLLOWUP-1..3（`Pubkey::tweak` 改 Result + handler 持久化前预派生 + 启动加载若派生失败标 bricked 而非 panic）。
 
+#### 链 J：浏览器多 tab wallet 资金罚没（XMOD-014 + STORE-001 + WASM-001/002）
+
+```
+                     tab A                              tab B
+                       │                                  │
+                  open wallet                       open same wallet (re-visit)
+                       │                                  │
+                       ▼                                  ▼
+            ChannelActor 实例 A                ChannelActor 实例 B
+            (memory: cn = N)                   (memory: cn = N，刚从 IndexedDB 读)
+                       │                                  │
+              send_payment → 推进                       send_payment → 推进
+              cn = N+1, 签名 commit_N+1               cn = N+1, 签名 commit_N+1
+                       │                                  │
+              IndexedDB put cn=N+1 ✓                IndexedDB put cn=N+1 ✓ (覆盖)
+                       │                                  │
+              对端先收到 A 的 sig                    对端后收到 B 的 sig (相同 cn, 不同 commitment_tx)
+                       │                                  │
+                       └──────────────┬───────────────────┘
+                                      ▼
+                            对端视为 cheat：同一 commitment_number 出现两个签名 → 广播 revocation tx
+                                      ▼
+                            **资金罚没**（不是 brick，是 *直接* 损失）
+```
+
+资金直损模型：浏览器 wallet 是 fiber 最广泛的用户接入入口，损失阈值（开通通道的 wallet 余额）由用户掌控，攻击门槛仅"用户在两个 tab 打开同一钱包"或"前端 SPA 路由刷新触发新 ChannelActor 实例"。
+
+**核心修复**：
+- XMOD-014.FOLLOWUP-A：`navigator.locks.request` 启动独占锁，第二 tab 仅观察；
+- XMOD-014.FOLLOWUP-B：browser 后端 IndexedDB transaction 包裹 migration + state 写入；
+- XMOD-014.FOLLOWUP-C：启动时检测 `commitment_number` 回退即主动 force-close。
+
 ### 11.3 修复优先级（含 XMOD）
 
 合并 §6 与 XMOD 后的统一 P0/P1 列表：
@@ -435,6 +470,7 @@ attacker (open channel side)
 - **XMOD-001.FOLLOWUP-A**（route-membership 校验 + 速率限制 channel_update 出站转发）
 - **XMOD-008.FOLLOWUP-A**（3 处 MuSig2 partial 统一 `verify_partial` 预校验）
 - **XMOD-009.FOLLOWUP-1..3**（RPC 显式 timeout + ractor bounded + 移除 `.expect(ASSUME_*)`）
+- **XMOD-014.FOLLOWUP-A/B**（浏览器 Web Locks + IndexedDB transaction 包裹 migration）
 
 #### P1
 - CRYPTO-001 PoC（同 §6）
@@ -443,20 +479,24 @@ attacker (open channel side)
 - **XMOD-005**：敏感模块强制 biscuit + CORS 启用空列表 fail-fast + Host allowlist
 - **XMOD-003**：store 0o700/0o600 + bincode strict + db-version HMAC
 - **XMOD-010**：`Pubkey::tweak` 返回 Result + handler 预派生验证
+- **XMOD-013**：钱包凭据生命周期硬化（zeroize + mlock + dumpable=0 + env 立即清空）
+- **XMOD-014.FOLLOWUP-C/D**：commitment_number 回退检测 + SQLite advisory lock
 - NET-001.F4（UPnP 开关）/ MEM-003 / STORE-001（同 §6）
 - NET-001.F1 持久 ban list（XMOD-006 和 XMOD-008 都依赖）
 
 #### P2
 - **XMOD-007**：SPEC-001 规范补 Init chain_hash + funding 双校验
 - **XMOD-011**：`Preimage` newtype + 日志 redact + biscuit token 移除 Display
+- **XMOD-012**：final-hop 错误码与 BOLT-04 对齐 + 差分时序防御
 
 ### 11.4 Phase 1.5 交付
 
 | 项 | 状态 |
 |---|---|
-| TODO 附录 C（11 条 XMOD 项 + 链 D/E/F/G/H/I 链路图） | ✅ 本提交（v27） |
+| TODO 附录 C（14 条 XMOD 项 + 链 D/E/F/G/H/I/J 链路图） | ✅ 本提交（v28） |
 | `findings/AUDIT-XMOD-001.md`（payment ↔ gossip slander 放大） | ✅ S27 |
-| `findings/AUDIT-XMOD-008.md`（MuSig2 partial-sig 不一致） | ✅ 本提交 |
-| XMOD-002..007 / XMOD-009..011 是否需要独立 finding 文件 | 后续按需补；当前已有 ≥1 个 Phase 1 finding 引用或代码引用足以追踪 |
-| Phase 2 PoC 列表 | 在 §7 路线图基础上追加：(a) channel_update gossip 放大 PoC (b) cch 24h 窗口实战 PoC (c) **ClosingSigned bad partial channel-stuck PoC** (d) **OpenChannel `(T,Q)` 构造永久 brick PoC** (e) **慢响应 chain actor 触发 RPC 雪崩 PoC** |
+| `findings/AUDIT-XMOD-008.md`（MuSig2 partial-sig 不一致） | ✅ S28 |
+| `MODULES.md`（模块关系图 + 入出站边表 + 12 条 INV 不变量） | ✅ 本提交 |
+| XMOD-002..007 / 009..014 是否需要独立 finding 文件 | 后续按需补；当前 TODO 附录 C 详细节 + MODULES.md 边映射足以追踪 |
+| Phase 2 PoC 列表 | 在 §7 路线图基础上追加：(a) channel_update gossip 放大 PoC (b) cch 24h 窗口实战 PoC (c) **ClosingSigned bad partial channel-stuck PoC** (d) **OpenChannel `(T,Q)` 构造永久 brick PoC** (e) **慢响应 chain actor 触发 RPC 雪崩 PoC** (f) **final-hop 错误码 probing oracle PoC** (g) **浏览器双 tab wallet revocation 罚没 PoC** |
 

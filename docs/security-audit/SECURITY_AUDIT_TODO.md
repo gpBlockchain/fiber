@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v27** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成 + Phase 1.5 跨模块审计补强 (XMOD-001..011)** — 见 [附录 C](#附录-c跨模块审计-phase-15)
+> 版本: **v28** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成 + Phase 1.5 跨模块审计补强 (XMOD-001..014)** — 见 [附录 C](#附录-c跨模块审计-phase-15) 与 [`MODULES.md`](./MODULES.md)
 
 ## 项目概况 (Project Profile)
 
@@ -877,6 +877,9 @@ Phase 1 按"维度 × 章节"切片做完 33 项后，**横向**复盘暴露出�
 | **AUDIT-XMOD-009** | rpc ↔ all-actors ↔ ractor (mailbox/timeout) | 🟠 **High** | MEM-003, INPUT-003 | [!] 见下方 |
 | **AUDIT-XMOD-010** | primitives ↔ channel ↔ store (curve panic) | 🟡 Medium | （新发现：`Pubkey::tweak` `.not_inf().expect` + 状态持久化先于 panic） | [!] 见下方 |
 | **AUDIT-XMOD-011** | watchtower ↔ tracing ↔ rpc (preimage leak) | 🟡 Medium | （新发现：日志卫生 + `Preimage` 无 newtype 与 `Hash256` 共用） | [!] 见下方 |
+| **AUDIT-XMOD-012** | invoice ↔ channel ↔ payment (probing oracle) | 🟡 Medium | ERR-001、（payment error codes 记忆） | [!] 见下方 |
+| **AUDIT-XMOD-013** | fiber-bin ↔ env ↔ fiber/key ↔ store ↔ ckb | 🟡 Medium | CRYPTO-003、STORE-001 | [!] 见下方 |
+| **AUDIT-XMOD-014** | fiber-wasm-db-* ↔ store ↔ channel state (跨 tab) | 🟠 **High** | WASM-001、WASM-002、STORE-001（SQLite advisory lock 缺位） | [!] 见下方 |
 
 ### AUDIT-XMOD-001 — Payment → Gossip channel_update slander 全网放大
 
@@ -961,11 +964,14 @@ XMOD 项**继承** Phase 1 优先级，但要求**链式修复**（部分模块�
 | **P0** | XMOD-002, XMOD-006 | 资金直损 |
 | **P0** | XMOD-001, XMOD-004, XMOD-008 | 远程零授权放大/panic/channel-stuck |
 | **P0** | XMOD-009 | 远程一行 RPC 全节点冻结（actor mailbox 无 timeout） |
+| **P0** | XMOD-014 | 浏览器多 tab 同 wallet 资金罚没 |
 | **P1** | XMOD-005 | 多租户/浏览器鉴权穿透 |
 | **P1** | XMOD-003 | 同主机离线攻击者持久化破坏 |
 | **P1** | XMOD-010 | 单条 P2P 消息永久 brick 通道 |
+| **P1** | XMOD-013 | 钱包凭据生命周期端到端硬化 |
 | **P2** | XMOD-007 | 规范层防御纵深 |
 | **P2** | XMOD-011 | 日志泄露 preimage（默认 ERROR-only 但 watchtower 主动 ERROR 级别打印） |
+| **P2** | XMOD-012 | 协议级 probing oracle，与 BOLT-04 对齐 |
 
 ---
 
@@ -1045,4 +1051,96 @@ XMOD 项**继承** Phase 1 优先级，但要求**链式修复**（部分模块�
 3. `biscuit.rs:234` 改 `anyhow!("Token is in revocation list")` 不带 token；
 4. `biscuit.rs:260` 删除 leftover warn；
 5. `main.rs` 默认 `EnvFilter` 显式排除 `fiber_lib::watchtower::actor=warn`（短期止血，长期靠 (1) 类型系统）。
+
+### AUDIT-XMOD-012 — Invoice ↔ Channel ↔ Payment final-hop 错误码 probing oracle
+
+**关联代码**：
+- `crates/fiber-types/src/payment.rs:808-834` (`TlcErrorCode` 包含 fiber 独有的 `InvoiceExpired = PERM|16`、`InvoiceCancelled = PERM|17`，并保留 `FinalIncorrectTlcAmount`/`FinalIncorrectExpiryDelta` 细分)
+- `crates/fiber-lib/src/fiber/channel.rs:840-844, 1156-1170` (`process_add_tlc_peeled_onion_packet` final-hop 校验路径 — 不同失败原因映射不同错误码并对外返回)
+- 对比 BOLT-04：主网 LN 已把上述 4 类错误码统一折叠为 `IncorrectOrUnknownPaymentDetails (PERM|15)`，避免 probing oracle
+
+**问题**：
+1. fiber 在 final hop 返回的错误码区分以下 4 种情形：
+   - `IncorrectOrUnknownPaymentDetails` — payment_hash 未知（正常）
+   - `InvoiceExpired` — payment_hash 已存在但 invoice 已过期
+   - `InvoiceCancelled` — payment_hash 已存在但 invoice 已主动取消
+   - `FinalIncorrectTlcAmount` / `FinalIncorrectExpiryDelta` — payment_hash 已存在且 invoice 有效，但金额/CLTV 不符
+2. 任意能路由到 final hop 的攻击者，按"试错 payment hash"枚举即可：
+   - 用 1 satoshi 试探 → 返回 `InvoiceExpired`：可确认目标节点持有该 payment_hash 的 invoice 且已过期；
+   - 返回 `InvoiceCancelled`：泄露主动取消行为；
+   - 返回 `FinalIncorrect*`：泄露 invoice **存在** + 金额信息（attempt 不同 amt_to_forward，差分回归推 invoice 金额）。
+3. 与 INPUT-002 协同：probing 时也是 invoice DoS 入口（payment 的 invoice 字符串解析复用 panic 面）。
+
+**XMOD 提级理由**：
+- `invoice/`、`fiber/channel`（final-hop 校验）、`fiber/payment`（错误码透传）三个模块共同决定了 oracle 的"信息量"；
+- 修复必须在 *channel.rs final-hop 校验* 与 *payment.rs 错误码透传* 两处同时收口；单改一侧不解决问题。
+- 与 ERR-001 / ERR-002 章节区别：ERR-001 关注本地图 slander（XMOD-001），ERR-002 关注一般错误信息泄露；本条专门覆盖**协议级错误码的 oracle 语义**。
+
+**修复 (FOLLOWUP)**：
+1. **FOLLOWUP-A**：在 `process_add_tlc_peeled_onion_packet` final-hop 路径**统一**返回 `IncorrectOrUnknownPaymentDetails`，不论实际原因（`InvoiceExpired` / `InvoiceCancelled` / `FinalIncorrect*`）— 与 BOLT-04 对齐。
+2. **FOLLOWUP-B**：`InvoiceExpired = PERM|16` / `InvoiceCancelled = PERM|17` 仅保留为**本地**事件类型用于本端日志/RPC subscription，不在 P2P 报文中暴露。
+3. **FOLLOWUP-C**：差分时序攻击防御 — 不论分支，final-hop 失败响应延迟到固定 budget（ms 量级）以避免侧信道泄露。
+4. **回归测试**：每条 probing 路径（4 类）都要有一个集成测试断言**对外返回**统一错误码。
+
+### AUDIT-XMOD-013 — fiber-bin ↔ env ↔ fiber/key ↔ store ↔ ckb 钱包凭据生命周期
+
+**关联代码**：
+- `crates/fiber-bin/src/main.rs` (启动序列：解析 cfg → `read_secret_key` → 初始化 `CkbChainActor` / signer)
+- `crates/fiber-lib/src/ckb/config.rs::read_secret_key` (从磁盘 keyfile + `FIBER_SECRET_KEY_PASSWORD` env 解密 scrypt + AES-GCM)
+- `crates/fiber-lib/src/utils/encrypt_decrypt_file.rs` (加解密原语)
+- `crates/fiber-lib/src/fiber/key.rs` (`Privkey` 实例化与持有)
+- `crates/fiber-lib/src/ckb/signer.rs` (CKB 签名)
+- `crates/fiber-store/src/native.rs:17-105` (DB 目录 0o755/0o644，存放 `commitment_seed` / watchtower `Privkey`)
+
+**问题**：钱包凭据生命周期跨 5 个模块，每模块单独看起来都"合理"但组合面无人收口：
+
+1. **加载入口**：`FIBER_SECRET_KEY_PASSWORD` env 变量从父进程继承。docker / systemd / shell 退出码 dump 把 env **写入** crash log / core dump 是常见模式。fiber 启动后不主动清空该 env（`std::env::remove_var` 在 Rust 是 unsafe + 跨平台 deprecated），子进程（如 fiber spawn 的辅助进程）会继承同一 env。
+2. **解密后**：`Privkey` 留在内存 + `ChannelActorState.commitment_seed` 进 store（0o644）。
+3. **签名路径**：`ckb/signer.rs` 在每次链上交易构造时被调用；signer 实例持有 secret key 引用。
+4. **watchtower**：独立 `Privkey` 存 store，也是 0o644。
+5. **核心心跳**：没有任何模块负责"凭据是否仍合法可用"的健康检查（无 secret zeroization on drop；无 `mlock`；无 swap 抑制）。
+
+**XMOD 提级理由**：
+- 单 finding（CRYPTO-003）只看"加解密本身是否正确"；
+- 单 finding（STORE-001）只看"DB 权限"；
+- 单 finding（INPUT-004）只看"反序列化严格性"；
+- 但**凭据从磁盘 → env → 内存 → store(0o644) → signer**这条端到端路径在 Phase 1 没有统一画像。同主机非特权用户能通过 `/proc/PID/environ` 读 env、`/proc/PID/maps` + `mem` 读内存（CAP_SYS_PTRACE）、读 DB 文件三个独立入口拿到不同片段。
+
+**修复 (FOLLOWUP)**：
+1. **FOLLOWUP-A (P1)**：`fiber-bin` 启动后立即 `prctl(PR_SET_DUMPABLE, 0)` 防 core dump + `mlock_all` 防 swap（Linux 特定，加 cfg gate）；
+2. **FOLLOWUP-B (P1)**：`FIBER_SECRET_KEY_PASSWORD` 读完后用 unsafe `std::env::remove_var` 立即移除（即便有警告也优于残留）；推荐改为读取一次性 fd / unix socket；
+3. **FOLLOWUP-C (P1)**：`Privkey`、`commitment_seed`、watchtower secret 全部 wrap 进 `zeroize::Zeroizing<...>`，Drop 时清零；
+4. **FOLLOWUP-D (P0)**：合并 STORE-001.F1 0o700/0o600 落地（已在 XMOD-003 列出，此处复用）；
+5. **回归测试**：写一个 `tests/security/credential_lifecycle.rs`，覆盖 (a) DB 目录创建后权限断言；(b) 进程 dumpable 标志；(c) 启动后 env 被清空；(d) `Privkey::drop` 后内存确实清零（用 `unsafe` 直读检查）。
+
+### AUDIT-XMOD-014 — fiber-wasm-db-* ↔ store ↔ channel 跨 tab 状态机损坏
+
+**关联代码**：
+- `crates/fiber-store/src/browser*.rs` (IndexedDB 适配；2 处 `unsafe impl Send/Sync` — 与 Phase 1 信任边界 ⑨ 协同)
+- `crates/fiber-wasm-db-worker/` (单 worker 假设)
+- `crates/fiber-wasm-db-common/` (跨 worker 接口)
+- `crates/fiber-wasm/` (浏览器入口)
+- `crates/fiber-store/src/migration.rs:213-312` (migration 逐条 put 无 batch/tx)
+- `crates/fiber-lib/src/fiber/channel.rs:ChannelActorState` (核心持久化对象)
+
+**问题**：浏览器场景下 fiber 没有"单进程独占 store"假设的实现保障：
+
+1. **多 tab 同时打开同一 wallet**：每个 tab 实例化各自的 `ChannelActor` + 各自的 `WatchtowerActor`，但底层 IndexedDB 是同源共享 → 两份 ChannelActor 各自基于"上次读到的"`ChannelActorState` 推进 commitment number → 写回时**最后写者赢**（IndexedDB Object Store put 默认覆盖）；
+2. **migration 非原子**：`fiber-store/src/migration.rs:213-312` 逐条 put 无 transaction → tab A 在 migration 中途、tab B 刷新页面也开始 migration → 双 migration 并发 → 数据库进入未定义状态；
+3. **SQLite 后端无 advisory lock**（STORE-001 已记）：native 也有相同问题但通常单进程；浏览器场景下"多 tab = 多进程"更易触发；
+4. **commitment_seed 损坏 = 永久 brick**：旧 commitment 重新签名后广播 → 对端视为 cheat → revocation tx 上链 → **本端资金被罚没**；
+5. **WASM-001/002 已记**单点（"单 worker 假设" / "Batch 非原子"），但跨 tab 维度未量化。
+
+**XMOD 提级理由**：
+- 浏览器 wallet 场景是 fiber **最实际的用户接入面**（不是节点运营商也能用）；
+- 损失模型直接是**资金罚没**（不是 brick / DoS）；
+- 单 WASM finding 只看了 worker 内部一致性；本条强调**多 tab × 多 worker × 共享 IndexedDB × 无 lock** 四元组。
+
+**修复 (FOLLOWUP)**：
+1. **FOLLOWUP-A (P0)**：在 `fiber-wasm` 启动时通过 `Web Locks API` (`navigator.locks.request`) 申请独占锁，第二个 tab 直接进入只读 / 只观察状态，不允许签名；
+2. **FOLLOWUP-B (P0)**：`fiber-store/src/browser*.rs` 把 migration 与所有 channel state 写入包装到 IndexedDB transaction (`readwrite` mode) 内，跨 store 用 `transaction([...], 'readwrite')`；
+3. **FOLLOWUP-C (P1)**：启动时检测 `commitment_number` 单调性 — 如果新读到的值 < 内存中"我以为最后一次写入"的值，主动 force-close + 报警，不继续推进；
+4. **FOLLOWUP-D (P1)**：SQLite 后端补 `BEGIN EXCLUSIVE` 启动 advisory lock（与 STORE-001 共享修复路径）；
+5. **回归测试**：playwright 集成测试模拟双 tab 同时打开同一 wallet + 同时 send_payment，断言其中一方进入只读模式 / commitment 不发生 double-sign。
+
 

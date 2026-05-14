@@ -1,6 +1,6 @@
 # Fiber Network Node — 模块关系图（安全审计视角）
 
-> 版本: **v1** | 最后更新: 2026-05-14 (S28) | 配套文档: [`SECURITY_AUDIT_TODO.md`](./SECURITY_AUDIT_TODO.md), [`REPORT.md`](./REPORT.md)
+> 版本: **v2** | 最后更新: 2026-05-14 (S28) | 配套文档: [`SECURITY_AUDIT_TODO.md`](./SECURITY_AUDIT_TODO.md), [`REPORT.md`](./REPORT.md)
 
 ## 0. 文档目的
 
@@ -184,6 +184,9 @@
 | **XMOD-009** | E5 + I3 + I5 | rpc ↔ all-actors ↔ ractor ↔ chain | 全栈无 timeout + 无界 mailbox + `.expect()` |
 | **XMOD-010** | E2 + I11 + 状态持久化 | primitives ↔ channel ↔ store | 单 OpenChannel 永久 brick |
 | **XMOD-011** | E5 + I6 + O5 | rpc ↔ watchtower ↔ tracing | preimage 落地后 ERROR 级别打印 |
+| **XMOD-012** | E2 (final-hop) + payment 错误码透传 | invoice ↔ channel ↔ payment | final-hop 错误码与 BOLT-04 偏离 → probing oracle |
+| **XMOD-013** | E10 + 内部 signer + E8 | bin ↔ env ↔ key ↔ store ↔ ckb signer | 凭据生命周期跨 5 模块；env/内存/磁盘 3 个泄露面 |
+| **XMOD-014** | E9 + 隐式跨 tab 边 | wasm-db ↔ store ↔ channel | 多 tab 双签 → 资金罚没 |
 
 ---
 
@@ -205,6 +208,9 @@
 | **INV-10** | 每条 RPC actor 调用必须显式超时；actor mailbox 必须 bounded；fiber 内核任何 actor 不可 `.expect(ASSUME_*)` | I3, I5 | ❌ XMOD-009 |
 | **INV-11** | 协议消息字段不可使 `Pubkey::tweak` 等"几乎全空间安全但有罕见 O 输入"原语 panic；调用方必须能优雅拒绝 | I11 + 状态持久化 | ❌ XMOD-010 |
 | **INV-12** | `Preimage` 必须独立 newtype，`Debug` 默认 redact；所有 ERROR 级别打印不可包含 preimage / token / secret | O5 | ❌ XMOD-011 |
+| **INV-13** | final-hop 错误响应必须与 BOLT-04 对齐，统一返回 `IncorrectOrUnknownPaymentDetails`，不暴露 invoice 状态分支 | E2 final-hop | ❌ XMOD-012 |
+| **INV-14** | 钱包凭据（env / 内存 / 磁盘）全生命周期受保护：env 启动后清空 / `Privkey` Zeroize on Drop / DB 0o600 / dumpable=0 | E8 + E10 + 全内核 | ❌ XMOD-013 |
+| **INV-15** | 浏览器场景下同一 wallet 在同一时刻仅允许一个 tab 持有写权限（Web Locks + commitment_number 回退检测） | E9 + I 跨 tab 边 | ❌ XMOD-014 |
 
 ---
 
@@ -225,6 +231,9 @@
 - INV-10 ↔ MEM-003 + INPUT-003 + AUDIT-XMOD-009
 - INV-11 ↔ AUDIT-XMOD-010（新发现）
 - INV-12 ↔ ERR-002 + AUDIT-XMOD-011（新发现）
+- INV-13 ↔ ERR-001 + AUDIT-XMOD-012（新发现）
+- INV-14 ↔ CRYPTO-003 + STORE-001 + AUDIT-XMOD-013（新发现）
+- INV-15 ↔ WASM-001/002 + STORE-001 + AUDIT-XMOD-014（新发现）
 
 ---
 
