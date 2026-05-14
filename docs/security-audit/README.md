@@ -18,7 +18,7 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 3. **Phase 2** — Doc updates after every session (status, findings, new attack-surface items).
 4. **Phase 3** — Final report.
 
-## Status (TODO v14, 2026-05-14)
+## Status (TODO v15, 2026-05-14)
 
 | Bucket | Count |
 |---|---|
@@ -26,16 +26,16 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | ✅ Passed | 0 |
 | ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
-| ⚠️ Weak design | 16 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001) |
+| ⚠️ Weak design | 17 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001, AUDIT-INPUT-003) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001 — no known CVE in surveyed deps) |
-| ⏳ Pending | 12 |
+| ⏳ Pending | 11 |
 
-## Next session (S14) — planned
+## Next session (S16) — planned
 
-- AUDIT-STORE-001 — Persistence & migration safety (RocksDB CFs, `.schema.json`, binary deser)
-- AUDIT-INPUT-003 — JSON-RPC parameter validation (unauth'd endpoints, hex decode panic surface)
-- AUDIT-ERR-002 — Sensitive info in logs / tracing
-- **Highest-priority follow-ups**: INPUT-002-A/B (remote zero-cost zero-auth DoS fix), LOGIC-008-A/B (direct fund-loss fix), ERR-001-A/B (probing oracle + graph slander), MEM-001-A, AUTH-001-A, AUTH-002-A, LOGIC-007-A
+- AUDIT-ERR-002 — Sensitive info in logs / tracing (preimage / privkey / payment_hash / pubkey)
+- AUDIT-AUTH-003 — RPC CORS / Tower-http defence-in-depth (partial coverage in AUTH-001.F3 + INPUT-003.F5)
+- AUDIT-INPUT-004 — Storage deserialization (bincode) cross-version replay / downgrade
+- **Highest-priority follow-ups**: INPUT-002-A/B (also unblocks INPUT-003.F1), LOGIC-008-A/B, INPUT-003-A (list-RPC limit cap), ERR-001-A/B, STORE-001-A/B, MEM-001-A, AUTH-001-A, AUTH-002-A, LOGIC-007-A
 
 ## Findings index
 
@@ -61,3 +61,4 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | AUDIT-INPUT-002 | 🟠 **High** / 🟠 High × 1 + 🟡 Medium × 2 + 🟢 Low × 2 + ℹ️ Info × 1 + ✅ Pass × 2 | Invoice parsing — `From<InvoiceAttr>` `.expect()` (UTF-8 / pubkey) and `ar_decompress(...).expect()` panic the entire fiber process from a single unauth'd `parse_invoice` / `send_payment` / `cch.receive_btc` call | [findings/AUDIT-INPUT-002.md](./findings/AUDIT-INPUT-002.md) |
 | AUDIT-ERR-001 | 🟡 Medium / 🟡 Medium × 2 + 🟢 Low × 3 + ℹ️ Info × 1 + ✅ Pass × 2 | Payment error codes & probing — final-hop `InvoiceExpired`/`InvoiceCancelled`/`FinalIncorrect{TlcAmount,ExpiryDelta}` leak invoice state (BOLT-04 deviation) → remote zero-cost probing; `update_graph_with_tlc_fail` trusts attacker-controlled `extra_data.node_id`/`channel_outpoint` without route-membership check → local-graph slander; three `.expect(...)` panic PaymentActor when `extra_data` absent | [findings/AUDIT-ERR-001.md](./findings/AUDIT-ERR-001.md) |
 | AUDIT-STORE-001 | 🟡 Medium / 🟡 Medium × 2 + 🟢 Low × 4 + ℹ️ Info × 1 + ✅ Pass × 2 | Persistence & migration — DB directory/files default to 0644/0755 (vs onion key/wallet enforcing 0o600) exposing `commitment_seed`/watchtower `Privkey`/preimage to same-host users; SQLite backend has no exclusive advisory lock (RocksDB has LOCK file) so systemd restart races / OOM-restarts can let two instances double-write `MIGRATION_VERSION_KEY` + ChannelActorState → revocation history split; global `deserialize_from` is `panic!`-on-error → single corrupted record = permanent boot-loop; per-step migrations are non-atomic (no batch/tx) and rely on bincode 1.x default not rejecting trailing bytes for "idempotency" — mid-crash can silently mis-skip records; backend `.expect` lifts I/O errors to process panic without graceful flush | [findings/AUDIT-STORE-001.md](./findings/AUDIT-STORE-001.md) |
+| AUDIT-INPUT-003 | 🟡 Medium / 🟡 Medium × 2 + 🟢 Low × 4 + ℹ️ Info × 1 + ✅ Pass × 3 | JSON-RPC parameter validation — `parse_invoice`/`cch.receive_btc`/`send_payment(invoice)` are the remote-triggering surface for INPUT-002 invoice DoS (single bech32m string panics whole process; CCH = unauth'd cross-chain ingress); `graph_nodes`/`graph_channels`/`list_payments` `limit: Option<u64>` lacks an explicit upper bound — attacker `{ "limit": u64::MAX }` causes full graph/session walk + JSON serialize → 数十 MB response + heavy store I/O (jsonrpsee default 100 conns easily saturated); `get_invoice`/`cancel_invoice` `.expect("no invoice status found")` is remotely panic-able through a tiny state-split window (INVOICE present, STATUS missing — non-atomic insert / STORE-001.F4 mid-migration); jsonrpsee `Server::builder()` uses defaults and `RpcConfig` exposes no `max_connections`/`max_body`/`per_ip_qps` to operators; `is_public_addr` only gates public-bind auth — private/loopback monitors silently run with `enable_auth=false` letting any same-host tenant (shared dev/CI/k8s sidecar) call sensitive RPCs (cancel_invoice/shutdown_channel/send_payment); type-decoding (Pubkey/Hash256/Multiaddr) and DevRpc `#[cfg(debug_assertions)]` gating are correct | [findings/AUDIT-INPUT-003.md](./findings/AUDIT-INPUT-003.md) |

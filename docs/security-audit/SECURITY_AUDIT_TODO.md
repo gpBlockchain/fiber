@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v14** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 14 完成)
+> 版本: **v15** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 15 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 16 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001)
+- ⚠️ 发现弱设计: 17 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001, AUDIT-INPUT-003)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 12
+- ⏳ 待审计: 11
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -225,7 +225,20 @@
     - [✓] **F8 ✅ Pass**: `check_signature` + `validate_signature` 在签名存在时强制校验，hash 覆盖全部 attrs。
   - **总体评价**: 信号层（bech32m / 签名 / HRP / 长度边界）扎实；**异常处理层充满 `.expect()`/`panic!`**，且这些 panic 全部位于用户可达的 RPC / CCH 入口。**单次合法格式的 RPC 请求 → 节点崩溃**。修复成本极低（`.expect → ?` + `From → TryFrom`），是除 LOGIC-008 之外最严重的 DoS 类发现。与 INPUT-001 (P2P 帧) 形成镜像：P2P 受 tentacle 长度限 + molecule 表层保护，但 invoice 入口同等攻击面**未受同等保护**。
   - **发现记录**: 见 [`findings/AUDIT-INPUT-002.md`](./findings/AUDIT-INPUT-002.md)
-- [ ] 🟠 **AUDIT-INPUT-003** JSON-RPC 参数校验
+- [!] 🟡 **AUDIT-INPUT-003** JSON-RPC 参数校验 — **整体 Medium / Medium × 2 + Low × 4 + Info × 1 + Pass × 3**
+  - **关联代码**: `crates/fiber-lib/src/rpc/mod.rs:124-408` (start_server + start_rpc + is_public_addr), `config.rs:1-38` (RpcConfig), `middleware.rs:42-114` (BiscuitAuthMiddleware + inject_rpc_context), `invoice.rs:289-300` (parse_invoice), `:302-369` (.expect("no invoice status found")), `payment.rs:315-343` (list_payments limit), `graph.rs:128-184` (graph_nodes/channels limit), `cch.rs:68-115` (send_btc/receive_btc pay_req)
+  - **审计内容**:
+    - [!] **F1 🟡 Medium**: `invoice.parse_invoice` / `cch.receive_btc` / `payment.send_payment(invoice)` 是 INPUT-002 invoice DoS 的远程触发入口 — 单条合法 bech32m 字符串即让节点 panic；私网默认无鉴权 / CCH 网关接收跨链用户输入 → 零成本零授权 DoS
+    - [!] **F2 🟡 Medium**: `graph_nodes`/`graph_channels` (`limit: Option<u64>` 默认 500) 与 `list_payments` (`limit: Option<u64>` 默认 15) **无显式上界** — 攻击者 `{ "limit": 18446744073709551615 }` → 全量遍历 + clone + JSON 序列化 → 数十 MB 响应 + 大量 store 读 I/O；jsonrpsee 默认 100 并发连接 → 单 IP 即占满
+    - [!] **F3 🟢 Low**: `invoice.rs:312, 338` 中 `get_invoice`/`cancel_invoice` 用 `.expect("no invoice status found")` — `insert_invoice` 双 put 非原子，IO 故障或 STORE-001.F4 mid-migration 可让 INVOICE 存在但 STATUS 缺失 → 远程触发 RPC panic
+    - [!] **F4 🟢 Low**: jsonrpsee `Server::builder()` 用默认配置（10MB body / 100 connections / 无 per-IP-QPS / 无 receive timeout），且 `RpcConfig` **不暴露**这些字段给运维收紧；与 F1/F2 协同放大 DoS
+    - [!] **F5 🟢 Low**: `is_public_addr` 仅检查公网监听强制鉴权；私网/loopback 监听默认 `enable_auth=false` → 同主机多租户（共享 dev/CI/k8s sidecar）任意用户可读所有 RPC（`cancel_invoice`/`shutdown_channel`/`send_payment` 等敏感方法）
+    - [i] **F6 ℹ️ Info**: `middleware.rs:55` `inject_rpc_context` 用 `to_raw_value(...).expect("serialize injected params")` — 当前不可触发，但 RpcContext schema 调整时易引入隐式 panic（防御性建议）
+    - [✓] **F7 ✅ Pass**: Pubkey/Hash256/Privkey/Multiaddr 解析全部走 `try_from`/`parse` + `?` 传播，无 `.expect` 在解码路径
+    - [✓] **F8 ✅ Pass**: `DevRpc` (`add_tlc`/`remove_tlc`/`submit_commitment_transaction` 等危险方法) `#[cfg(debug_assertions)]` release build 自动剔除 ✓
+    - [✓] **F9 ✅ Pass**: 公网监听 (`is_public_addr`) + 未配置 `biscuit_public_key` 时启动 fail-fast，防止公网零鉴权暴露
+  - **总体评价**: RPC 层**类型解析**严谨（Pubkey/Hash256 全部 fallible，公网强制鉴权，DevRpc 编译期剔除），但在**用户字符串透传**（F1，与 INPUT-002 共生）和**集合 size 边界**（F2，零成本资源耗尽）两个面有重要缺口。F3/F4/F5 是防御纵深问题，与 STORE-001/MEM-001/AUTH-001/002 协同放大攻击面。修复成本低（F1 依赖 INPUT-002 主修复；F2/F3 各 < 10 行；F4/F5 小幅 RpcConfig 扩展 + tower middleware）。
+  - **发现记录**: 见 [`findings/AUDIT-INPUT-003.md`](./findings/AUDIT-INPUT-003.md)
 - [ ] 🟠 **AUDIT-INPUT-004** 存储反序列化 (bincode) 与迁移
 - [ ] 🟡 **AUDIT-INPUT-005** CKB Tx / Cell 数据
 
@@ -517,32 +530,47 @@
 | AUDIT-STORE-001.F6 | 🟢 Low | 添加 `--auto-confirm-migration` flag + 非 TTY 默认拒绝 | 未修复 |
 | AUDIT-STORE-001.F7 | 🟢 Low | 后端 trait 改 Result<...> 提供 graceful flush 钩子（大重构） | 未修复 |
 | AUDIT-STORE-001.F8 | ℹ️ Info | `check_validate` 默认分支报告 unknown prefix counts | 未修复 |
+| AUDIT-INPUT-003.F1 | 🟡 Medium | `parse_invoice`/`cch.receive_btc`/`payment.send_payment(invoice)` 是 INPUT-002 远程触发面 — 修复依赖 INPUT-002 主修复 | 未修复 |
+| AUDIT-INPUT-003.F2 | 🟡 Medium | `graph_nodes`/`graph_channels`/`list_payments` `limit: Option<u64>` 加显式 `MAX_LIMIT` 上界 + 检查 `list_channels`/`list_peers` | 未修复 |
+| AUDIT-INPUT-003.F3 | 🟢 Low | `get_invoice`/`cancel_invoice` `.expect("no invoice status found")` → `ok_or_else(|| rpc_error(...))` | 未修复 |
+| AUDIT-INPUT-003.F4 | 🟢 Low | `RpcConfig` 暴露 `max_connections`/`max_request_body_size`/`per_ip_qps`；引入 `tower-governor` 限速；hyper keep_alive_timeout | 未修复 |
+| AUDIT-INPUT-003.F5 | 🟢 Low | `is_public_addr` 不再唯一 gate；启用敏感模块 (payment/channel/cch/watchtower) 时一律强制 biscuit；或 `force_auth: bool` 默认 true | 未修复 |
+| AUDIT-INPUT-003.F6 | ℹ️ Info | `middleware.inject_rpc_context.expect("serialize injected params")` 改 Result 传播 | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S15)
+## Phase 1 — 下一步建议 (Session S16)
 
-按 SKILL §三选取规则，S15 计划：
+按 SKILL §三选取规则，S16 计划：
 
-1. **AUDIT-INPUT-003** — JSON-RPC 参数校验（无授权端点 / 数值边界 / hex 解码 panic 面）
-2. **AUDIT-ERR-002** — 日志/tracing 中的敏感信息
-3. **AUDIT-AUTH-003** — RPC CORS / Tower-http 配置
+1. **AUDIT-ERR-002** — 日志/tracing 中的敏感信息（preimage / privkey / payment_hash / pubkey）
+2. **AUDIT-AUTH-003** — RPC CORS / Tower-http 配置（已部分覆盖于 AUTH-001.F3 与 INPUT-003.F5，需补充 Origin allow-list 与 CSRF 防御纵深审计）
+3. **AUDIT-INPUT-004** — 存储反序列化 (bincode) 与迁移（已部分覆盖于 STORE-001.F3/F4，需补充 cross-version replay / downgrade 测试）
 
 跟进遗留（按优先级）：
-- **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播
+- **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播（同时解锁 INPUT-003.F1）
 - **AUDIT-LOGIC-008-FOLLOWUP-A/B (high, 直接资金损失修复)** — `expire_order` Pending-only gating + LND/Fiber 对称 cancel 路径
+- **AUDIT-INPUT-003-FOLLOWUP-A (medium, 零成本 DoS 修复)** — list-type RPC `limit` 上界
+- **AUDIT-ERR-001-FOLLOWUP-A/B (medium, probing + slander 修复)** — 折叠 final-hop 错误码 + `update_graph_with_tlc_fail` 加 route-membership 校验
+- **AUDIT-STORE-001-FOLLOWUP-A/B (medium, deployment hardening)** — DB 文件权限 0700/0600 + SQLite 独占 advisory lock
 - **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复
 - **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower NodeId 冲突 PoC + 修复
 - **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复
 - **AUDIT-LOGIC-007-FOLLOWUP-A** — 协同 DoS PoC
 - **AUDIT-INPUT-002-FOLLOWUP-C/D/E/F** — panic 反模式 / dup attr / fuzz 改进 / catch_unwind 防御
+- **AUDIT-INPUT-003-FOLLOWUP-B/C/D/E/F** — `.expect` 防御化 + RpcConfig 字段扩展 + force_auth + inject_rpc_context Result + catch_unwind
 - **AUDIT-LOGIC-008-FOLLOWUP-C** — orphaned-preimage 旁路
 - **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造
 - **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
-- **AUDIT-ERR-001-FOLLOWUP-A/B/C/D/E** — final-hop 错误码折叠 + graph slander 防护 + `.expect` 防御化 + timing padding 反汇编验证 + slander PoC 测试
-- **AUDIT-STORE-001-FOLLOWUP-A/B** — DB 文件权限 0700/0600 + SQLite 独占 advisory lock
+- **AUDIT-ERR-001-FOLLOWUP-C/D/E** — `.expect` 防御化 + timing padding 反汇编验证 + slander PoC 测试
+- **AUDIT-STORE-001-FOLLOWUP-C/D/E/F/G/H** — migration batch + bincode strict / deserialize Result / MissingMigration / auto-confirm / backend Result trait / check_validate unknown-prefix
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 15 已完成
+
+按计划完成：
+- ✅ **AUDIT-INPUT-003** — JSON-RPC 参数校验。发现 **F1 🟡 Medium — `parse_invoice`/`cch.receive_btc`/`payment.send_payment(invoice)` 是 INPUT-002 invoice DoS 的远程触发面**：单条合法 bech32m 字符串即让节点 panic；私网默认无鉴权 / CCH 网关接收跨链用户输入 → 零成本零授权 DoS。本条主要起入口标记作用，修复依赖 INPUT-002 主修复。**F2 🟡 Medium — `graph_nodes`/`graph_channels`/`list_payments` 的 `limit: Option<u64>` 无显式上界**：`unwrap_or(default)` 仅对缺省有效，攻击者显式传 `u64::MAX` → 全量遍历 + clone + JSON 序列化 → 数十 MB 响应；jsonrpsee 默认 100 并发即被单 IP 占满。**F3 🟢 Low — `get_invoice`/`cancel_invoice` `.expect("no invoice status found")`**：`insert_invoice` 双 put 非原子，IO 故障或 STORE-001.F4 mid-migration 可让 INVOICE 存在但 STATUS 缺失 → 远程触发 panic。**F4 🟢 Low — jsonrpsee `Server::builder()` 用默认配置 + RpcConfig 不暴露 max_connections/max_body/qps**：与 F1/F2 协同放大 DoS。**F5 🟢 Low — `is_public_addr` 仅检查公网监听强制鉴权；私网/loopback 默认 `enable_auth=false`**：同主机多租户（共享 dev/CI/k8s sidecar）任意用户可读所有 RPC，与 STORE-001.F1 文件权限问题对称。**F6 ℹ️ Info — `middleware.inject_rpc_context` 用 `.expect("serialize injected params")`**：当前不可触发，防御性建议改 Result 传播。**F7-F9 ✅ Pass**：Pubkey/Hash256/Multiaddr 解析全部走 `try_from` + `?`；DevRpc `#[cfg(debug_assertions)]` release 剔除；公网监听 `is_public_addr` + biscuit 强制 fail-fast。整体评价：RPC 层**类型解析**严谨（Pubkey/Hash256 全部 fallible，公网强制鉴权，DevRpc 编译期剔除），但在**用户字符串透传**（F1）和**集合 size 边界**（F2）两个面有重要缺口；F3/F4/F5 是防御纵深，与 INPUT-002/STORE-001/MEM-001/AUTH-001 协同放大攻击面。修复成本低（F2/F3 各 < 10 行）。新增 6 个 follow-ups（A 必修 Medium，B/C/D 防御 Low，E 维护 Info，F 临时 catch_unwind）。
 
 ## Phase 1 — Session 14 已完成
 
