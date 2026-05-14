@@ -4,7 +4,7 @@
 |---|---|
 | 项目 | gpBlockchain/fiber (Fiber Network Node, FNN) |
 | 分支/快照 | `copilot/create-security-audit-plan` (HEAD at audit close) |
-| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S27, 27 个会话；Phase 1 = S1-S26 33 项 + Phase 1.5 = S27 跨模块 XMOD 补强) |
+| 审计周期 | 2026-05-13 至 2026-05-14 (S1-S28, 28 个会话；Phase 1 = S1-S26 33 项 + Phase 1.5 = S27-S28 跨模块 XMOD-001..011 补强) |
 | 审计范围 | 工作区全部 9 crates ~144k 行 Rust；Cargo.lock 锁定的依赖图 |
 | 审计方法 | 静态阅读 + ripgrep + 编译期类型/匹配收口 + bincode/molecule 实测 (`/tmp/bctest`)，**无动态 PoC** (所有 ⚠️ 标 "[?]" 的项明确标识 "需动态验证") |
 | 工具 | GitHub Advisory DB (DEP-001)、`grep`/`view` + 仓库自带 fuzz 目标审阅 |
@@ -291,6 +291,10 @@ Fiber 是 CKB 之上的 Layer-2 支付网络节点（Lightning Network 类设计
 | **XMOD-005** | rpc ↔ auth ↔ biscuit | 🟠 High | `is_public_addr` 单 gate + CORS 全通配 fallback + 无 Host allowlist + standalone watchtower `NodeId::local()` | INPUT-003.F5, AUTH-001/003 |
 | **XMOD-006** | watchtower ↔ ckb ↔ channel ↔ gossip | 🟠 High | 反 cheat 链 (报告 §4 链 A) — 修复必须四模块同步 | INPUT-005, LOGIC-003, CRYPTO-004, AUTH-002, NET-001 |
 | **XMOD-007** | network ↔ spec ↔ store | 🟡 Medium | Init `chain_hash` 规范缺位 → 第三方实现漏校 → 跨网攻击 | SPEC-001.F7, AUTH-002.F8 |
+| **XMOD-008** | channel ↔ gossip ↔ network | 🟠 High | 5 处 MuSig2 partial 接收中 4 处缺 `verify_partial`（ClosingSigned×2 / RevokeAndAck / AnnouncementSignatures）；仓库内 4732-4737 TODO 已知该 bug | CRYPTO-004.F2, LOGIC-007, MEM-001 |
+| **XMOD-009** | rpc ↔ all-actors ↔ ractor | 🟠 High | RPC `handle_actor_call!` 全 `call!` 无 timeout + ractor 0.15 默认无界 mailbox + `.expect(ASSUME_*)` 死路 panic | MEM-003, INPUT-003 |
+| **XMOD-010** | primitives ↔ channel ↔ store | 🟡 Medium | `Pubkey::tweak` `.not_inf().expect` + 同条 `OpenChannel` 两 attacker-controlled 公钥无关系校验 + channel state 已持久化先于 panic → 重启再 panic = **永久 brick** | （新发现，与 CRYPTO-001 同模块但不同问题） |
+| **XMOD-011** | watchtower ↔ tracing ↔ rpc | 🟡 Medium | `watchtower/actor.rs:181` 主动 ERROR 级别打印 `preimage:?` 全 hex；`Preimage` 复用 `Hash256` 类型系统无防护；biscuit token Display | （新发现：日志卫生） |
 
 ### 11.2 跨模块协同链 — 扩展（§4 链 A/B/C 之外的链 D/E/F）
 
@@ -333,6 +337,91 @@ attacker (mid-hop)  ──TlcErr+channel_update──>  victim sender
 
 **核心修复**：STORE-001.F1 (0o700/0o600) + INPUT-004.F1 (`reject_trailing_bytes`) + db-version HMAC。
 
+#### 链 G：MuSig2 partial-sig DoS 双向（XMOD-008 + LOGIC-007 + XMOD-006）
+
+```
+attacker (channel 对端)
+   │
+   ├─ ClosingSigned { bad partial } ──> 我方 (792-803) ──> remote_shutdown_info.signature = bad
+   │                                         │
+   │                                         ▼ build_shutdown_tx 阶段 aggregate 失败
+   │                                   channel stuck ShuttingDown
+   │                                         │
+   │                                         ▼ (+ LOGIC-007 fee_rate=0 / 200B args)
+   │                                   force-close + CSV 锁资金
+   │
+   ├─ RevokeAndAck { bad partial } ──> 我方 (7301) ──> aggregate 失败 / 错值写入 store
+   │                                         │
+   │                                         ▼ (+ LOGIC-003.F6 revocation 覆盖式)
+   │                                   反 cheat 防线断裂 (与链 A 协同)
+   │
+   └─ AnnouncementSignatures { bad partial } ──> 我方 (4720) ──> aggregate 失败 + warn! 不 ban
+                                             │
+                                             ▼ (无 NET-001.F1 持久 ban)
+                                       重连 + 重发 → channel 公开 DoS + gossip 入存放大
+```
+
+**资金间损**：(a) 协作关闭被坏 partial 阻断 → force-close penalty；(b) revocation 链污染 → 反 cheat 防线断（与链 A 同址）。
+
+**核心修复**：XMOD-008.FOLLOWUP-A（3 处统一 `verify_partial`）+ FOLLOWUP-B（失败 ban 对端，依赖 NET-001.F1）。
+
+#### 链 H：单一 RPC 端点 → 全 fiber 进程冻结（XMOD-009 + INPUT-003）
+
+```
+attacker  ─jsonrpsee TCP─>  rpc/channel.rs  ─handle_actor_call!─>  NetworkActor
+                                                                        │ (无 timeout)
+                                                                        ▼
+                                                                  ChannelActor (无 timeout)
+                                                                        │
+                                                                        ▼
+                                                                  ChainActor (DEFAULT_CHAIN_ACTOR_TIMEOUT=5min)
+                                                                        │ chain RPC 慢/挂
+                                                                        ▼
+                                                            network.rs:3490 `.expect()` → panic 全 NetworkActor
+                                                                        │
+                                                                        ▼
+                                                                fiber 进程 crash
+```
+
+并发的 attacker：
+- INPUT-003 默认 100 connections / 10MB body → 100 个慢请求并发
+- ractor 0.15 默认无界 mailbox → 每个 actor 收件箱不断膨胀 → 进程 OOM 在 panic 之前到达
+
+**资金间损**：节点不可用期间无法响应 watchtower preimage、无法 honest force-close、watchtower 子流程亦 panic（与链 A 协同）。
+
+**核心修复**：XMOD-009.FOLLOWUP-1..4（RPC 显式 timeout + ractor bounded mailbox + 移除 `.expect(ASSUME_*)`）。
+
+#### 链 I：单条 P2P 消息永久 brick 通道（XMOD-010）
+
+```
+attacker (open channel side)
+   │
+   └─ OpenChannel {
+        tlc_basepoint = T,  ← 构造 s·G
+        first_per_commitment_point = Q,  ← 任选 secp256k1 点
+        // 满足 T + blake2b(Q)·G = O
+      }
+              │
+              ▼  channel.rs:8748-8762 无两公钥关系校验
+        ChannelActorState 持久化到 store
+              │
+              ▼  首次 derive_tlc_pubkey (channel.rs:6097-6126)
+        Pubkey::tweak (primitives.rs:511-519) → result == O
+              │
+              ▼  `.not_inf().expect("valid public key")`
+        ChannelActor panic
+              │
+              ▼  重启
+        Store 重新加载 state → 再次 derive_tlc_pubkey → 再次 panic
+              │
+              ▼
+        **永久 brick：无法收发 TLC，force-close 也走不通签名路径**
+```
+
+**资金间损**：通道资金锁死直到链上 commitment 强制 timeout（CSV）。
+
+**核心修复**：XMOD-010.FOLLOWUP-1..3（`Pubkey::tweak` 改 Result + handler 持久化前预派生 + 启动加载若派生失败标 bricked 而非 panic）。
+
 ### 11.3 修复优先级（含 XMOD）
 
 合并 §6 与 XMOD 后的统一 P0/P1 列表：
@@ -344,21 +433,30 @@ attacker (mid-hop)  ──TlcErr+channel_update──>  victim sender
 - AUTH-001.F1（standalone watchtower）— **包含在 XMOD-005**
 - MEM-001.F1（gossip 入存验签 + per-peer 上限）— **与 XMOD-001 协同**
 - **XMOD-001.FOLLOWUP-A**（route-membership 校验 + 速率限制 channel_update 出站转发）
+- **XMOD-008.FOLLOWUP-A**（3 处 MuSig2 partial 统一 `verify_partial` 预校验）
+- **XMOD-009.FOLLOWUP-1..3**（RPC 显式 timeout + ractor bounded + 移除 `.expect(ASSUME_*)`）
 
 #### P1
 - CRYPTO-001 PoC（同 §6）
-- LOGIC-007 协同补丁（同 §6）
-- CRYPTO-004 verify_partial（同 §6）
+- LOGIC-007 协同补丁（同 §6；与 XMOD-008 同 PR 提交）
+- CRYPTO-004 verify_partial（同 §6；合并到 XMOD-008.FOLLOWUP-A）
 - **XMOD-005**：敏感模块强制 biscuit + CORS 启用空列表 fail-fast + Host allowlist
 - **XMOD-003**：store 0o700/0o600 + bincode strict + db-version HMAC
+- **XMOD-010**：`Pubkey::tweak` 返回 Result + handler 预派生验证
 - NET-001.F4（UPnP 开关）/ MEM-003 / STORE-001（同 §6）
+- NET-001.F1 持久 ban list（XMOD-006 和 XMOD-008 都依赖）
+
+#### P2
+- **XMOD-007**：SPEC-001 规范补 Init chain_hash + funding 双校验
+- **XMOD-011**：`Preimage` newtype + 日志 redact + biscuit token 移除 Display
 
 ### 11.4 Phase 1.5 交付
 
 | 项 | 状态 |
 |---|---|
-| TODO 附录 C（7 条 XMOD 项 + 链 D/E/F 链路图） | ✅ 本提交 |
-| `findings/AUDIT-XMOD-001.md`（独立详细） | ✅ 本提交 |
-| XMOD-002..007 是否需要独立 finding 文件 | 后续按需补；当前已有 ≥2 个 Phase 1 finding 引用足以追踪 |
-| Phase 2 PoC 列表 | 在 §7 路线图基础上追加：(a) channel_update gossip 放大 PoC (b) cch 24h 窗口实战 PoC |
+| TODO 附录 C（11 条 XMOD 项 + 链 D/E/F/G/H/I 链路图） | ✅ 本提交（v27） |
+| `findings/AUDIT-XMOD-001.md`（payment ↔ gossip slander 放大） | ✅ S27 |
+| `findings/AUDIT-XMOD-008.md`（MuSig2 partial-sig 不一致） | ✅ 本提交 |
+| XMOD-002..007 / XMOD-009..011 是否需要独立 finding 文件 | 后续按需补；当前已有 ≥1 个 Phase 1 finding 引用或代码引用足以追踪 |
+| Phase 2 PoC 列表 | 在 §7 路线图基础上追加：(a) channel_update gossip 放大 PoC (b) cch 24h 窗口实战 PoC (c) **ClosingSigned bad partial channel-stuck PoC** (d) **OpenChannel `(T,Q)` 构造永久 brick PoC** (e) **慢响应 chain actor 触发 RPC 雪崩 PoC** |
 

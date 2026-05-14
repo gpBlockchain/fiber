@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v26** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成 + Phase 1.5 跨模块审计补强 (XMOD)** — 见 [附录 C](#附录-c跨模块审计-phase-15)
+> 版本: **v27** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成 + Phase 1.5 跨模块审计补强 (XMOD-001..011)** — 见 [附录 C](#附录-c跨模块审计-phase-15)
 
 ## 项目概况 (Project Profile)
 
@@ -873,6 +873,10 @@ Phase 1 按"维度 × 章节"切片做完 33 项后，**横向**复盘暴露出�
 | **AUDIT-XMOD-005** | rpc ↔ auth ↔ biscuit ↔ network | 🟠 **High** | INPUT-003.F5, AUTH-001.F1, AUTH-003.F1/F4 | [!] 见下方 |
 | **AUDIT-XMOD-006** | watchtower ↔ ckb ↔ channel ↔ gossip | 🟠 **High** | INPUT-005, LOGIC-003.F6, CRYPTO-004.F2, AUTH-002.F1, NET-001.F1 | [!] 见下方 |
 | **AUDIT-XMOD-007** | network ↔ store ↔ chain hash | 🟡 Medium | NET-001.F1, AUTH-002.F8, SPEC-001.F7 | [!] 见下方 |
+| **AUDIT-XMOD-008** | channel ↔ gossip ↔ network (MuSig2) | 🟠 **High** | CRYPTO-004.F2, LOGIC-007, MEM-001, NET-001.F1 | [!] 见独立 finding |
+| **AUDIT-XMOD-009** | rpc ↔ all-actors ↔ ractor (mailbox/timeout) | 🟠 **High** | MEM-003, INPUT-003 | [!] 见下方 |
+| **AUDIT-XMOD-010** | primitives ↔ channel ↔ store (curve panic) | 🟡 Medium | （新发现：`Pubkey::tweak` `.not_inf().expect` + 状态持久化先于 panic） | [!] 见下方 |
+| **AUDIT-XMOD-011** | watchtower ↔ tracing ↔ rpc (preimage leak) | 🟡 Medium | （新发现：日志卫生 + `Preimage` 无 newtype 与 `Hash256` 共用） | [!] 见下方 |
 
 ### AUDIT-XMOD-001 — Payment → Gossip channel_update slander 全网放大
 
@@ -955,8 +959,90 @@ XMOD 项**继承** Phase 1 优先级，但要求**链式修复**（部分模块�
 | 优先级 | XMOD 项 | 触发条件 |
 |---|---|---|
 | **P0** | XMOD-002, XMOD-006 | 资金直损 |
-| **P0** | XMOD-001, XMOD-004 | 远程零授权放大/panic |
+| **P0** | XMOD-001, XMOD-004, XMOD-008 | 远程零授权放大/panic/channel-stuck |
+| **P0** | XMOD-009 | 远程一行 RPC 全节点冻结（actor mailbox 无 timeout） |
 | **P1** | XMOD-005 | 多租户/浏览器鉴权穿透 |
 | **P1** | XMOD-003 | 同主机离线攻击者持久化破坏 |
+| **P1** | XMOD-010 | 单条 P2P 消息永久 brick 通道 |
 | **P2** | XMOD-007 | 规范层防御纵深 |
+| **P2** | XMOD-011 | 日志泄露 preimage（默认 ERROR-only 但 watchtower 主动 ERROR 级别打印） |
+
+---
+
+### AUDIT-XMOD-008 — Channel ↔ Gossip MuSig2 partial-signature 预校验不一致
+
+详见 [`findings/AUDIT-XMOD-008.md`](./findings/AUDIT-XMOD-008.md)。要点：`channel.rs` 共 5 处接收对端 MuSig2 partial signature，但仅 `CommitmentSigned.verify_and_complete_tx` (8339-8340) 调用 `verify_partial`；`ClosingSigned` (792-803, 6591-6598)、`RevokeAndAck` (7301-7356)、`AnnouncementSignatures` (4720-4737) 三条路径全部直接 `aggregate_partial_signatures`，而 `musig2 0.2.4` 只验聚合不验单 partial。`AnnouncementSignatures` 4720-4737 处 TODO 注释**已明确承认**"we should ban remote peer if we fail to aggregate the signature since the error is caused by the wrong nonce" — 仓库内已知 bug 至今未修。
+
+**XMOD 提级理由**：3 条路径中 `AnnouncementSignatures` 产物直接进 gossip 广播池（channel ↔ gossip 跨模块），其余两条 (`ClosingSigned`/`RevokeAndAck`) 直接关系到协作关闭与 revocation chain（channel ↔ network 跨模块，且与 XMOD-006 反 cheat 链协同）。
+
+**修复 (FOLLOWUP)**：(a) 3 处统一 `verify_partial` 预校验；(b) 失败时主动 ban 对端 peer（依赖 NET-001.F1 持久 ban list — XMOD-008 与 XMOD-006 共享 ban list 依赖）；(c) 把"verify_partial then aggregate"提炼为统一 helper，避免后续协议消息漏校。
+
+### AUDIT-XMOD-009 — RPC ↔ all-actors ↔ ractor 无 timeout/无界 mailbox 全栈冻结
+
+**关联代码**：
+- `crates/fiber-lib/src/rpc/utils.rs:50-84` (`handle_actor_call!` 宏统一用 `call!`，**全 RPC 模块无超时**：channel / payment / invoice / peer / info / dev)
+- `crates/fiber-lib/Cargo.toml:38-40` (`ractor 0.15` 仅启用 `async-trait` feature，**MPSC mailbox 默认无界**)
+- `crates/fiber-lib/src/fiber/network.rs:116` (`DEFAULT_CHAIN_ACTOR_TIMEOUT = 5min` — 太长)
+- `crates/fiber-lib/src/fiber/network.rs:3484-3490` (`.expect(ASSUME_CHAIN_ACTOR_ALWAYS_ALIVE_FOR_NOW)` — chain actor 死路 panic)
+- `crates/fiber-lib/src/fiber/payment.rs:1423-1438` (SendPaymentOnionPacket 也用 5min 超时)
+- `crates/fiber-lib/src/fiber/gossip.rs:1197-1240, 1521-1546` (NewSubscription / QueryBroadcastMessages 全用 `call!` 无超时)
+
+**问题**：
+1. **跨模块全链路无超时**：RPC 调 NetworkActor → NetworkActor 调 ChannelActor → ChannelActor 调 ChainActor → ChainActor 调 CKB RPC client。链上任一节点慢响应，调用方堵在 `call!()` 上。
+2. **mailbox 无界**：ractor 0.15 默认 MPSC 无界 → 攻击者持续发 RPC（jsonrpsee `Server::builder()` 用默认 100 connections / 10MB body，见 INPUT-003）→ actor mailbox 积压 → 进程 OOM。
+3. **chain actor `.expect()` 死路**：若 chain actor 意外退出，`network.rs:3490` 主动 panic NetworkActor → 整个 fiber 进程崩溃。
+4. **ActorHandleLogGuard (utils/actor.rs:1-54) + 15s 阈值已启用** ✓ 但只 *记录*，不 *中断*。
+
+**XMOD 提级理由**：单一 RPC 端点慢 → 全 fiber 进程冻结 = 跨 rpc / all-actors / ractor 三层不变量违反。`MEM-003` 单独点出 mailbox 问题，但**没有覆盖** "RPC 路径全栈无 timeout + actor `.expect()` 死路 + 无界 mailbox 三者协同的全链路效果"。
+
+**修复 (FOLLOWUP)**：
+1. `handle_actor_call!` 改用 `call_t!(actor, msg, timeout)`，每条 RPC 显式 30s timeout；
+2. `Cargo.toml` 启用 `ractor` 的 `bounded` 相关 feature（如 0.15 支持），或所有 actor 启动时显式 `set_supervision_strategy` + 限定 mailbox 容量；
+3. 把 `.expect(ASSUME_*)` 全部改 `if let Err(e) = ... { error!(); /* graceful degrade */ }`；
+4. INPUT-003.F* 同步收紧 `RpcConfig.max_connections` 与 `max_body_size`。
+
+### AUDIT-XMOD-010 — Primitives ↔ Channel ↔ Store 曲线代数 panic 永久 brick 通道
+
+**关联代码**：
+- `crates/fiber-types/src/primitives.rs:511-519` (`Pubkey::tweak` 末尾 `.not_inf().expect("valid public key")`)
+- `crates/fiber-types/src/schema/fiber.mol:41-42, 58-59` (`OpenChannel` / `AcceptChannel` 同条消息中 `tlc_basepoint` 和 `first_per_commitment_point` 均 attacker-controlled)
+- `crates/fiber-lib/src/fiber/channel.rs:8748-8762` (`OpenChannel` 入参处理，**无两公钥关系校验**)
+- `crates/fiber-lib/src/fiber/channel.rs:6097-6126` (`derive_tlc_pubkey` 首次调用点 — `get_tlc_pubkeys` / `get_tlc_keys`)
+- 状态持久化：`ChannelActorState` 在 OpenChannel/AcceptChannel handler 返回前已通过 store 写入 → panic 后重启复现
+
+**问题**：`Pubkey::tweak` 实际为 `T + blake2b(Q)·G`，攻击者只需在同一条 `OpenChannel`（或 `AcceptChannel`）里发送一对 `(T, Q)` 使该结果等于无穷远点 O。即：选择标量 `s = -blake2b(Q) mod n`、令 `T = s·G`、`Q` 任选 → `T + blake2b(Q)·G = O`。`Pubkey::from_slice` (503-508) 接受任意有效压缩点 → 攻击者可任意选 Q → 同时控制 `blake2b(Q)`。`OpenChannel` 同条消息内两字段无任何关联校验 (8748-8762)，victim 在首次 `derive_tlc_pubkey` 调用即 panic。
+
+**已与"channel state 已持久化先于 panic"协同**：channel state 在 panic 之前已经 commit 到 store → 节点重启后 ChannelActor 重新加载该 state，再次走 derive_tlc_pubkey → 再次 panic → **永久 brick 通道**（无法收发任何 TLC / 协作关闭 / force-close 也走不通签名路径）。
+
+**XMOD 提级理由**：单一 finding 视角 `primitives.rs` 看不到攻击面（看上去只是密码学库 strictness）；`channel.rs` 视角看不到 panic 性（看上去只是 OpenChannel 处理）；`store` 视角看不到触发条件（看上去只是状态持久化）。三层组合才形成"一条 P2P 消息 → 永久 brick"。
+
+**修复 (FOLLOWUP)**：
+1. `Pubkey::tweak` 返回 `Result<Pubkey, KeyError>`，调用方在 `derive_tlc_pubkey` / `derive_*_pubkey` 显式处理 None；
+2. `OpenChannel` / `AcceptChannel` handler 在持久化前预跑一次 `derive_tlc_pubkey` 与 `derive_revocation_pubkey` 做"早期验证"，失败则 reject channel 且**不**持久化；
+3. ChannelActor 启动时若加载某 channel state 触发派生失败，应将该 channel 标记 `bricked` 并允许 force-close，而非 panic。
+4. `Privkey::tweak` (403-412) `.not_zero().expect` 仅本地 secret 使用 → Low；可不改。
+
+### AUDIT-XMOD-011 — Watchtower ↔ Tracing ↔ RPC 日志泄露 preimage
+
+**关联代码**：
+- `crates/fiber-lib/src/watchtower/actor.rs:181` (`tracing::error!` 直接以 ERROR 级别打印 `preimage:?` 全 hex)
+- `crates/fiber-lib/src/rpc/biscuit.rs:234` (`anyhow!("Token is in revocation list: {token}")` 把 token 进 Error Display)
+- `crates/fiber-lib/src/rpc/biscuit.rs:260` (leftover `warn!("fetch {id:?} {node_id:?}")`)
+- `crates/fiber-types/src/primitives.rs:215-217, 358-369` (`Hash256` Debug 完整 hex；**`Preimage` 无独立 newtype 与 `payment_hash` 共用 `Hash256`**)
+- `crates/fiber-bin/src/main.rs:84-89` (默认 `EnvFilter::from_default_env()` = ERROR-only — 但 watchtower 的泄露在 ERROR 级)
+
+**问题**：
+1. **默认 ERROR-only 不能止血**：`watchtower/actor.rs:181` 主动用 ERROR 级别打印 preimage → 默认配置即可看到。
+2. **类型系统无防护**：`Preimage` 复用 `Hash256` 没独立 newtype → 未来代码任意 `{preimage:?}` 都会全 hex 输出，无编译期警告。
+3. **多入口**：watchtower 日志 + biscuit token Display + leftover warn — 三个不同模块的"该 redact 没 redact"。
+4. **远程可诱导**：`create_preimage` RPC 由 RPC 端点接收 → preimage 经 watchtower 落地 → 日志路径 → 同主机或日志聚合（如 syslog/k8s-log）泄露给次级攻击者。
+
+**XMOD 提级理由**：单 finding 视角是"日志卫生"；跨模块视角是"敏感字段类型系统无防护 + 远程 RPC 可诱导 + watchtower 主动 ERROR 级 + 默认 log filter 不过滤"四点叠加 → 跨链 preimage 泄露面。
+
+**修复 (FOLLOWUP)**：
+1. 引入 `Preimage(Hash256)` newtype，`Debug` 实现统一返回 `"<redacted preimage>"`；
+2. 全仓 `grep '\{preimage'` 复审一次，所有打印改为 `payment_hash` 或 `<redacted>`；
+3. `biscuit.rs:234` 改 `anyhow!("Token is in revocation list")` 不带 token；
+4. `biscuit.rs:260` 删除 leftover warn；
+5. `main.rs` 默认 `EnvFilter` 显式排除 `fiber_lib::watchtower::actor=warn`（短期止血，长期靠 (1) 类型系统）。
 
