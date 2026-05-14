@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v16** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 16 完成)
+> 版本: **v17** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 17 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 18 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001, AUDIT-INPUT-003, AUDIT-ERR-002)
+- ⚠️ 发现弱设计: 19 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001, AUDIT-INPUT-003, AUDIT-ERR-002, AUDIT-AUTH-003)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 10
+- ⏳ 待审计: 9
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -277,7 +277,20 @@
     - [i] **F7-F10 (Pass)**: secio remote_pubkey 绑定；gossip 三类消息签名验证；SOCKS5 stream isolation 默认；onion v3 key 生成
   - **最严重场景 (F1)**: 攻击者用 17 个 fresh keypair 同时 dial 受害节点的 p2p 端口；每次 secio 握手完成后 `enforce_inbound_peer_budget` 被触发，由于 `peers.sort_by_key(|(_, sid)| *sid)` 升序 + `.take(1).disconnect()`，**最老的合法 inbound-no-channel session 被踢**。合法节点 reconnect 后再次成为最老，再次被踢。攻击者只需 < 100 KB/s 流量持续轮转，即可让节点对任何新 peer 不可达，阻断 channel onboarding 与 gossip 同步入度
   - **发现记录**: 见 [`findings/AUDIT-AUTH-002.md`](./findings/AUDIT-AUTH-002.md)
-- [ ] 🟡 **AUDIT-AUTH-003** RPC CORS / Tower-http 配置
+- [!] 🟡 **AUDIT-AUTH-003** RPC CORS / Tower-http 配置 — **整体 Medium / Medium × 1 + Low × 2 + Info × 2 + Pass × 4**
+  - **关联代码**: `crates/fiber-lib/src/rpc/config.rs:23-31` (cors_enabled/cors_allowed_origins), `crates/fiber-lib/src/rpc/mod.rs:76,128-129,207-235` (CorsLayer 构造), `crates/fiber-lib/src/rpc/mod.rs:248-264,285-287` (is_public_addr + biscuit gate), `crates/fiber-lib/src/rpc/middleware.rs:30-40` (auth_token Bearer-only), `crates/fiber-lib/Cargo.toml:63,87-88` (hyper 1.5 / tower 0.5 / tower-http 0.6 / jsonrpsee 0.25.1)
+  - **审计内容**:
+    - [!] **F1 🟡 Medium**: `cors_enabled=true && cors_allowed_origins=[]` fall-through 到 `CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)` (rpc/mod.rs:211-216)，运营者直觉为"空 = 拒绝全部"但实际通配所有源；配合 INPUT-003.F5 (loopback no-auth default) 形成 classic wallet drainer pattern：用户访问 evil.com → JS `fetch("http://127.0.0.1:<port>/", POST, json)` → CorsLayer preflight 通配 → biscuit `enable_auth=false` → `send_payment`/`shutdown_channel`/`cancel_invoice` 任意调用。Bitcoin/Ethereum 节点 2014 前经历过相同攻击模板
+    - [!] **F2 🟢 Low**: `allow_methods(Any).allow_headers(Any)` 即便 origin 受限仍过宽 — JSON-RPC 仅需 POST + OPTIONS + Content-Type/Authorization
+    - [!] **F3 🟢 Low**: `cors_allowed_origins.iter().filter_map(|o| o.parse().ok())` (rpc/mod.rs:220-223) — parsing 失败静默丢弃 (trailing slash / path / 空格 typo)；最坏情况 3 个 origin 全部 typo → `AllowOrigin::list(vec![])` 拒绝一切请求且运营者不知道
+    - [i] **F4 ℹ️ Info**: 无 Host header allowlist / DNS rebinding 防御 — jsonrpsee 0.25 自身无 host validation；fiber 也未集成 (geth 用 `--http.vhosts localhost` 默认)。即便 cors_enabled=false，攻击者控制 evil.com TTL=0 → 浏览器 rebound 到 127.0.0.1 视为 same-origin → CORS preflight skip → Host header 是 evil.com 但 fiber 不校验 → 配合 INPUT-003.F5 攻击成立。CORS 不能防 DNS rebinding（CORS 是 same-origin 例外机制；rebinding 把跨域伪装为 same-origin）
+    - [i] **F5 ℹ️ Info**: `auth_token` 仅读 `Authorization: Bearer` header 不读 Cookie/Query (middleware.rs:30-40) — 好的设计应文档化：浏览器**不会**为跨域请求**自动**附加 token (cookie 才会被浏览器跨域自动附加)，从根本上消除"凭证被被动盗用"CSRF 向量
+    - [✓] **F6 ✅ Pass**: `cors_enabled: false` 默认 (config.rs:24)
+    - [✓] **F7 ✅ Pass**: `allow_credentials` 未启用 + tower-http 0.6 默认 false → 浏览器不会跨域自动携带 Cookie/HTTP-Auth credentials
+    - [✓] **F8 ✅ Pass**: CORS layer 在 biscuit middleware 外层，OPTIONS preflight 在 CorsLayer 直接返回（符合 CORS 规范），实际 POST RPC 经 biscuit 鉴权
+    - [✓] **F9 ✅ Pass**: tower-http 0.6 / jsonrpsee 0.25.1 无已知 CVE（AUDIT-DEP-001 覆盖）
+  - **总体评价**: CORS/browser-side 攻击面整体保护良好：默认安全 (cors_enabled=false)、设计安全 (Bearer-only auth)、层级正确 (CorsLayer 外/biscuit 内)、依赖安全 (无 CVE)。主要缺口两处：F1 (Medium) "反直觉默认" + INPUT-003.F5 形成 wallet drainer 路径；F4 (Info) 缺 Host header allowlist 让 DNS rebinding 绕过 CORS。F2/F3 工程化改进，F5 是好设计需文档化。整体相比 AUTH-001/AUTH-002 属于"配置可加固但默认OK"的中等级别。
+  - **发现记录**: 见 [`findings/AUDIT-AUTH-003.md`](./findings/AUDIT-AUTH-003.md)
 
 ## 第 5 章 DIM-MEMORY 数值与资源
 
