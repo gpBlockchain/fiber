@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v15** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 15 完成)
+> 版本: **v16** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 16 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 17 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001, AUDIT-INPUT-003)
+- ⚠️ 发现弱设计: 18 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001, AUDIT-INPUT-003, AUDIT-ERR-002)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 11
+- ⏳ 待审计: 10
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -323,7 +323,20 @@
     - [x] `TlcErr::serialize` `.expect(...)` 反模式 → 与 INPUT-002.F4 同质
     - [x] sphinx 加密 / HMAC + `record_payment_fail` route-membership 校验 → ✅
   - **发现记录**: 见 [`findings/AUDIT-ERR-001.md`](./findings/AUDIT-ERR-001.md)
-- [ ] 🟡 **AUDIT-ERR-002** 日志/tracing 中的敏感信息
+- [!] 🟡 **AUDIT-ERR-002** 日志/tracing 中的敏感信息 — **整体 Medium / Medium × 1 + Low × 3 + Info × 2 + Pass × 3**
+  - **关联代码**: `crates/fiber-bin/src/main.rs:84-89` (EnvFilter::from_default_env), `crates/fiber-types/src/primitives.rs:215-217,358-369` (Privkey/Hash256 Debug), `crates/fiber-lib/src/watchtower/actor.rs:181,740`, `crates/fiber-lib/src/rpc/biscuit.rs:234,260`, `crates/fiber-lib/src/rpc/middleware.rs:88`
+  - **审计内容**:
+    - [!] **F1 🟡 Medium**: `watchtower/actor.rs:181` `tracing::error!("CreatePreimage with wrong preimage, payment_hash: {payment_hash:?} preimage: {preimage:?}")` — ERROR 级别默认输出，远程 `create_preimage` RPC 可诱导，preimage 字节进入 log aggregator/Datadog/Loki；与 STORE-001.F1 / INPUT-003.F5 协同 → 本地用户拼接 log+store 即可枚举 preimage/payment_hash 对
+    - [!] **F2 🟢 Low**: `rpc/biscuit.rs:260` `tracing::warn!("fetch {id:?} {node_id:?}")` leftover 调试 — WARN 级别默认输出，每次 watchtower 鉴权 RPC 一条 → 噪声 + node_id 枚举
+    - [!] **F3 🟢 Low**: `rpc/biscuit.rs:234-235` `anyhow!("Token is in revocation list: {token}")` — token 进入 Error Display → 远程 JSON-RPC error response 回显（AUTH-001.F4 镜像，从 ERR 维度补强）
+    - [!] **F4 🟢 Low**: `Hash256` Debug 完整 hex + `Preimage` 与公开 hash 共用 `Hash256` 类型（无独立 `PaymentPreimage` newtype）→ 未来 `preimage:?` log 隐患（F1 是已知实例）；LN 主网 rust-lightning 用独立 `PaymentPreimage` newtype redact
+    - [i] **F5 ℹ️ Info**: `EnvFilter::from_default_env()` 在 `RUST_LOG` 未设时为 ERROR-only — debug! 默认安静 ✓ 但可观测性差，运维易 `RUST_LOG=debug` 激活 F2/F3
+    - [i] **F6 ℹ️ Info**: 缺少 JSON formatter / redaction layer / 字段级过滤；当前 `pretty()` 多行人类可读不便机器化二次过滤
+    - [✓] **F7 ✅ Pass**: `Privkey(SecretKey)` `#[derive(Debug)]` 委托 secp256k1 0.30 `SecretKey::Debug` finish_non_exhaustive → "Privkey(SecretKey { .. })" ✓
+    - [✓] **F8 ✅ Pass**: `commitment_seed` 与 wallet `password` 全局 grep 0 处 `tracing::*!` 引用 ✓
+    - [✓] **F9 ✅ Pass**: Rust panic backtrace 不展开 local 变量；`expect("...")` 字符串均为静态文本或类型边界值（line numbers / lengths），不携带 secret ✓
+  - **总体评价**: 日志层"机密性维度"基础保护良好（核心密钥类型不流入日志、secp256k1 0.30 redaction、默认 ERROR 限制 debug! 泄露）。主要缺口集中三处：F1 watchtower 一处 ERROR 级别 preimage 字面值（唯一明确的"敏感字节进入默认输出"路径）、F2 biscuit leftover 调试、F3 token 通过 anyhow 远程回显（AUTH-001.F4 同条）。结构性缺口 F4/F6 是缺少 `PaymentPreimage` newtype 与 redaction layer 的工程化保护，导致未来易再发生类似 F1 的模式。修复成本：F1/F2/F3 各 1-3 行；F4 需类型重构（中期）；F5/F6 是 UX/工程改进。
+  - **发现记录**: 见 [`findings/AUDIT-ERR-002.md`](./findings/AUDIT-ERR-002.md)
 
 ## 第 7 章 DIM-DEPS 依赖安全
 
@@ -536,21 +549,28 @@
 | AUDIT-INPUT-003.F4 | 🟢 Low | `RpcConfig` 暴露 `max_connections`/`max_request_body_size`/`per_ip_qps`；引入 `tower-governor` 限速；hyper keep_alive_timeout | 未修复 |
 | AUDIT-INPUT-003.F5 | 🟢 Low | `is_public_addr` 不再唯一 gate；启用敏感模块 (payment/channel/cch/watchtower) 时一律强制 biscuit；或 `force_auth: bool` 默认 true | 未修复 |
 | AUDIT-INPUT-003.F6 | ℹ️ Info | `middleware.inject_rpc_context.expect("serialize injected params")` 改 Result 传播 | 未修复 |
+| AUDIT-ERR-002.F1 | 🟡 Medium | `watchtower/actor.rs:181` `error!` 移除 `preimage:?` 字段，仅保留 payment_hash + preimage_len | 未修复 |
+| AUDIT-ERR-002.F2 | 🟢 Low | `rpc/biscuit.rs:260` leftover `warn!("fetch {id:?} {node_id:?}")` 改 `trace!` 或删除 | 未修复 |
+| AUDIT-ERR-002.F3 | 🟢 Low | `rpc/biscuit.rs:234-235` `anyhow!("Token is in revocation list: {token}")` 改前缀 hash（与 AUTH-001.F4 合并） | 未修复 |
+| AUDIT-ERR-002.F4 | 🟢 Low | 引入 `PaymentPreimage` newtype + 自定义 Debug redact；逐步迁移 `payment_preimage: Hash256` 字段 | 未修复（中期重构） |
+| AUDIT-ERR-002.F5 | ℹ️ Info | 默认 filter 升 `info` + 文档说明 `RUST_LOG=debug` 激活字段 | — |
+| AUDIT-ERR-002.F6 | ℹ️ Info | 加 `--log-format json` + redaction tracing layer（扫描 `Hash256(0x...)` × 字段名 preimage/secret） | — |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S16)
+## Phase 1 — 下一步建议 (Session S17)
 
-按 SKILL §三选取规则，S16 计划：
+按 SKILL §三选取规则，S17 计划：
 
-1. **AUDIT-ERR-002** — 日志/tracing 中的敏感信息（preimage / privkey / payment_hash / pubkey）
-2. **AUDIT-AUTH-003** — RPC CORS / Tower-http 配置（已部分覆盖于 AUTH-001.F3 与 INPUT-003.F5，需补充 Origin allow-list 与 CSRF 防御纵深审计）
-3. **AUDIT-INPUT-004** — 存储反序列化 (bincode) 与迁移（已部分覆盖于 STORE-001.F3/F4，需补充 cross-version replay / downgrade 测试）
+1. **AUDIT-AUTH-003** — RPC CORS / Tower-http 配置（已部分覆盖于 AUTH-001.F3 与 INPUT-003.F5，需补充 Origin allow-list 与 CSRF 防御纵深审计）
+2. **AUDIT-INPUT-004** — 存储反序列化 (bincode) 与迁移（已部分覆盖于 STORE-001.F3/F4，需补充 cross-version replay / downgrade 测试）
+3. **AUDIT-NET-001** — P2P 网络协议安全（peer 流控、握手鉴权、tentacle/secio 配置）
 
 跟进遗留（按优先级）：
 - **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播（同时解锁 INPUT-003.F1）
 - **AUDIT-LOGIC-008-FOLLOWUP-A/B (high, 直接资金损失修复)** — `expire_order` Pending-only gating + LND/Fiber 对称 cancel 路径
 - **AUDIT-INPUT-003-FOLLOWUP-A (medium, 零成本 DoS 修复)** — list-type RPC `limit` 上界
+- **AUDIT-ERR-002-FOLLOWUP-A (medium, preimage 字面值移除)** — `watchtower/actor.rs:181` `error!` 字段裁剪
 - **AUDIT-ERR-001-FOLLOWUP-A/B (medium, probing + slander 修复)** — 折叠 final-hop 错误码 + `update_graph_with_tlc_fail` 加 route-membership 校验
 - **AUDIT-STORE-001-FOLLOWUP-A/B (medium, deployment hardening)** — DB 文件权限 0700/0600 + SQLite 独占 advisory lock
 - **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复
@@ -559,6 +579,7 @@
 - **AUDIT-LOGIC-007-FOLLOWUP-A** — 协同 DoS PoC
 - **AUDIT-INPUT-002-FOLLOWUP-C/D/E/F** — panic 反模式 / dup attr / fuzz 改进 / catch_unwind 防御
 - **AUDIT-INPUT-003-FOLLOWUP-B/C/D/E/F** — `.expect` 防御化 + RpcConfig 字段扩展 + force_auth + inject_rpc_context Result + catch_unwind
+- **AUDIT-ERR-002-FOLLOWUP-B/C/D/E/F** — biscuit leftover warn / token 前缀 hash / PaymentPreimage newtype / 默认 info / redaction layer
 - **AUDIT-LOGIC-008-FOLLOWUP-C** — orphaned-preimage 旁路
 - **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造
 - **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
@@ -566,6 +587,11 @@
 - **AUDIT-ERR-001-FOLLOWUP-C/D/E** — `.expect` 防御化 + timing padding 反汇编验证 + slander PoC 测试
 - **AUDIT-STORE-001-FOLLOWUP-C/D/E/F/G/H** — migration batch + bincode strict / deserialize Result / MissingMigration / auto-confirm / backend Result trait / check_validate unknown-prefix
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 16 已完成
+
+按计划完成：
+- ✅ **AUDIT-ERR-002** — 日志/tracing 敏感信息。发现 **F1 🟡 Medium — `watchtower/actor.rs:181` `tracing::error!` 输出 preimage 全文**：ERROR 级别默认输出（任何 RUST_LOG 设置），远程 watchtower `create_preimage` RPC 可诱导，preimage 字节进入 log aggregator (Datadog/Loki/etc)；该分支 preimage 对**目标支付**无效，但字节本身可能用作其它 payment 的 preimage（caller-任选随机字节），与 STORE-001.F1 (DB 0644)/INPUT-003.F5 (同主机多租户) 协同 → 本地 user 拼 log+store 即可枚举 preimage/payment_hash 对。**F2 🟢 Low — `rpc/biscuit.rs:260` `tracing::warn!("fetch {id:?} {node_id:?}")` leftover 调试代码**：每次 watchtower 鉴权 RPC 都生成 WARN 行（默认输出），噪声 + node_id 枚举便利。**F3 🟢 Low — `rpc/biscuit.rs:234-235` `anyhow!("Token is in revocation list: {token}")`**：token 进入 Error Display → 远程 JSON-RPC error response 回显（AUTH-001.F4 镜像，从 ERR 维度补强）。**F4 🟢 Low — `Hash256` Debug 完整 hex + `Preimage` 与 payment_hash/channel_id 共用 `Hash256` 类型，无独立 `PaymentPreimage` newtype**：未来 `preimage:?` log 仍然类型系统无防护（F1 是已知实例）；LN 主网 rust-lightning 用独立 `PaymentPreimage` newtype redact 中段。**F5 ℹ️ Info — `EnvFilter::from_default_env()` 默认 ERROR-only**：debug! 默认安静 ✓ 但运维易 `RUST_LOG=debug` 激活 F2/F3。**F6 ℹ️ Info — 缺 JSON formatter / redaction layer / 字段级过滤**：当前 `pretty()` 多行人类可读不便机器化二次过滤。**F7 ✅ Pass — `Privkey(SecretKey)` Debug 委托 secp256k1 0.30 `finish_non_exhaustive` → "Privkey(SecretKey { .. })" ✓**。**F8 ✅ Pass — `commitment_seed`/wallet `password` 全局 grep 0 处 `tracing::*!` 引用 ✓**。**F9 ✅ Pass — Rust panic backtrace 不展开 local 变量；`expect("...")` 字符串均为静态文本不携带 secret ✓**。整体评价：日志层"机密性维度"基础保护良好（核心密钥不流入日志、secp256k1 0.30 redaction、默认 ERROR 限制 debug! 泄露面），主要缺口集中三处（F1 唯一明确"敏感字节进入默认输出"路径 + F2 leftover + F3 token 远程回显），结构性缺口 F4/F6 是缺少 `PaymentPreimage` newtype 与 redaction layer 工程化保护。修复成本：F1/F2/F3 各 1-3 行；F4 类型重构（中期）；F5/F6 UX/工程。新增 6 个 follow-ups（A 必修 Medium，B/C/D 防御 Low，E/F 工程 Info）。
 
 ## Phase 1 — Session 15 已完成
 
