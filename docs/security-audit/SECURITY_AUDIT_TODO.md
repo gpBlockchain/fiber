@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v11** | 最后更新: 2026-05-13 | 状态: 进行中 (Phase 1 — Session 11 完成)
+> 版本: **v12** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 12 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 13 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002)
+- ⚠️ 发现弱设计: 14 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 15
+- ⏳ 待审计: 14
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -212,7 +212,19 @@
     - [⚠️] **Improvement B**: CI 中缺少 weekly fuzz cron / OSS-Fuzz 集成
     - [⚠️] **Improvement C**: 缺少 `TlcErrPacket::decode` / store migration / RPC JSON 参数的 fuzz 目标
   - **发现记录**: 见 [`findings/AUDIT-INPUT-001.md`](./findings/AUDIT-INPUT-001.md)
-- [ ] 🔴 **AUDIT-INPUT-002** Invoice 解析 (bech32 / lightning-invoice)
+- [!] 🟠 **AUDIT-INPUT-002** Invoice 解析 (bech32m / molecule / CkbInvoice) — **整体 High / High × 1 + Medium × 2 + Low × 2 + Info × 1 + Pass × 2**
+  - **关联代码**: `crates/fiber-types/src/invoice.rs:865-907` (`from_str`), `:887` (`ar_decompress(...).expect`), `:1018-1064` (`From<InvoiceAttr>`), `:1024,1042,1052` (utf8/pubkey expect), `:1085,1088` (store path u5/from_base32_checked expect), `:610` (`panic!`); `crates/fiber-lib/src/rpc/invoice.rs:289` (`parse_invoice` RPC), `cch/actor.rs:628` (`receive_btc`), `cch/actions/send_outgoing_payment.rs:254`, `cch/cch_fiber_agent.rs:115`, `fiber/payment.rs:359` (`build_send_payment_data`), `fuzz_targets/fuzz_invoice.rs`
+  - **审计内容**:
+    - [!] **F1 🟠 High — `From<InvoiceAttr> for Attribute` 三处 `.expect()` 远程 DoS**: `String::from_utf8(value).expect(...)` for `Description` (line 1024) / `FallbackAddr` (line 1042); `PublicKey::from_slice(...).expect(...)` for `PayeePublicKey` (line 1052)。Molecule 表层只校验 `Bytes` 表头，**不校验 UTF-8 / pubkey 长度**。攻击者绕过 `InvoiceBuilder` 直接构造 `RawInvoiceData` molecule 字节（如 Description.value = `\xff\xff`），ar_encompress + bech32m 包装 → 单次 `parse_invoice({invoice: S})` / `send_payment` / `cch.receive_btc(fiber_pay_req)` → 整个 fiber 进程 panic。`parse_invoice` 是公开只读 RPC 通常无授权，CCH receive_btc 接受跨链用户的 fiber_pay_req → **零成本零授权远程 DoS**。
+    - [!] **F2 🟡 Medium — `ar_decompress(&data_part).expect("decompress invoice data")` 远程 DoS** (line 887): `arcode::ArithmeticDecoder::decode` 返回 `IoResult`，位流耗尽未读到 EOF 时返回 Err → panic。攻击者只需合法 bech32m 外壳 + 任意非合法压缩负载即可触发，比 F1 更易构造。修复：改 `.expect()` 为 `?`，新增 `InvoiceError::DecompressionError`。
+    - [!] **F3 🟡 Medium — `invoice_data.try_into().expect("pack invoice data")`** (line 902): 当前 `TryFrom<RawInvoiceData> for InvoiceData` 实现体只是 `Ok(...)` 不会失败，`.expect()` 暂未可触发；但 F1 修复后（`From → TryFrom`）此处会变成第二个真实 panic 点。需联动改 `?`。
+    - [!] **F4 🟢 Low — `panic!("no other error may occur, got {:?}", e)`** (line 610): `check_signature` 中对 secp256k1 错误用 `panic!` 表达不变式。当前不可触发但脆弱；secp256k1 升级或新增错误变体时会突然可触发。改 `Err(_) => return Err(InvoiceError::InvalidSignature)`。
+    - [!] **F5 🟢 Low — Duplicate attribute 不拒绝**: 所有 attr accessor 用 `.iter().filter_map().next()` 只读首个；但 `hash()` 把所有 attrs 入签名 → 用户可见与系统认知可能不一致。`InvoiceError::DuplicatedAttributeKey` 已定义但**全代码 0 命中** → 设计意图未实施。
+    - [i] **F6 ℹ️ Info — `fuzz_invoice` 结构性盲区**: 直接喂随机字节给 `from_str`，99.99% 被 bech32 checksum 拒绝；几乎无法穿透 ar_decompress 到达 attr 转换 panic 点。建议新增 `fuzz_invoice_data` (直接 fuzz `RawInvoiceData::from_slice`) 与 `fuzz_invoice_attr` (直接 fuzz `Attribute::from`)，并以现有 `tests/invoice_impl.rs` 中合法 invoice 字符串作为 corpus 种子。
+    - [✓] **F7 ✅ Pass**: bech32m 强制（line 871-873）拒绝 bech32 变体，避免与 LN BOLT11 invoice 混淆。
+    - [✓] **F8 ✅ Pass**: `check_signature` + `validate_signature` 在签名存在时强制校验，hash 覆盖全部 attrs。
+  - **总体评价**: 信号层（bech32m / 签名 / HRP / 长度边界）扎实；**异常处理层充满 `.expect()`/`panic!`**，且这些 panic 全部位于用户可达的 RPC / CCH 入口。**单次合法格式的 RPC 请求 → 节点崩溃**。修复成本极低（`.expect → ?` + `From → TryFrom`），是除 LOGIC-008 之外最严重的 DoS 类发现。与 INPUT-001 (P2P 帧) 形成镜像：P2P 受 tentacle 长度限 + molecule 表层保护，但 invoice 入口同等攻击面**未受同等保护**。
+  - **发现记录**: 见 [`findings/AUDIT-INPUT-002.md`](./findings/AUDIT-INPUT-002.md)
 - [ ] 🟠 **AUDIT-INPUT-003** JSON-RPC 参数校验
 - [ ] 🟠 **AUDIT-INPUT-004** 存储反序列化 (bincode) 与迁移
 - [ ] 🟡 **AUDIT-INPUT-005** CKB Tx / Cell 数据
@@ -333,6 +345,7 @@
 | 2026-05-13 | S9 | AUDIT-MEM-001 | F1 High: gossip `messages_to_be_saved` 入存不验签 + 无 per-peer 上限 + prune 不清理孤儿消息 → 50 MB/s RAM 增长可分钟级 OOM；F2 Medium: ractor mailbox unbounded + 入站无 rate-limit；F3 Medium: spawn_query_tasks 内 incomplete_messages 完整 clone × 10 放大 F1；F4-F6 Low: TLC_VALUE_IN_FLIGHT=u128::MAX / 单帧 1000 broadcasts / prune 无 TTL；F7-F8 Pass: ToBeAcceptedChannels 限额、NodeAnnouncement 私网过滤 | [!] High × 1, Medium × 2, Low × 3, Pass × 2 |
 | 2026-05-13 | S10 | AUDIT-MEM-002 | 整体 Medium，数值算术接近正确：F1 Low: check_tlc_limits fold 未 checked_add (max_tlc_value_in_flight 默认 u128::MAX 时无后果)；F2 Low: build_settlement_data 链式 +/- 未 checked，依赖状态机不变式 (force-close 路径最有价值修复)；F3 Low: commitment_fee*2 未 checked_mul / u128 as u64 截断；F4 Info: apply_remove_tlc checked_* 正面典范；F5 Info: funding < u64::MAX 显式 cap；F6-F9 Pass: payment/graph/onion checked_add 完整、retry/backoff saturating、MPP saturating_add、add_amount==0 拒绝 | [!] Low × 3, Info × 2, Pass × 4 |
 | 2026-05-13 | S11 | AUDIT-LOGIC-008 | 整体 High — F1 High: `expire_order` 不区分订单 status，默认 order_expiry=36h < TLC_expiry=60h 留 24h 窗口可让调度器在 outgoing 流程中强制 Fail 订单导致 preimage 事件被 `get_active_order_or_none` 丢弃 → CCH 直接资金损失（SendBTC/ReceiveBTC 双向均可利用）；模块完全无 cancel_invoice / cancel_payment 调用路径 (grep 0 命中)。F2 Low: `min_final_cltv_expiry_delta() * 600` 两处未 checked/saturating，与同文件 line 205 `saturating_mul` 不一致。F3 Info: BTC 600s/block 固定假设。F4-F6 Pass: preimage SHA256 hash 校验、静态 half-budget check（含 checked_mul）、动态 half-budget + max_outgoing limit + check_expiry_or_fail | [!] High × 1, Low × 1, Info × 1, Pass × 3 |
+| 2026-05-14 | S12 | AUDIT-INPUT-002 | 整体 High — F1 High: `From<InvoiceAttr>` 三处 `.expect()` (Description/FallbackAddr UTF-8、PayeePublicKey from_slice) 远程 DoS，攻击者绕过 Builder 构造 RawInvoiceData → `parse_invoice` / `send_payment` / `cch.receive_btc` 单次合法格式 RPC 即崩进程。F2 Medium: `ar_decompress(...).expect()` 同攻击面。F3 Medium: `from_str` line 902 `.expect("pack invoice data")` 在 F1 修复后变可触发。F4 Low: `panic!("no other error...")` 反模式。F5 Low: duplicate attribute 不拒绝，`DuplicatedAttributeKey` 错误定义但 grep 0 命中。F6 Info: 现有 `fuzz_invoice` 99.99% 被 bech32m checksum 拒绝，永远不到 attr 转换层。F7-F8 Pass: bech32m vs bech32 强制；签名校验路径完整。攻击面：parse_invoice (无授权)、send_payment、cch.receive_btc、cch_fiber_agent。修复成本极低 (`.expect → ?` + `From → TryFrom`) | [!] High × 1, Medium × 2, Low × 2, Info × 1, Pass × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -395,6 +408,12 @@
 | 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-D | S11 / AUDIT-LOGIC-008 | (Low) 将 `actor.rs:560` 与 `send_outgoing_payment.rs:249` 的 `min_final_cltv_expiry_delta() * 600` 统一为 `saturating_mul(600)` / `checked_mul` |
 | 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-E | S11 / AUDIT-LOGIC-008 | (Info, 文档) 在 `cch-expiry-dependency.md` 中明确 BTC 600 s/block 假设；提供持续偏快块速下下调 `btc_final_tlc_expiry_delta_blocks` 的指导 |
 | 2026-05-13 | AUDIT-LOGIC-008-FOLLOWUP-F | S11 / AUDIT-LOGIC-008 | (Low, 配置校验) 启动时拒绝 `order_expiry_delta_seconds >= min(ckb_final_tlc_expiry_delta_seconds, btc_final_tlc_expiry_delta_blocks * 600)` 的危险配置组合 |
+| 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-A | S12 / AUDIT-INPUT-002 | **🟠 High 必修** — `From<InvoiceAttr> for Attribute` → `TryFrom<InvoiceAttr>`；新增 `InvoiceError::MalformedAttribute(String)` 变体；联动改 `InvoiceData::try_from`、`from_str` line 902、line 1085/1088 store 路径所有 `.expect()` 为 `?` |
+| 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-B | S12 / AUDIT-INPUT-002 | **🟡 Medium 必修** — `ar_decompress(...).expect()` (line 887) 改 `?`；新增 `InvoiceError::DecompressionError(String)` |
+| 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-C | S12 / AUDIT-INPUT-002 | (Low) `check_signature` 中 `panic!("no other error...")` (line 610) 改为 `Err(_) => return Err(InvoiceError::InvalidSignature)` 兜底 |
+| 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-D | S12 / AUDIT-INPUT-002 | (Low) `InvoiceData::try_from` 中加 attribute discriminant 去重，使用既有 `InvoiceError::DuplicatedAttributeKey` 变体（当前 grep 0 命中） |
+| 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-E | S12 / AUDIT-INPUT-002 | (Info, 测试) 新增 fuzz target `fuzz_invoice_data` (`RawInvoiceData::from_slice`) 和 `fuzz_invoice_attr` (`Attribute::from`) 穿透 bech32m / ar_decompress 层；提供合法 invoice 字符串作为 corpus 种子 |
+| 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-F | S12 / AUDIT-INPUT-002 | (Low, 防御) 在 RPC handler 与 actor 入口包裹 `catch_unwind` 或建立 panic-hook，确保单次解析 panic 不击垮整个 fiber 进程（临时措施） |
 
 ## 附录 C：修复建议
 
@@ -451,28 +470,38 @@
 | AUDIT-MEM-002.F1/F2/F3 | 🟢 Low | check_tlc_limits fold checked_add / build_settlement_data checked_* / commitment_fee*2 checked_mul + u128→u64 try_from | 未修复 |
 | AUDIT-LOGIC-008.F1 | 🟠 **High** | CCH `expire_order` 仅 status==Pending 才 Fail；新增 LND/Fiber 对称 cancel 路径；handle_tracking_event 旁路写入 finalized 订单的 preimage | **未修复（直接资金损失）** |
 | AUDIT-LOGIC-008.F2 | 🟢 Low | `min_final_cltv_expiry_delta() * 600` 两处统一为 saturating_mul / checked_mul | 未修复 |
+| AUDIT-INPUT-002.F1 | 🟠 **High** | `From<InvoiceAttr> for Attribute` → `TryFrom`；Description/FallbackAddr UTF-8 + PayeePublicKey from_slice 三处 `.expect → ?`；联动改 store path line 1085/1088 | **未修复（远程零成本零授权 DoS）** |
+| AUDIT-INPUT-002.F2 | 🟡 Medium | `ar_decompress(...).expect()` (line 887) → `?`；新增 `InvoiceError::DecompressionError` | 未修复 |
+| AUDIT-INPUT-002.F3 | 🟡 Medium | `from_str` line 902 `.expect("pack invoice data")` → `?` (与 F1 联动) | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S12)
+## Phase 1 — 下一步建议 (Session S13)
 
-按 SKILL §三选取规则，S12 计划：
+按 SKILL §三选取规则，S13 计划：
 
-1. **AUDIT-INPUT-002** — Invoice 解析（bech32 / lightning-invoice）
-2. **AUDIT-ERR-001** — 支付错误码与 payment probing
-3. **AUDIT-STORE-001** — 持久层与迁移安全（RocksDB column families、`.schema.json`、binary 反序列化）
+1. **AUDIT-ERR-001** — 支付错误码与 payment probing
+2. **AUDIT-STORE-001** — 持久层与迁移安全（RocksDB CF、`.schema.json`、binary 反序列化）
+3. **AUDIT-INPUT-003** — JSON-RPC 参数校验（无授权端点 / 数值边界 / hex 解码 panic 面）
 
 跟进遗留（按优先级）：
-- **AUDIT-LOGIC-008-FOLLOWUP-A/B (highest, 直接资金损失修复)** — `expire_order` 限定 status==Pending；新增 LND `CancelInvoice` / Fiber invoice cancel 反向取消路径
-- **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复（远程零成本 OOM）
-- **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower 多租户 NodeId 冲突 PoC + 修复
+- **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播
+- **AUDIT-LOGIC-008-FOLLOWUP-A/B (high, 直接资金损失修复)** — `expire_order` Pending-only gating + LND/Fiber 对称 cancel 路径
+- **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复
+- **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower NodeId 冲突 PoC + 修复
 - **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复
 - **AUDIT-LOGIC-007-FOLLOWUP-A** — 协同 DoS PoC
-- **AUDIT-LOGIC-008-FOLLOWUP-C** — handle_tracking_event 收到 finalized 订单的 preimage 时旁路写入 orphaned_preimages
+- **AUDIT-INPUT-002-FOLLOWUP-C/D/E/F** — panic 反模式 / dup attr / fuzz 改进 / catch_unwind 防御
+- **AUDIT-LOGIC-008-FOLLOWUP-C** — orphaned-preimage 旁路
 - **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造
 - **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 12 已完成
+
+按计划完成：
+- ✅ **AUDIT-INPUT-002** — Invoice 解析（bech32m / molecule / CkbInvoice）。发现 **F1 🟠 High — `From<InvoiceAttr> for Attribute` 三处 `.expect()` 远程 DoS**：单次合法格式的 `parse_invoice` / `send_payment` / `cch.receive_btc` RPC 调用即可 panic 整个 fiber 进程。攻击者绕过 `InvoiceBuilder` 构造 `RawInvoiceData` molecule 字节（如 Description.value = 非 UTF-8、PayeePublicKey.value = 非合法 pubkey），通过 `ar_encompress + bech32m` 包装 → 节点崩溃。F2 Medium: `ar_decompress(...).expect()` 同攻击面更易构造。F3 Medium: `from_str` line 902 在 F1 修复后变可触发。F4-F5 Low: panic 反模式 + duplicate attr 不拒绝。F6 Info: 现有 `fuzz_invoice` 99.99% 被 bech32m checksum 拒绝、永远到不了 attr 转换层 → 结构性盲区。F7-F8 Pass: bech32m vs bech32 强制；签名校验路径完整。**修复成本极低**（`.expect → ?` + `From → TryFrom`），是除 LOGIC-008 之外最严重的 DoS 类发现。新增 6 个 follow-ups（A/B 必修 High/Medium，C/D/F 防御 Low，E 测试改进 Info）。
 
 ## Phase 1 — Session 11 已完成
 

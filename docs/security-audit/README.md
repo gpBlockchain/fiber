@@ -18,7 +18,7 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 3. **Phase 2** — Doc updates after every session (status, findings, new attack-surface items).
 4. **Phase 3** — Final report.
 
-## Status (TODO v11, 2026-05-13)
+## Status (TODO v12, 2026-05-14)
 
 | Bucket | Count |
 |---|---|
@@ -26,16 +26,16 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | ✅ Passed | 0 |
 | ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
-| ⚠️ Weak design | 13 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002) |
+| ⚠️ Weak design | 14 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001 — no known CVE in surveyed deps) |
-| ⏳ Pending | 15 |
+| ⏳ Pending | 14 |
 
-## Next session (S12) — planned
+## Next session (S13) — planned
 
-- AUDIT-INPUT-002 — Invoice parsing (bech32 / lightning-invoice)
 - AUDIT-ERR-001 — Payment error codes & probing
 - AUDIT-STORE-001 — Persistence & migration safety (RocksDB CFs, `.schema.json`, binary deser)
-- **Highest-priority PoC follow-ups**: AUDIT-LOGIC-008-A/B (direct fund-loss fix), MEM-001-A (remote OOM), AUTH-001-A, AUTH-002-A, LOGIC-007-A; medium-value local fix: MEM-002-B (build_settlement_data checked_*)
+- AUDIT-INPUT-003 — JSON-RPC parameter validation (unauth'd endpoints, hex decode panic surface)
+- **Highest-priority follow-ups**: INPUT-002-A/B (remote zero-cost zero-auth DoS fix), LOGIC-008-A/B (direct fund-loss fix), MEM-001-A, AUTH-001-A, AUTH-002-A, LOGIC-007-A; medium-value local fix: MEM-002-B
 
 ## Findings index
 
@@ -58,3 +58,4 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | AUDIT-MEM-001 | 🟠 High / 🟠 High × 1 + 🟡 Medium × 2 + 🟢 Low × 3 + ℹ️ Pass × 2 | Resource exhaustion — gossip `messages_to_be_saved` accepts unverified messages with no per-peer cap → remote OOM (~50 MB/s) | [findings/AUDIT-MEM-001.md](./findings/AUDIT-MEM-001.md) |
 | AUDIT-MEM-002 | 🟡 Medium / 🟢 Low × 3 + ℹ️ Info × 2 + ✅ Pass × 4 | Numeric overflow & boundaries — overall sound (apply_remove_tlc checked_* exemplary); 3 defense-in-depth gaps in check_tlc_limits, build_settlement_data, commitment_fee | [findings/AUDIT-MEM-002.md](./findings/AUDIT-MEM-002.md) |
 | AUDIT-LOGIC-008 | 🟠 **High** / 🟠 High × 1 + 🟢 Low × 1 + ℹ️ Info × 1 + ✅ Pass × 3 | CCH cross-chain HTLC — `expire_order` races outgoing flow → preimage dropped, no cancel paths in module → direct fund loss in default 24h window | [findings/AUDIT-LOGIC-008.md](./findings/AUDIT-LOGIC-008.md) |
+| AUDIT-INPUT-002 | 🟠 **High** / 🟠 High × 1 + 🟡 Medium × 2 + 🟢 Low × 2 + ℹ️ Info × 1 + ✅ Pass × 2 | Invoice parsing — `From<InvoiceAttr>` `.expect()` (UTF-8 / pubkey) and `ar_decompress(...).expect()` panic the entire fiber process from a single unauth'd `parse_invoice` / `send_payment` / `cch.receive_btc` call | [findings/AUDIT-INPUT-002.md](./findings/AUDIT-INPUT-002.md) |
