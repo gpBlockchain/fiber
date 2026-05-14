@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v24** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 25 完成)
+> 版本: **v25** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成** (Sessions S1-S26, 33/33 items audited) — 进入 Phase 3 (Final REPORT.md)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,11 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 26 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-MEM-003, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001, AUDIT-SPEC-001, AUDIT-SPEC-002)
+- ⚠️ 发现弱设计: 28 (新增 AUDIT-DEP-002, AUDIT-DEP-003, AUDIT-SPEC-003, AUDIT-WASM-001, AUDIT-WASM-002)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 5
+- ⏳ 待审计: 0  **(Phase 1 完成)**
+
+**Final report**: 见 [`REPORT.md`](./REPORT.md)
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -434,8 +436,22 @@
   - **审计内容**: `Cargo.lock` 中 `secp256k1`, `musig2`, `aes-gcm`, `scrypt`, `bitcoin`, `fiber-sphinx`, `lightning-invoice`, `jsonrpsee`, `biscuit-auth` (beta), `tentacle`, `molecule`, `bech32` 全部比对 → 见 [`findings/AUDIT-DEP-001.md`](./findings/AUDIT-DEP-001.md)
   - **后续**: 建议将 `cargo audit` 固化为 CI 步骤；建议每月重跑（公共数据库每日更新）
 
-- [ ] 🟡 **AUDIT-DEP-002** `biscuit-auth = 6.0.0-beta.3` (pre-release) 评估
-- [ ] 🟡 **AUDIT-DEP-003** `pprof` git rev pin (feature `pprof`) 评估
+- [!] 🟡 **AUDIT-DEP-002** `biscuit-auth = 6.0.0-beta.3` (pre-release) 评估 — **Info × 1, Low × 2, Improvement × 1**
+  - **关联代码**: `crates/fiber-lib/Cargo.toml:58,96`
+  - **审计内容**:
+    - [!] **F1 Info**: 6.0.0-beta.3 公共 API 未冻结；当前无 CVE 但版本演进风险存在
+    - [!] **F2 Low**: `features = ["wasm"]` 双引用未深审 entropy/密钥派生路径
+    - [!] **F3 Low**: 5.x→6.x 已有 breaking change 历史；token 撤销列表迁移路径无 schema 版本化
+    - [⚠️] **F4 Improvement**: 改 `=6.0.0-beta.3` 严格 pin + CI `cargo deny bans` 拒绝 pre-release
+  - **发现记录**: 见 [`findings/AUDIT-DEP-002.md`](./findings/AUDIT-DEP-002.md)
+- [!] 🟢 **AUDIT-DEP-003** `pprof` git rev pin 评估 — **Low × 2, Info × 1, Pass × 1**
+  - **关联代码**: `crates/fiber-lib/Cargo.toml:93,123`
+  - **审计内容**:
+    - [!] **F1 Low**: 直接 git rev pin 弱化扫描器信号 / 上游主线安全更新不跟踪
+    - [!] **F2 Low**: `frame-pointer` feature 与 panic backtrace / SIGPROF unwind 理论争用窗口
+    - [i] **F3 Info**: `optional = true` + opt-in feature 正确（默认 release artifact 无风险）
+    - [✓] **F4 Pass**: 攻击面受限（无 RPC 触发面，仅运维主动开启）
+  - **发现记录**: 见 [`findings/AUDIT-DEP-003.md`](./findings/AUDIT-DEP-003.md)
 
 ## 第 8 章 DIM-SPEC 规范一致性
 
@@ -473,12 +489,38 @@
   - **最严重场景 (L2 process crash)**: F6/F7/F13 三处任一 `.expect()` 被恶意 invoice 字符串通过 RPC `parse_invoice` 或 CCH `receive_btc` 触发 → fiber 节点进程 panic → 资金通道 force-close + watchtower 离线 + gossip 断流 (跨章节继承 INPUT-002 High)。**L4 (fallback 错网)**: F7 三方按 spec 实装 fallback redemption 时 mainnet/testnet 地址混淆 → 资金永久锁定。
   - **修复建议**: 8 项 follow-ups (A-H)，其中 FOLLOWUP-B (impl `.expect` 移除：`invoice.rs:1023, 1042, 1052, 887` 四处改 `Result` + 新 `InvoiceError` 变体) 优先级最高，与 INPUT-002 / CRYPTO-004 同链。
   - **发现记录**: 见 [`findings/AUDIT-SPEC-002.md`](./findings/AUDIT-SPEC-002.md)
-- [ ] 🟡 **AUDIT-SPEC-003** Trampoline / CCH 规范对照
+- [!] 🟡 **AUDIT-SPEC-003** Trampoline / CCH 规范对照 — **整体 Medium / Medium × 3 + Low × 3 + Info × 2 + Pass × 4**
+  - **关联代码**: `docs/specs/trampoline-routing.md`, `docs/specs/cross-chain-htlc.md`, `docs/specs/cch-expiry-dependency.md`, `payment.rs:46-50,233-236,365-385`, `types.rs:1860,1964,3773-3846`, `graph.rs:1294-1507`, `network.rs:2438-2550`, `channel.rs:1182-1195`, `cch/*`
+  - **审计内容**:
+    - [!] **F1 Medium**: trampoline spec 缺 `TrampolineHopData` 字段表（三方无法实装 forwarder）
+    - [!] **F2 Medium**: `MAX_TRAMPOLINE_HOPS_LIMIT=5` 仅 hard-code，与 BOLT-04 hop 数关系及错误码未文档化
+    - [!] **F6 Medium**: `cross-chain-htlc.md` 完全未文档化 expiry 关系（LOGIC-008.F1 直接资金损失的根因）
+    - [!] **F3/F7/F8 Low**: trampoline+MPP 组合未规范 / fee 政策无规范 / CCH cancel 路径无规范
+    - [i] **F4/F9 Info**: 错误码语义 / BTC 600s/block 假设
+    - [✓] **F5/F10/F11/F12 Pass**: tlc_expiry_limit / payment_hash tweak / SHA256 校验 / 双重 half-budget — 实现核心正确
+  - **总评**: 与 SPEC-001/SPEC-002 同质：实现守住协议核心，规范层欠债；spec-as-contract 缺位给生态扩展制造障碍
+  - **发现记录**: 见 [`findings/AUDIT-SPEC-003.md`](./findings/AUDIT-SPEC-003.md)
 
 ## 第 9 章 跨平台 (WASM)
 
-- [ ] 🟡 **AUDIT-WASM-001** `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量
-- [ ] 🟡 **AUDIT-WASM-002** WASM 持久化 / IndexedDB 读写一致性
+- [!] 🟡 **AUDIT-WASM-001** `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量 — **Medium × 1 + Low × 2 + Info × 1 + Pass × 2**
+  - **关联代码**: `crates/fiber-store/src/browser.rs:31-32,200-369`, `browser_test.rs:19-20`, `crates/fiber-wasm-db-worker/`, `fiber-wasm-db-common/`
+  - **审计内容**:
+    - [!] **F1 Medium**: `unsafe impl Send/Sync for Store` 无 SAFETY 注释；单 worker 假设隐性化，wasm threads 落地会引入 wasm-bindgen 句柄表 UB
+    - [!] **F2 Low**: `DB_INITIALIZED` AtomicBool + `thread_local! INPUT_BUFFER` 跨 worker 不一致（nested worker / Service Worker 嵌入会破不变量）
+    - [!] **F3 Low**: browser.rs 内 14 处 `.unwrap()`/`.expect()` 在 IPC 路径上，浏览器 panic = 整页崩
+    - [i] **F4 Info**: 未在 CI 锁 wasm-bindgen 版本，大版本升级理论 Send-ness 漂移
+    - [✓] **F5/F6 Pass**: 单 worker 模型内存安全；OutputCommand try_from + 共享 crate enum 编译期一致
+  - **发现记录**: 见 [`findings/AUDIT-WASM-001.md`](./findings/AUDIT-WASM-001.md)
+- [!] 🟡 **AUDIT-WASM-002** WASM 持久化 / IndexedDB 读写一致性 — **Medium × 2 + Low × 3 + Info × 1 + Pass × 2**
+  - **关联代码**: `crates/fiber-store/src/browser.rs:46-198`, `fiber-wasm-db-worker/src/db.rs`, `migration.rs`
+  - **审计内容**:
+    - [!] **F1 Medium**: `Batch::commit` 拆成两个独立 IPC（delete then put）非原子；与 native RocksDB/SQLite atomic batch 不对称；tab 关闭/OOM 半途崩 → ChannelActorState 丢失 → force-close + CSV 锁资金
+    - [!] **F2 Medium**: 同 origin 多 tab 同时开 fiber 实例无互斥（无 `navigator.locks` / BroadcastChannel）→ commitment_number 单调性被覆盖
+    - [!] **F3/F4/F5 Low**: db.rs `to_value().unwrap()` panic / 无 quota 监控 / Iterator IPC round-trip × N 与 INPUT-003.F2 协同
+    - [i] **F6 Info**: IDB schema upgrade 与 fiber MIGRATION_VERSION_KEY 双轨；idb crate 版本未审计
+    - [✓] **F7/F8 Pass**: 单 store 扁平 KV 简单稳健；IDB 内置事务隔离单 worker 内消除 race
+  - **发现记录**: 见 [`findings/AUDIT-WASM-002.md`](./findings/AUDIT-WASM-002.md)
 
 ## 第 10 章 DIM-STORE 持久层与迁移
 
@@ -526,6 +568,11 @@
 | 2026-05-14 | S13 | AUDIT-ERR-001 | 整体 Medium — F1 Medium: fiber 在 BOLT-04 之外引入独立 final-hop 错误码 `InvoiceExpired=PERM\|16`/`InvoiceCancelled=PERM\|17` 并保留 `FinalIncorrect{TlcAmount,ExpiryDelta}` 细分（LN 主网已折叠为 `IncorrectOrUnknownPaymentDetails`），攻击者用 1-sat 探测 TLC 即可远程零授权获取 invoice 状态/金额/cltv 匹配判定 = 商业隐私泄露 (channel.rs:840-844, 1156-1170)。F2 Medium: `update_graph_with_tlc_fail` (payment.rs:1099-1116) 信任 attacker-controlled `extra_data.node_id`/`channel_outpoint` 直接调 `mark_node_failed`/`mark_channel_failed`，未校验 ID 属于本次 attempt route → 中转 hop 可让发送方在本地图屏蔽任意目标；`record_payment_fail` (history.rs:170-180) 评分路径上有正确校验但 graph 路径未对称复用。F3 Low: `update_graph_with_tlc_fail` 三处 `.expect()` panic PaymentActor。F4 Low: `GetPaymentResult.failed_error: String` 直接透出错误码字面量。F5 Low: `TlcErr::serialize` `.expect()` 反模式。F6 Info: `ERROR_DECODING_PASSES=27` dummy XOR 在 release build 是否被 LLVM 优化消除待反汇编验证。F7-F8 Pass: Sphinx onion error encryption + history slander 防护。修复成本极低 (<50 行) | [!] Medium × 2, Low × 3, Info × 1, Pass × 2 |
 | 2026-05-14 | S14 | AUDIT-STORE-001 | 整体 Medium — F1 Medium: DB 目录/文件权限默认 0644/0755，store 中含 `ChannelActorState.commitment_seed` (HKDF 派生历史 revocation secret 种子) + watchtower `ChannelData.Privkey` + preimage 三类高敏数据；与 onion key/wallet 已 enforce 0o600 对称性差距明显，同主机多租户场景下非 root 用户可直读。F2 Medium: SQLite 后端无独占 advisory lock，`Connection::open + WAL` 允许多进程同开，systemd 重启竞态/容器 OOM 重启 → 两实例双写 `MIGRATION_VERSION_KEY` + ChannelActorState → revocation 历史不一致 → cheat 成功 (RocksDB 用 LOCK 文件不受影响)。F3 Low: `deserialize_from` 全局 `panic!` 让单条字节损坏永久 boot-loop。F4 Low: Migration 逐条 put 非原子 + bincode 默认不拒绝尾随字节 → mid-crash 后"幂等"误判致永久跳过迁移。F5 Low: `pending.is_empty()` 路径无条件升版本号掩盖缺失迁移。F6 Low: `cli_confirm` 在非 TTY 挂起。F7 Low: 后端 `.expect` 把 I/O 错抬升 panic 无 graceful flush。F8 Info: `check_validate` 默认分支 `_ => {}` 漏检未来前缀。F9-F10 Pass: INIT_DB_VERSION 拒绝跨 epoch + gossip 验签后才入 DB | [!] Medium × 2, Low × 4, Info × 1, Pass × 2 |
 | 2026-05-14 | S22 | AUDIT-NET-001 | 整体 High — Tentacle/secio 选型合理且 secio 强制 (F8 Pass)、chain_hash + Init 20s timeout 强制 (F8/F9 Pass)，但配置/运营层有 4 个 Medium 协同：**F1** 无持久 ban 列表，`requested_disconnect_peers` 仅 `Requested` 分支生效且只 throttle 本端 dial，远端协议违规 peer 可立即 reconnect (`grep ban_list\|misbehavior` 0 命中)；**F2** `ServiceBuilder` 用全部默认 → tentacle 0.7 `max_connection_number=65535` + 无 session/io idle timeout + 无 yamux 窗口配置；fiber `max_inbound_peers=16` 仅覆盖 fiber-protocol 层 → OS fd 表可被 1 万 + 连接耗尽；**F3** `enforce_inbound_peer_budget` 仅在 `on_peer_connected` 触发，且 `peer_session_map` 仅记录已开 fiber-protocol 的 peer → secio-only / gossip-only / pre-Init 三类 ghost session 完全逃过 admission control，与 MEM-001.F1 协同绕过 gossip OOM；**F4** `Cargo.toml:68` 启用 tentacle `upnp` feature 但 fiber 层无 `enable_upnp` 开关 → 部署在家用/NAT 路由器后的用户预期 LAN-only 时 UPnP 静默把端口路由公网，与 AUTH-002.F2 协同破坏隐私模式。Low: F5 CHECK_PEER_INIT 20s + 不偏向驱逐 pre-init session 让 fresh-keypair 轮换 100% 占满；F6 protocol `received` molecule 解析失败无 misbehavior 计数；F7 `try_send_actor_message` 转 unbounded mailbox 无 backpressure (MEM-001.F2 加强)。协同 L1-L4 链 (socket-exhaustion / Sybil 槽位 / gossip OOM 绕过 / UPnP 公网暴露) 让整体严重度上升到 High。修复优先级 F4>F2>F3>F1。新增 7 个 follow-ups (A-G) | [!] Medium × 4, Low × 3, Pass × 2, Info × 1 |
+| 2026-05-14 | S26 | AUDIT-DEP-002 | biscuit-auth 6.0.0-beta.3 pre-release：当前无 CVE 但 API 未冻结；wasm feature 双引用未深审；5.x→6.x 已有 breaking change 历史；建议 `=6.0.0-beta.3` 严格 pin + CI `cargo deny bans` 拒绝 pre-release | [!] Info × 1, Low × 2, Improvement × 1 |
+| 2026-05-14 | S26 | AUDIT-DEP-003 | pprof git rev pin `01cff82d...`：弱化扫描器信号 / 上游主线安全更新不跟踪；frame-pointer + SIGPROF unwind 理论争用；`optional = true` opt-in 默认 release artifact 无风险（F4 Pass：仅运维主动开启，无 RPC 触发面） | [!] Low × 2, Info × 1, Pass × 1 |
+| 2026-05-14 | S26 | AUDIT-SPEC-003 | Trampoline 规范缺 TrampolineHopData 字段表 (F1 Medium)、MAX_TRAMPOLINE_HOPS_LIMIT 与 BOLT-04 关系未文档化 (F2 Medium)、trampoline+MPP 组合未规范 (F3 Low)；CCH `cross-chain-htlc.md` 完全不文档化 expiry 关系 (F6 Medium — LOGIC-008.F1 根因)、fee 政策与 cancel 路径未规范 (F7/F8 Low)；F5/F10/F11/F12 Pass：tlc_expiry_limit / payment_hash tweak / SHA256 校验 / 双重 half-budget 实现核心正确 | [!] Medium × 3, Low × 3, Info × 2, Pass × 4 |
+| 2026-05-14 | S26 | AUDIT-WASM-001 | `unsafe impl Send/Sync for Store` 无 SAFETY 注释 (F1 Medium)；单 worker 假设隐性化，wasm threads 落地会引入 wasm-bindgen Int32Array/Uint8Array 句柄表 UB；DB_INITIALIZED + thread_local INPUT_BUFFER 跨 worker 不一致 (F2 Low)；browser.rs 14 处 `.unwrap()` IPC panic = 浏览器整页崩 (F3 Low)；CI 未锁 wasm-bindgen 版本 (F4 Info)；F5/F6 Pass：单 worker 模型内存安全 + OutputCommand try_from + 共享 crate enum | [!] Medium × 1, Low × 2, Info × 1, Pass × 2 |
+| 2026-05-14 | S26 | AUDIT-WASM-002 | `Batch::commit` 拆 delete+put 两个独立 IPC 非原子 (F1 Medium) — tab 关闭/OOM 半途崩 → ChannelActorState 丢失 → force-close + CSV 锁资金；同 origin 多 tab 无互斥 (F2 Medium) — commitment_number 单调性被覆盖；db.rs `to_value().unwrap()` (F3 Low) / IDB quota 无监控 (F4 Low) / Iterator IPC round-trip × N 与 INPUT-003.F2 协同 (F5 Low)；F7/F8 Pass：单 store 扁平 KV 简单稳健 + IDB 内置事务隔离单 worker 内消除 race | [!] Medium × 2, Low × 3, Info × 1, Pass × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
