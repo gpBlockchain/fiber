@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v23** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 23 完成)
+> 版本: **v24** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 25 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,7 +35,7 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 25 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-MEM-003, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001, AUDIT-SPEC-001)
+- ⚠️ 发现弱设计: 26 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-MEM-003, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001, AUDIT-SPEC-001, AUDIT-SPEC-002)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
 - ⏳ 待审计: 5
 
@@ -307,7 +307,7 @@
     - [i] **F9/F10 (Pass)**: biscuit 签名/撤销/超时机制；`is_public_addr` 私网判定（取严）
   - **最严重场景 (F1)**: 自建 watchtower 集群 standalone 模式（私网/容器）无 biscuit 公钥配置时，攻击者只需访问 watchtower RPC 端口 + 已知受害者 channel_id（gossip 公开）即可调用 `update_revocation(victim_channel_id, attacker_crafted_revocation)` 覆盖 → watchtower 在 cheat 发生时广播错误的 revocation tx → 受害者无法反制 cheat
   - **发现记录**: 见 [`findings/AUDIT-AUTH-001.md`](./findings/AUDIT-AUTH-001.md)
-- [ ] 🟠 **AUDIT-AUTH-002** Peer 身份绑定与 onion service — **整体 Medium / Medium × 2 + Low × 4 + Pass × 4**
+- [!] 🟠 **AUDIT-AUTH-002** Peer 身份绑定与 onion service — **整体 Medium / Medium × 2 + Low × 4 + Pass × 4**
   - **关联代码**: `crates/fiber-lib/src/fiber/network.rs:4460-4512 (enforce_inbound_peer_budget + inbound_no_channel_peers_in_connected_order)`, `network.rs:4876-4950 (on_peer_connected)`, `network.rs:6053-6108 (FiberProtocolHandle remote_pubkey)`, `network.rs:5560-5710 (secio handshake + listen + onion start)`, `network.rs:1744-1797 (ConnectPeer/ConnectPeerWithPubkey)`, `fiber/onion_service.rs:1-492 (Tor controller + key IO)`, `fiber/proxy.rs:1-50 (SOCKS5)`, `fiber/gossip.rs:2428-2615 (gossip signature verify)`, `fiber/config.rs:88,251-552 (DEFAULT_MAX_INBOUND_PEERS=16)`
   - **审计内容**:
     - [x] secio 握手对 `remote_pubkey` 的 ed25519 签名绑定（F7 Pass）✓
@@ -453,7 +453,26 @@
     - [i] **F9 ℹ️ Info**: spec "work in progress" disclaimer + `Secret Derivations` 外链 lnbook（与实现 basepoint 派生有差异）
   - **总体评价**: 实现正确，规范滞后；fiber 自身无直接资金风险，但公共规范误导新接入者，给生态扩展和未来协议升级（如 PTLC）讨论制造障碍。9 项 follow-ups 全部为文档修复（A-E Medium 必修，F-G Low 防御，H Info, I CI script）。
   - **发现记录**: 见 [`findings/AUDIT-SPEC-001.md`](./findings/AUDIT-SPEC-001.md)
-- [ ] 🟠 **AUDIT-SPEC-002** Invoice 协议对照 (`docs/specs/payment-invoice.md` vs `invoice/`)
+- [!] 🟠 **AUDIT-SPEC-002** Invoice 协议对照 (`docs/specs/payment-invoice.md` vs `invoice/`) — **整体 🟡 Medium / Medium × 6 + Low × 4 + Info × 1 + Pass × 6**
+  - **关联代码**: `docs/specs/payment-invoice.md:1-71`, `crates/fiber-types/src/schema/invoice.mol:1-79`, `crates/fiber-types/src/invoice.rs:128-129,166-187,521-543,601-619,652-657,868-906,1022-1063`, `crates/fiber-lib/src/invoice/invoice_impl.rs:143-228`, `crates/fiber-lib/src/rpc/invoice.rs:289`, `crates/fiber-lib/src/cch/actor.rs:628`
+  - **审计内容**:
+    - [!] **F1 🟡 Medium**: SHA256 preimage 域歧义 — spec `hash = SHA256(hrp ‖ data_bytes)` 措辞含混，impl 实际是 `from_base32(u5_data ‖ pad_to_byte)` 再 hash，三方按 spec 实装签名一律失败
+    - [!] **F2 🟡 Medium**: `expiry` spec 32-bit vs impl Uint64 — 长期失同步埋安全债
+    - [!] **F3 🟡 Medium**: `final_htlc_timeout` 已 v0.6.0 deprecated 但 spec 未文档化替代字段 `FinalHtlcMinimumExpiryDelta`，三方继续构造该字段必被 `DeprecatedAttribute` 拒收；且不实装新字段则 `is_tlc_expire_too_soon` 退化为 0ms → final-hop TLC 抢跑结算风险
+    - [!] **F4 🟡 Medium**: `feature` spec 32-bit vs impl 变长 `Bytes` → MPP/trampoline feature gating 在三方实现失效；feature bit 表 spec 全空白（与 SPEC-001 F7 同源）
+    - [!] **F5 🟡 Medium**: `payment_secret`（256-bit, MPP 必需）spec 完全缺失 → 三方 MPP 功能缺失 + payment_secret 随机性要求无规范背书 → MPP probing oracle 复活
+    - [!] **F6 🟡 Medium**: `PayeePublicKey` spec 声明 33 bytes，schema 用变长 `Bytes`，impl `PublicKey::from_slice(&value).expect("...")` (`invoice.rs:1052`) → 远程恶意 invoice panic（与 INPUT-002 同源）
+    - [!] **F7 🟡 Medium**: `FallbackAddr` spec 称 "CKB address" 但 impl 仅 `String::from_utf8.expect()` (`invoice.rs:1042`) 无 bech32/network 校验 → (a) 远程 panic DoS；(b) 三方实装 fallback redemption 时 mainnet/testnet 错网，资金永久锁定
+    - [!] **F8 🟡 Medium**: `check_signature` 对 unsigned invoice 直接 `Ok(())` (`invoice.rs:601-604`)，与 spec "可验证完整性" 措辞误导；CCH `receive_btc` (`cch/actor.rs:628`) / RPC `parse_invoice` 缺 `is_signed()` 守卫（与 CRYPTO-004 F5 同源）
+    - [!] **F9 🟢 Low**: `description` 上限 639 字节 (`invoice.rs:128-129`) spec 未记载
+    - [!] **F10 🟢 Low**: `amount` u128 容量 + UDT 单位 spec 未规定
+    - [!] **F11 🟢 Low**: 重复 attr 仅 builder 侧拒，解析侧 (`TryFrom<RawInvoiceData>`) 不复用 `check_attrs_valid` → spec/impl 取语义不一致
+    - [!] **F12 🟢 Low**: HODL invoice `payment_hash` spec 固定 `blake2b_256` vs impl 使用 `hash_algorithm` 字段
+    - [i] **F13 ℹ️ Info**: spec 无版本号/日期；无 invoice 总长度上限规定，配合 `ar_decompress.expect("decompress invoice data")` (`invoice.rs:887`) → 已在 INPUT-002 中评 High，此处 cross-ref
+    - [x] Pass: HRP prefix 映射 / timestamp Uint128 ms / payment_hash Byte32 / bech32m+arcode 编码 / 65B 签名 / HashAlgorithm enum (6 项)
+  - **最严重场景 (L2 process crash)**: F6/F7/F13 三处任一 `.expect()` 被恶意 invoice 字符串通过 RPC `parse_invoice` 或 CCH `receive_btc` 触发 → fiber 节点进程 panic → 资金通道 force-close + watchtower 离线 + gossip 断流 (跨章节继承 INPUT-002 High)。**L4 (fallback 错网)**: F7 三方按 spec 实装 fallback redemption 时 mainnet/testnet 地址混淆 → 资金永久锁定。
+  - **修复建议**: 8 项 follow-ups (A-H)，其中 FOLLOWUP-B (impl `.expect` 移除：`invoice.rs:1023, 1042, 1052, 887` 四处改 `Result` + 新 `InvoiceError` 变体) 优先级最高，与 INPUT-002 / CRYPTO-004 同链。
+  - **发现记录**: 见 [`findings/AUDIT-SPEC-002.md`](./findings/AUDIT-SPEC-002.md)
 - [ ] 🟡 **AUDIT-SPEC-003** Trampoline / CCH 规范对照
 
 ## 第 9 章 跨平台 (WASM)
@@ -669,15 +688,22 @@
 
 ---
 
-## Phase 1 — 下一步建议 (Session S25)
+## Phase 1 — 下一步建议 (Session S26)
 
-按 SKILL §三选取规则，S25 计划：
+按 SKILL §三选取规则，S26 计划：
 
-1. **AUDIT-WASM-001** — `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量（仅 2 处 unsafe，目标审计面小）
-2. **AUDIT-SPEC-002** — Invoice 协议对照 (`docs/specs/payment-invoice.md` vs `invoice/`)（与 SPEC-001 同维度，承接修复路线图）
+1. **AUDIT-SPEC-003** — Trampoline / CCH 规范对照（与 SPEC-001/002 收束 spec 章节）
+2. **AUDIT-WASM-001** — `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量（仅 2 处 unsafe，目标审计面小）
 3. **AUDIT-DEP-002** — `biscuit-auth = 6.0.0-beta.3` (pre-release) 评估（短面审计）
 
-跟进遗留：见各章节既有 follow-ups 列表（NET-001 A-G / MEM-003 / SPEC-001 A-I 等）。
+跟进遗留：见各章节既有 follow-ups 列表（NET-001 A-G / MEM-003 / SPEC-001 A-I / SPEC-002 A-H 等）。
+
+## Phase 1 — Session 25 已完成
+
+按计划完成：
+- ✅ **AUDIT-SPEC-002** — Invoice 协议规范对照 (`docs/specs/payment-invoice.md` 71 行 vs `invoice.mol` 79 行 + `invoice.rs` 1200 行 + `invoice_impl.rs` 229 行)。发现 **F1 🟡 Medium**: SHA256 preimage 域歧义（spec `hash = SHA256(hrp ‖ data_bytes)` vs impl `from_base32(u5_data ‖ pad_to_byte)`，规范遵循者签名一律失败）。**F2 🟡 Medium**: `expiry` spec 32-bit vs impl `Uint64`。**F3 🟡 Medium**: `final_htlc_timeout` v0.6.0 deprecated 但 spec 未文档化替代字段 `FinalHtlcMinimumExpiryDelta` (Uint64 ms) — `invoice_impl.rs:216-225` 显式拒收旧字段，三方按 spec 实现 (a) invoice 一律被拒 (b) 不实装新字段则 `is_tlc_expire_too_soon` 退化 0ms → final-hop TLC 抢跑结算。**F4 🟡 Medium**: `feature` spec 32-bit vs impl 变长 `Bytes` → MPP/trampoline gating 在三方实现失效；feature bit 表完全空白（与 SPEC-001.F7 同源）。**F5 🟡 Medium**: `payment_secret`（Byte32, MPP 强制）spec 完全缺失 → MPP 功能在三方实装中消失 + payment_secret 随机性要求无规范背书 → MPP probing oracle 复活。**F6 🟡 Medium**: `PayeePublicKey` spec 33 bytes vs schema `Bytes` (任意) + `invoice.rs:1049-1054 PublicKey::from_slice.expect("Public key from slice")` → 远程 invoice 字符串 panic（与 INPUT-002 同源）。**F7 🟡 Medium**: `FallbackAddr` spec "CKB address" 但 impl 仅 `String::from_utf8.expect()` (`invoice.rs:1042`) — (a) 远程 panic DoS (b) 无 network prefix 校验 → mainnet/testnet fallback 错网，资金永久锁定。**F8 🟡 Medium**: `check_signature` (`invoice.rs:601-619`) 对 unsigned invoice 直接 `Ok(())` + spec 措辞"可验证完整性"误导；CCH `receive_btc` (`cch/actor.rs:628`) / RPC `parse_invoice` 缺 `is_signed()` 守卫（CRYPTO-004.F5 收敛）。**F9 🟢 Low**: `description` 上限 639 bytes (`invoice.rs:128-129`) spec 未记载。**F10 🟢 Low**: `amount` u128 容量 + UDT 单位 spec 未规定。**F11 🟢 Low**: 重复 attr 仅 builder 侧拒，解析侧 (`TryFrom<RawInvoiceData>`) 不复用 `check_attrs_valid`。**F12 🟢 Low**: HODL invoice `payment_hash = blake2b_256(preimage)` (spec) vs `hash_algorithm.hash(preimage)` (impl)。**F13 ℹ️ Info**: spec 无版本号 + invoice 总长度无上限规定，配合 `ar_decompress.expect()` (`invoice.rs:887`) → INPUT-002 High 跨章节继承。**Pass × 6**: HRP prefix 映射 / timestamp Uint128 ms / payment_hash Byte32 / bech32m+arcode 编码 / 65B 签名 / HashAlgorithm enum 一致。**协同攻击链 L1-L4**: L1=F2/F3/F4 spec-following 自伤拒收 (Low)；**L2=F6+F7+F13 远程 panic → 进程崩 + 通道 force-close + watchtower 离线 + gossip 断流（跨章节继承 INPUT-002 High）**；L3=F5+F8 MPP probing oracle 复活 (Medium 隐私)；**L4=F7 fallback 跨网络错放 → mainnet 发票 testnet fallback → 资金永久锁定 (Medium)**。**整体定性**: 公共 spec 文档为 v0.5 设计快照，6 处 Medium / 4 处 Low 漂移；最严重 deliverable 是 FOLLOWUP-B 把 `invoice.rs:1023, 1042, 1052, 887` 四处 `.expect()` 改 `Result` + 新 `InvoiceError` 变体（与 INPUT-002/CRYPTO-004 同链）。新增 8 个 follow-ups（A 文档重写 Medium，B impl panic 移除 High，C schema 收紧 Medium，D-G 文档/防御 Medium-Low，H CI 工程 Info）。
+
+---
 
 ## Phase 1 — Session 24 已完成
 
