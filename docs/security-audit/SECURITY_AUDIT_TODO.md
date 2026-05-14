@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v12** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 12 完成)
+> 版本: **v13** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 13 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 14 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002)
+- ⚠️ 发现弱设计: 15 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 14
+- ⏳ 待审计: 13
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -299,7 +299,17 @@
 
 ## 第 6 章 DIM-ERRINFO 错误信息与隐私
 
-- [ ] 🟠 **AUDIT-ERR-001** 支付错误码与 payment probing
+- [!] 🟠 **AUDIT-ERR-001** 支付错误码与 payment probing — **整体 🟡 Medium (Medium × 2 + Low × 3 + Info × 1 + Pass × 2)**
+  - **关联代码**: `crates/fiber-types/src/payment.rs:793-852,161-285,273-278`, `crates/fiber-types/src/onion.rs:31-145,124`, `crates/fiber-lib/src/fiber/channel.rs:830-906,1148-1206,1333-1564`, `crates/fiber-lib/src/fiber/payment.rs:603-614,1076-1117,1728-1758`, `crates/fiber-lib/src/fiber/history.rs:167-307`, `crates/fiber-lib/src/fiber/graph.rs:1091-1122`
+  - **审计内容**:
+    - [x] 错误码语义颗粒度 vs BOLT-04 → ❌ fiber 引入 `InvoiceExpired`/`InvoiceCancelled` 且保留 `FinalIncorrect{TlcAmount,ExpiryDelta}` 细分 → payment probing
+    - [x] final-hop 错误生成站点是否折叠 → ❌ `get_tlc_error` (channel.rs:840-844) + `try_to_settle_down_tlc_with_invoice` (channel.rs:1156-1170) 都显式区分
+    - [x] 中转 hop `extra_data.node_id`/`channel_outpoint` 是否在本地图更新前校验 route 成员 → ❌ `update_graph_with_tlc_fail` 无校验，history 路径有校验（不对称）
+    - [x] `update_graph_with_tlc_fail` 三处 `.expect(...)` → ⚠️ 在攻击者构造 `extra_data` 缺失时 PaymentActor panic
+    - [x] sphinx error packet timing padding `ERROR_DECODING_PASSES=27` → ⚠️ release build 上是否被 LLVM 优化消除需动态验证
+    - [x] `TlcErr::serialize` `.expect(...)` 反模式 → 与 INPUT-002.F4 同质
+    - [x] sphinx 加密 / HMAC + `record_payment_fail` route-membership 校验 → ✅
+  - **发现记录**: 见 [`findings/AUDIT-ERR-001.md`](./findings/AUDIT-ERR-001.md)
 - [ ] 🟡 **AUDIT-ERR-002** 日志/tracing 中的敏感信息
 
 ## 第 7 章 DIM-DEPS 依赖安全
@@ -473,16 +483,21 @@
 | AUDIT-INPUT-002.F1 | 🟠 **High** | `From<InvoiceAttr> for Attribute` → `TryFrom`；Description/FallbackAddr UTF-8 + PayeePublicKey from_slice 三处 `.expect → ?`；联动改 store path line 1085/1088 | **未修复（远程零成本零授权 DoS）** |
 | AUDIT-INPUT-002.F2 | 🟡 Medium | `ar_decompress(...).expect()` (line 887) → `?`；新增 `InvoiceError::DecompressionError` | 未修复 |
 | AUDIT-INPUT-002.F3 | 🟡 Medium | `from_str` line 902 `.expect("pack invoice data")` → `?` (与 F1 联动) | 未修复 |
+| AUDIT-ERR-001.F1 | 🟡 Medium | Final-hop `InvoiceExpired`/`InvoiceCancelled`/`FinalIncorrectTlcAmount`/`FinalIncorrectExpiryDelta` 折叠为 `IncorrectOrUnknownPaymentDetails` (channel.rs:840-844, 1156-1170) | 未修复 |
+| AUDIT-ERR-001.F2 | 🟡 Medium | `update_graph_with_tlc_fail` 加 route-membership 校验（复用 history.rs:170-180 模板） | 未修复 |
+| AUDIT-ERR-001.F3 | 🟢 Low | `update_graph_with_tlc_fail` 三处 `.expect(...)` 改防御式 `if let Some(...)` | 未修复 |
+| AUDIT-ERR-001.F5 | 🟢 Low | `TlcErr::serialize` `.expect()` → `unwrap_or_else(unreachable!())` 或 Result | 未修复 |
+| AUDIT-ERR-001.F6 | ℹ️ Info | release build 反汇编验证 `ERROR_DECODING_PASSES=27` dummy XOR 未被优化消除 | 待动态验证 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S13)
+## Phase 1 — 下一步建议 (Session S14)
 
-按 SKILL §三选取规则，S13 计划：
+按 SKILL §三选取规则，S14 计划：
 
-1. **AUDIT-ERR-001** — 支付错误码与 payment probing
-2. **AUDIT-STORE-001** — 持久层与迁移安全（RocksDB CF、`.schema.json`、binary 反序列化）
-3. **AUDIT-INPUT-003** — JSON-RPC 参数校验（无授权端点 / 数值边界 / hex 解码 panic 面）
+1. **AUDIT-STORE-001** — 持久层与迁移安全（RocksDB CF、`.schema.json`、binary 反序列化）
+2. **AUDIT-INPUT-003** — JSON-RPC 参数校验（无授权端点 / 数值边界 / hex 解码 panic 面）
+3. **AUDIT-ERR-002** — 日志/tracing 中的敏感信息
 
 跟进遗留（按优先级）：
 - **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播
@@ -496,7 +511,13 @@
 - **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造
 - **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
+- **AUDIT-ERR-001-FOLLOWUP-A/B/C/D/E** — final-hop 错误码折叠 + graph slander 防护 + `.expect` 防御化 + timing padding 反汇编验证 + slander PoC 测试
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 13 已完成
+
+按计划完成：
+- ✅ **AUDIT-ERR-001** — 支付错误码与 payment probing。发现 **F1 🟡 Medium — Final-hop 错误码细分构成 payment probing oracle**：fiber 在 BOLT-04 之外引入 `InvoiceExpired`(16)/`InvoiceCancelled`(17) 独立终态码，并保留 `FinalIncorrectTlcAmount`(19)/`FinalIncorrectExpiryDelta`(18) 细分（LN 主网已折叠到 `IncorrectOrUnknownPaymentDetails`）。攻击者用 1-sat 探测 TLC 即可远程确认 merchant 的 invoice 状态（存在/已取消/已过期/金额匹配/cltv 匹配）= 商业隐私泄露。零成本零授权。**F2 🟡 Medium — graph slander**：`update_graph_with_tlc_fail` 信任 attacker-controlled `extra_data.node_id`/`channel_outpoint` 标记本地图为 disabled，未校验 ID 属于本次 attempt 的 route。`history.rs::record_payment_fail` 评分路径有正确校验模板 — graph 路径未复用。中转 hop 可让发送方在本地"屏蔽"任意目标节点的所有通道。**F3 🟢 Low — `.expect` panic** 三处：`update_graph_with_tlc_fail` 在攻击者构造 `extra_data` 缺失时 PaymentActor panic → 单笔 payment 卡死。**F4 🟢 Low — `GetPaymentResult.failed_error` 透出错误码字面量加重 F1**（F1 修复后自动消解）。**F5 🟢 Low — `TlcErr::serialize` `.expect` 反模式**（与 INPUT-002.F4 同质）。**F6 ℹ️ Info — `ERROR_DECODING_PASSES=27` dummy XOR 在 release build 上是否被 LLVM 优化消除需反汇编验证**。**F7-F8 ✅ Pass**：sphinx error 加密完备、history 评分路径有 route-membership 校验。整体评价：错误处理框架结构良好（BOLT-04 位掩码、sphinx encryption、constant-time padding 设计、history slander 防护），但存在隐私维度 (F1) 与可用性维度 (F2/F3) 两个规范/对称性差距。修复成本极低（<50 行 Rust）。新增 5 个 follow-ups（A/B 必修 Medium，C/D 防御 Low，E 测试）。
 
 ## Phase 1 — Session 12 已完成
 
