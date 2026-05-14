@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 24 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-MEM-003, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
+- ⚠️ 发现弱设计: 25 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-MEM-003, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001, AUDIT-SPEC-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 6
+- ⏳ 待审计: 5
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -439,7 +439,20 @@
 
 ## 第 8 章 DIM-SPEC 规范一致性
 
-- [ ] 🟠 **AUDIT-SPEC-001** P2P 消息规范对照 (`docs/specs/p2p-message.md` vs 实现)
+- [!] 🟠 **AUDIT-SPEC-001** P2P 消息规范对照 (`docs/specs/p2p-message.md` vs 实现) — **整体 🟡 Medium / Medium × 5 + Low × 3 + Info × 1**
+  - **关联代码**: `docs/specs/p2p-message.md:1-376`, `crates/fiber-types/src/schema/fiber.mol:1-305`, `crates/fiber-lib/src/fiber/network.rs`, `crates/fiber-lib/src/fiber/channel.rs`
+  - **审计内容**:
+    - [!] **F1 🟡 Medium**: `RevokeAndAck` 规范声明 `per_commitment_secret: Byte32`（lightning revocation 风格），实现使用 `revocation_partial_signature: Byte32`（musig2）— 整套 revocation 子协议规范错位
+    - [!] **F2 🟡 Medium**: `RemoveTlcFail.error_code: Uint32` plaintext (spec) vs `TlcErrPacket { onion_packet: Bytes }` 加密 (impl) — 规范遵循者引入网络性 payment probing
+    - [!] **F3 🟡 Medium**: `AddTlc` 规范缺 `hash_algorithm`, `onion_packet` — 多跳路由层无文档
+    - [!] **F4 🟡 Medium**: `TxSignatures` 规范有 `tx_hash`, 实现移除 — wire 解析硬不兼容
+    - [!] **F5 🟡 Medium**: `TxComplete` 规范无 `next_commitment_nonce`, 实现要求 — musig2 nonce hand-off 关键时机隐藏
+    - [!] **F6 🟢 Low**: OpenChannel/AcceptChannel 8+ 字段差异；spec 内 `to_self_delay` vs `commitment_delay_epoch` 自相矛盾
+    - [!] **F7 🟢 Low**: `Init` 消息 + chain_hash 校验 + features 协商无规范
+    - [!] **F8 🟢 Low**: `UpdateTlcInfo` / `ReestablishChannel` / `AnnouncementSignatures` 全无规范
+    - [i] **F9 ℹ️ Info**: spec "work in progress" disclaimer + `Secret Derivations` 外链 lnbook（与实现 basepoint 派生有差异）
+  - **总体评价**: 实现正确，规范滞后；fiber 自身无直接资金风险，但公共规范误导新接入者，给生态扩展和未来协议升级（如 PTLC）讨论制造障碍。9 项 follow-ups 全部为文档修复（A-E Medium 必修，F-G Low 防御，H Info, I CI script）。
+  - **发现记录**: 见 [`findings/AUDIT-SPEC-001.md`](./findings/AUDIT-SPEC-001.md)
 - [ ] 🟠 **AUDIT-SPEC-002** Invoice 协议对照 (`docs/specs/payment-invoice.md` vs `invoice/`)
 - [ ] 🟡 **AUDIT-SPEC-003** Trampoline / CCH 规范对照
 
@@ -656,22 +669,28 @@
 
 ---
 
-## Phase 1 — 下一步建议 (Session S23)
+## Phase 1 — 下一步建议 (Session S25)
 
-按 SKILL §三选取规则，S23 计划：
+按 SKILL §三选取规则，S25 计划：
 
-1. **AUDIT-MEM-003** — Actor mailbox 阻塞（与 NET-001.F7、MEM-001.F2 互补：bounded mailbox 设计 + backpressure 信道选择）
-2. **AUDIT-SPEC-001** — P2P 消息规范对照 (`docs/specs/p2p-message.md` vs 实现) — 与 NET-001 + LOGIC-001 协同验证规范-实现一致性
-3. **AUDIT-WASM-001** — `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量（仅 2 处 unsafe，目标审计面小）
+1. **AUDIT-WASM-001** — `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量（仅 2 处 unsafe，目标审计面小）
+2. **AUDIT-SPEC-002** — Invoice 协议对照 (`docs/specs/payment-invoice.md` vs `invoice/`)（与 SPEC-001 同维度，承接修复路线图）
+3. **AUDIT-DEP-002** — `biscuit-auth = 6.0.0-beta.3` (pre-release) 评估（短面审计）
 
-跟进遗留 (新增 NET-001 follow-ups)：
-- **AUDIT-NET-001-FOLLOWUP-A (Medium, 优先级最高)** — tentacle `upnp` feature 默认禁用或 fiber 层 enable_upnp 开关
-- **AUDIT-NET-001-FOLLOWUP-B (Medium)** — 显式 `set_max_connection_number` + RpcConfig/FiberConfig 字段
-- **AUDIT-NET-001-FOLLOWUP-C (Medium)** — admission control 按 tentacle session 而非 fiber peer_session_map 统计 + pre-secio/pre-init/post-init 三层 budget
-- **AUDIT-NET-001-FOLLOWUP-D (Medium)** — `disconnected_peers` cooldown 表按 reason 分级
-- **AUDIT-NET-001-FOLLOWUP-E/F/G (Low/Info)** — 解析 misbehavior 计数 / tentacle `session.suspend()` 集成 / 默认配置文档化
+跟进遗留：见各章节既有 follow-ups 列表（NET-001 A-G / MEM-003 / SPEC-001 A-I 等）。
 
-（其余跟进项见原 S19 列表）
+## Phase 1 — Session 24 已完成
+
+按计划完成：
+- ✅ **AUDIT-SPEC-001** — P2P 消息规范对照。对照 `docs/specs/p2p-message.md` (376 行, "work in progress" 声明) 与权威实现 `crates/fiber-types/src/schema/fiber.mol` (305 行) + `crates/fiber-lib/src/fiber/*` 处理路径。发现 **F1 🟡 Medium**: `RevokeAndAck` 规范声明 `per_commitment_secret: Byte32` (lightning 风格 secret reveal)，实现使用 `revocation_partial_signature: Byte32` (musig2) — 子协议错位，遵循规范的第三方实现可能误广播 32B 任意字节作为 "per_commitment_secret"。**F2 🟡 Medium**: `RemoveTlcFail.error_code: Uint32` plaintext (spec) vs `TlcErrPacket { onion_packet: Bytes }` 加密 (impl) — 规范遵循者引入网络性 payment probing（每个中转 hop 都可读 final-hop 错误码）。**F3 🟡 Medium**: `AddTlc` 规范缺 `hash_algorithm`, `onion_packet` — 整个多跳路由层无文档，与 AUDIT-CRYPTO-002 Sphinx 实现无规范对应。**F4 🟡 Medium**: `TxSignatures` 规范有 `tx_hash: Byte32`, 实现移除（fiber.mol:72-75）— 规范遵循者 Molecule wire 解析硬不兼容，channel funding 100% 失败。**F5 🟡 Medium**: `TxComplete` 规范仅 `channel_id`, 实现要求 `next_commitment_nonce: PubNonce` — musig2 nonce hand-off 关键时机被规范隐藏，与 AUDIT-CRYPTO-001 P0 命题直接关联。**F6 🟢 Low**: OpenChannel/AcceptChannel 8+ 字段差异 (`funding_udt_type_script`/`shutdown_script`/`reserved_ckb_amount`/`commitment_delay_epoch`/三 nonce 等) + spec 内部矛盾（line 59 `to_self_delay` 字段 vs line 78 描述 `commitment_delay_epoch`）。**F7 🟢 Low**: `Init { features, chain_hash }` 完全无规范 — AUDIT-NET-001.F9 / AUDIT-AUTH-002.F8 的 chain_hash 校验防线规范缺失。**F8 🟢 Low**: `UpdateTlcInfo` / `ReestablishChannel` / `AnnouncementSignatures` 三条 active 消息全无规范，`ReestablishChannel` 是 channel-stuck 恢复唯一双向对账渠道 → 第三方无法实现重连。**F9 ℹ️ Info**: spec 开篇 "work in progress" disclaimer + `[Secret Derivations]` 外链 lnbook（与实现 basepoint 派生有差异，规范侧外链可能误导）。**协同攻击链 L1-L3**: L1 spec-following peer 自伤 DoS（F4/F5 任一）；L2 plaintext error_code 下游 probing（F2 影响 spec-following 节点用户）；L3 revocation 误植入（F1 协议级，需要建模才能完全排除资金风险）。**整体定性**: 实现正确、规范滞后；fiber 自身无直接资金风险，但公共规范误导新接入者，给 AUDIT-CRYPTO-001/002/004 和 AUDIT-LOGIC-003/007 的修复方向无规范背书。新增 9 个 follow-ups（A-E Medium 必修文档重写，F/G Low 防御文档，H Info 外链整理，I CI script 字段名 grep 一致性脚本）。
+
+---
+
+## Phase 1 — Session 23 已完成
+
+按计划完成 AUDIT-MEM-003（见上方第 5 章 AUDIT-MEM-003 详情条目与 [`findings/AUDIT-MEM-003.md`](./findings/AUDIT-MEM-003.md)）。
+
+---
 
 ## Phase 1 — Session 22 已完成
 
