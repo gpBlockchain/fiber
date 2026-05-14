@@ -278,7 +278,7 @@ Fiber 是 CKB 之上的 Layer-2 支付网络节点（Lightning Network 类设计
 
 ## 11. Phase 1.5 — 跨模块审计补强 (XMOD)
 
-> Phase 1 按"维度 × 章节"完成 33 项静态审计后，本节做一次**横向**复盘：把那些"单 finding 严重度只 Medium、组合后 High"的攻击面提级为独立的 XMOD 项，方便修复规划与回归测试。详见 [`SECURITY_AUDIT_TODO.md` 附录 C](./SECURITY_AUDIT_TODO.md#附录-c跨模块审计-phase-15) 与 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md) / [`findings/AUDIT-XMOD-008.md`](./findings/AUDIT-XMOD-008.md)；模块间关系与不变量速查见 [`MODULES.md`](./MODULES.md)。
+> Phase 1 按"维度 × 章节"完成 33 项静态审计后，本节做一次**横向**复盘：把那些"单 finding 严重度只 Medium、组合后 High"的攻击面提级为独立的 XMOD 项，方便修复规划与回归测试。详见 [`SECURITY_AUDIT_TODO.md` 附录 C](./SECURITY_AUDIT_TODO.md#附录-c跨模块审计-phase-15)；XMOD-001 ~ XMOD-014 每条均有独立 finding 文件，见 [`findings/AUDIT-XMOD-001.md`](./findings/AUDIT-XMOD-001.md) … [`findings/AUDIT-XMOD-014.md`](./findings/AUDIT-XMOD-014.md)。模块间关系与不变量速查见 [`MODULES.md`](./MODULES.md)。
 
 ### 11.1 XMOD 项概览
 

@@ -76,6 +76,21 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | AUDIT-SPEC-003 | 🟡 Medium × 3 + 🟢 Low × 3 + ℹ️ Info × 2 + ✅ Pass × 4 | Trampoline / CCH spec consistency — `TrampolineHopData` field table missing, `MAX_TRAMPOLINE_HOPS_LIMIT` & error codes undocumented, `cross-chain-htlc.md` completely lacks expiry relations (root cause of LOGIC-008.F1); core protocol mechanisms (tlc_expiry_limit / payment_hash tweak / SHA256 check / double half-budget) correctly implemented | [findings/AUDIT-SPEC-003.md](./findings/AUDIT-SPEC-003.md) |
 | AUDIT-WASM-001 | 🟡 Medium × 1 + 🟢 Low × 2 + ℹ️ Info × 1 + ✅ Pass × 2 | `unsafe impl Send/Sync for Store` lacks SAFETY comment; single-worker assumption implicit, wasm threads adoption introduces wasm-bindgen handle-table UB; 14× `.unwrap()` on IPC path = full-page panic; single-worker safe under current architecture (Pass) | [findings/AUDIT-WASM-001.md](./findings/AUDIT-WASM-001.md) |
 | AUDIT-WASM-002 | 🟡 Medium × 2 + 🟢 Low × 3 + ℹ️ Info + ✅ Pass × 2 | IndexedDB persistence — `Batch::commit` splits delete+put into two independent IPC calls (non-atomic; tab close/OOM mid-batch = ChannelActorState loss = force-close + CSV fund lock); same-origin multi-tab no mutex (commitment_number monotonicity violated); IDB built-in transaction isolation saves single-worker case (Pass) | [findings/AUDIT-WASM-002.md](./findings/AUDIT-WASM-002.md) |
+| **Cross-module (Phase 1.5)** | | | |
+| AUDIT-XMOD-001 | 🟠 High | Payment → Gossip channel_update slander 全网放大（`BroadcastMessages` 转发 attacker-controlled update） | [findings/AUDIT-XMOD-001.md](./findings/AUDIT-XMOD-001.md) |
+| AUDIT-XMOD-002 | 🟠 High | CCH ↔ Watchtower ↔ Channel 时序错配 24h 窗口（order_expiry=36h vs final_tlc=60h） | [findings/AUDIT-XMOD-002.md](./findings/AUDIT-XMOD-002.md) |
+| AUDIT-XMOD-003 | 🟡 Medium | Store 0o644 + db-version 无完整性 + bincode 宽松默认三层叠加 → 同主机离线攻击 | [findings/AUDIT-XMOD-003.md](./findings/AUDIT-XMOD-003.md) |
+| AUDIT-XMOD-004 | 🟠 High | RPC ↔ Invoice ↔ CCH 解析 panic 多入口共享（CCH 接受上游 LND bolt11 = 远程零授权 crash） | [findings/AUDIT-XMOD-004.md](./findings/AUDIT-XMOD-004.md) |
+| AUDIT-XMOD-005 | 🟠 High | RPC 鉴权穿透链（is_public_addr 单 gate + CORS 全通配 + 无 Host allowlist + standalone NodeId::local 空 vec） | [findings/AUDIT-XMOD-005.md](./findings/AUDIT-XMOD-005.md) |
+| AUDIT-XMOD-006 | 🟠 High | 反 cheat 三模块协同断裂（NET-001 Sybil + INPUT-005 watchtower panic + LOGIC-003.F6 revocation + CRYPTO-004.F2） | [findings/AUDIT-XMOD-006.md](./findings/AUDIT-XMOD-006.md) |
+| AUDIT-XMOD-007 | 🟡 Medium | Init chain_hash 跨模块缺位（SPEC-001.F7 规范无字段表，实现侧 OK） | [findings/AUDIT-XMOD-007.md](./findings/AUDIT-XMOD-007.md) |
+| AUDIT-XMOD-008 | 🟠 High | Channel ↔ Gossip MuSig2 partial-signature 预校验不一致（5 处中 3 处缺 verify_partial） | [findings/AUDIT-XMOD-008.md](./findings/AUDIT-XMOD-008.md) |
+| AUDIT-XMOD-009 | 🟠 High | RPC ↔ all-actors ↔ ractor 无超时/无界 mailbox/`.expect()` 死路 → 全栈冻结 | [findings/AUDIT-XMOD-009.md](./findings/AUDIT-XMOD-009.md) |
+| AUDIT-XMOD-010 | 🟡 Medium | Primitives ↔ Channel ↔ Store 曲线代数 panic 永久 brick 通道（`Pubkey::tweak.expect` + state 持久化先于 panic） | [findings/AUDIT-XMOD-010.md](./findings/AUDIT-XMOD-010.md) |
+| AUDIT-XMOD-011 | 🟡 Medium | Watchtower ↔ Tracing ↔ RPC 日志泄露 preimage（ERROR 级别 + `Preimage` 无 newtype） | [findings/AUDIT-XMOD-011.md](./findings/AUDIT-XMOD-011.md) |
+| AUDIT-XMOD-012 | 🟡 Medium | Invoice ↔ Channel ↔ Payment final-hop 错误码 probing oracle（与 BOLT-04 偏离） | [findings/AUDIT-XMOD-012.md](./findings/AUDIT-XMOD-012.md) |
+| AUDIT-XMOD-013 | 🟡 Medium | fiber-bin ↔ env ↔ key ↔ store ↔ ckb 钱包凭据生命周期跨 5 模块无收口 | [findings/AUDIT-XMOD-013.md](./findings/AUDIT-XMOD-013.md) |
+| AUDIT-XMOD-014 | 🟠 High | fiber-wasm-db-* ↔ store ↔ channel 多 tab 共享 IndexedDB 无 Web Locks → commitment 倒退 → 资金罚没 | [findings/AUDIT-XMOD-014.md](./findings/AUDIT-XMOD-014.md) |
 
 ## Final report
 
