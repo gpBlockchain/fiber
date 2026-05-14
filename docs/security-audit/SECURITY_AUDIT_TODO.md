@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v20** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 20 完成)
+> 版本: **v22** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 22 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -31,11 +31,11 @@
 
 ## 审计进度
 
-- **总 TODO 项**: 32
+- **总 TODO 项**: 33
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 21 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
+- ⚠️ 发现弱设计: 23 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
 - ⏳ 待审计: 7
 
@@ -337,6 +337,26 @@
     - [✓] **F9 ✅ Pass**: tower-http 0.6 / jsonrpsee 0.25.1 无已知 CVE（AUDIT-DEP-001 覆盖）
   - **总体评价**: CORS/browser-side 攻击面整体保护良好：默认安全 (cors_enabled=false)、设计安全 (Bearer-only auth)、层级正确 (CorsLayer 外/biscuit 内)、依赖安全 (无 CVE)。主要缺口两处：F1 (Medium) "反直觉默认" + INPUT-003.F5 形成 wallet drainer 路径；F4 (Info) 缺 Host header allowlist 让 DNS rebinding 绕过 CORS。F2/F3 工程化改进，F5 是好设计需文档化。整体相比 AUTH-001/AUTH-002 属于"配置可加固但默认OK"的中等级别。
   - **发现记录**: 见 [`findings/AUDIT-AUTH-003.md`](./findings/AUDIT-AUTH-003.md)
+- [!] 🟠 **AUDIT-NET-001** P2P 网络协议安全 (tentacle/secio/流控/准入) — **整体 High / Medium × 4 + Low × 3 + Pass × 2 + Info × 1**
+  - **关联代码**: `crates/fiber-lib/src/fiber/network.rs:120-160,1744-1820,2030-2048,4302-4322,4469-4512,4534-4545,4876-4950,5213-5262,5572-5710,6029-6108`, `gossip.rs:3121-3142`, `config.rs:88-251,551`, `Cargo.toml:67-74`, tentacle 0.7.5 / tentacle-secio 0.6.7
+  - **审计内容**:
+    - [!] **F1 (Medium)**: 无持久 ban 列表 / 协议违规 disconnect 后远端可立即 reconnect — `requested_disconnect_peers` 仅 `Requested` 分支生效且只 throttle 本端 dial；`grep ban_list|banned_peer|misbehavior` 在 `crates/fiber-lib/src/fiber/` 全 0 命中
+    - [!] **F2 (Medium)**: `ServiceBuilder` 用全部默认 — `max_connection_number=65535`、无 `set_session_open_timeout`、无 yamux 窗口配置；fiber `max_inbound_peers=16` 只覆盖 fiber-protocol 层 → tentacle/OS 级 fd 可被 1 万 + 连接耗尽
+    - [!] **F3 (Medium)**: `enforce_inbound_peer_budget` 仅在 `on_peer_connected` 触发 + 仅统计已开 fiber-protocol 的 peer → secio-only / gossip-only / pre-Init 的 ghost session 完全逃过 admission control；与 MEM-001.F1 协同绕过 gossip OOM 修复
+    - [!] **F4 (Medium)**: `crates/fiber-lib/Cargo.toml:68` 启用 tentacle `upnp` feature 但 fiber 层无 `enable_upnp` 开关也无文档 → 部署在家用/NAT 路由器后的用户预期 LAN-only，UPnP 静默把端口路由到公网；与 AUTH-002.F2 (`listen_on_onion=true` 仍开明文 TCP) 协同破坏隐私模式
+    - [!] **F5 (Low)**: `CHECK_PEER_INIT_INTERVAL=20s` + admission control 不偏向驱逐 "pre-init" session → 攻击者 16 fresh-keypair 占满 inbound 槽位、故意不 Init，每 20s 轮换；合法用户入境失败
+    - [!] **F6 (Low)**: protocol `received` 解析失败仅 debug log → 无 misbehavior 计数 / 累计阈值 / 触发 ban
+    - [!] **F7 (Low)**: `try_send_actor_message` 转发至 ractor unbounded mailbox 无 backpressure (MEM-001.F2 加强)；tentacle `session.suspend()` 完全未使用
+    - [✓] **F8 (Pass)**: secio 强制启用 (tentacle 0.7 `handshake_type` 是唯一对外类型) + chain_hash 强制 + Init 20s timeout
+    - [✓] **F9 (Pass)**: `check_feature_compatibility` 在 Init 之前门控其它 fiber 业务消息
+    - [i] **F10 (Info)**: `MAINTAINING_CONNECTIONS_INTERVAL=1200s` / `PEER_RECONNECT_BACKOFF_MAX=60s` 数值合理但**仅本端 outbound 节流**，对远端 inbound 无效（F1 主因）
+  - **协同攻击链 (L1-L4)**:
+    - L1 (F2+F3): tentacle 65535 fd 上限 + admission control 错层 → 单 IP 万级 fd 耗尽
+    - L2 (F1+F3+F5+AUTH-002.F1): fresh-keypair Sybil 100% 占满 16 槽位
+    - L3 (F3+MEM-001.F1): gossip-only inbound 绕过 admission control → MEM-001 OOM 攻击仍成立
+    - L4 (F4 + L1/L2/L3): UPnP 把上述攻击面静默从 LAN 升级到公网
+  - **修复优先级**: F4 (即时 internet 暴露收紧) > F2 (即时 fd 防护) > F3 (admission 结构性重构) > F1 > F5/F6/F7。修复成本：F1 ~50 行，F2 ~30 行，F3 ~80 行，F4 ~10 行
+  - **发现记录**: 见 [`findings/AUDIT-NET-001.md`](./findings/AUDIT-NET-001.md)
 
 ## 第 5 章 DIM-MEMORY 数值与资源
 
@@ -462,6 +482,7 @@
 | 2026-05-14 | S12 | AUDIT-INPUT-002 | 整体 High — F1 High: `From<InvoiceAttr>` 三处 `.expect()` (Description/FallbackAddr UTF-8、PayeePublicKey from_slice) 远程 DoS，攻击者绕过 Builder 构造 RawInvoiceData → `parse_invoice` / `send_payment` / `cch.receive_btc` 单次合法格式 RPC 即崩进程。F2 Medium: `ar_decompress(...).expect()` 同攻击面。F3 Medium: `from_str` line 902 `.expect("pack invoice data")` 在 F1 修复后变可触发。F4 Low: `panic!("no other error...")` 反模式。F5 Low: duplicate attribute 不拒绝，`DuplicatedAttributeKey` 错误定义但 grep 0 命中。F6 Info: 现有 `fuzz_invoice` 99.99% 被 bech32m checksum 拒绝，永远不到 attr 转换层。F7-F8 Pass: bech32m vs bech32 强制；签名校验路径完整。攻击面：parse_invoice (无授权)、send_payment、cch.receive_btc、cch_fiber_agent。修复成本极低 (`.expect → ?` + `From → TryFrom`) | [!] High × 1, Medium × 2, Low × 2, Info × 1, Pass × 2 |
 | 2026-05-14 | S13 | AUDIT-ERR-001 | 整体 Medium — F1 Medium: fiber 在 BOLT-04 之外引入独立 final-hop 错误码 `InvoiceExpired=PERM\|16`/`InvoiceCancelled=PERM\|17` 并保留 `FinalIncorrect{TlcAmount,ExpiryDelta}` 细分（LN 主网已折叠为 `IncorrectOrUnknownPaymentDetails`），攻击者用 1-sat 探测 TLC 即可远程零授权获取 invoice 状态/金额/cltv 匹配判定 = 商业隐私泄露 (channel.rs:840-844, 1156-1170)。F2 Medium: `update_graph_with_tlc_fail` (payment.rs:1099-1116) 信任 attacker-controlled `extra_data.node_id`/`channel_outpoint` 直接调 `mark_node_failed`/`mark_channel_failed`，未校验 ID 属于本次 attempt route → 中转 hop 可让发送方在本地图屏蔽任意目标；`record_payment_fail` (history.rs:170-180) 评分路径上有正确校验但 graph 路径未对称复用。F3 Low: `update_graph_with_tlc_fail` 三处 `.expect()` panic PaymentActor。F4 Low: `GetPaymentResult.failed_error: String` 直接透出错误码字面量。F5 Low: `TlcErr::serialize` `.expect()` 反模式。F6 Info: `ERROR_DECODING_PASSES=27` dummy XOR 在 release build 是否被 LLVM 优化消除待反汇编验证。F7-F8 Pass: Sphinx onion error encryption + history slander 防护。修复成本极低 (<50 行) | [!] Medium × 2, Low × 3, Info × 1, Pass × 2 |
 | 2026-05-14 | S14 | AUDIT-STORE-001 | 整体 Medium — F1 Medium: DB 目录/文件权限默认 0644/0755，store 中含 `ChannelActorState.commitment_seed` (HKDF 派生历史 revocation secret 种子) + watchtower `ChannelData.Privkey` + preimage 三类高敏数据；与 onion key/wallet 已 enforce 0o600 对称性差距明显，同主机多租户场景下非 root 用户可直读。F2 Medium: SQLite 后端无独占 advisory lock，`Connection::open + WAL` 允许多进程同开，systemd 重启竞态/容器 OOM 重启 → 两实例双写 `MIGRATION_VERSION_KEY` + ChannelActorState → revocation 历史不一致 → cheat 成功 (RocksDB 用 LOCK 文件不受影响)。F3 Low: `deserialize_from` 全局 `panic!` 让单条字节损坏永久 boot-loop。F4 Low: Migration 逐条 put 非原子 + bincode 默认不拒绝尾随字节 → mid-crash 后"幂等"误判致永久跳过迁移。F5 Low: `pending.is_empty()` 路径无条件升版本号掩盖缺失迁移。F6 Low: `cli_confirm` 在非 TTY 挂起。F7 Low: 后端 `.expect` 把 I/O 错抬升 panic 无 graceful flush。F8 Info: `check_validate` 默认分支 `_ => {}` 漏检未来前缀。F9-F10 Pass: INIT_DB_VERSION 拒绝跨 epoch + gossip 验签后才入 DB | [!] Medium × 2, Low × 4, Info × 1, Pass × 2 |
+| 2026-05-14 | S22 | AUDIT-NET-001 | 整体 High — Tentacle/secio 选型合理且 secio 强制 (F8 Pass)、chain_hash + Init 20s timeout 强制 (F8/F9 Pass)，但配置/运营层有 4 个 Medium 协同：**F1** 无持久 ban 列表，`requested_disconnect_peers` 仅 `Requested` 分支生效且只 throttle 本端 dial，远端协议违规 peer 可立即 reconnect (`grep ban_list\|misbehavior` 0 命中)；**F2** `ServiceBuilder` 用全部默认 → tentacle 0.7 `max_connection_number=65535` + 无 session/io idle timeout + 无 yamux 窗口配置；fiber `max_inbound_peers=16` 仅覆盖 fiber-protocol 层 → OS fd 表可被 1 万 + 连接耗尽；**F3** `enforce_inbound_peer_budget` 仅在 `on_peer_connected` 触发，且 `peer_session_map` 仅记录已开 fiber-protocol 的 peer → secio-only / gossip-only / pre-Init 三类 ghost session 完全逃过 admission control，与 MEM-001.F1 协同绕过 gossip OOM；**F4** `Cargo.toml:68` 启用 tentacle `upnp` feature 但 fiber 层无 `enable_upnp` 开关 → 部署在家用/NAT 路由器后的用户预期 LAN-only 时 UPnP 静默把端口路由公网，与 AUTH-002.F2 协同破坏隐私模式。Low: F5 CHECK_PEER_INIT 20s + 不偏向驱逐 pre-init session 让 fresh-keypair 轮换 100% 占满；F6 protocol `received` molecule 解析失败无 misbehavior 计数；F7 `try_send_actor_message` 转 unbounded mailbox 无 backpressure (MEM-001.F2 加强)。协同 L1-L4 链 (socket-exhaustion / Sybil 槽位 / gossip OOM 绕过 / UPnP 公网暴露) 让整体严重度上升到 High。修复优先级 F4>F2>F3>F1。新增 7 个 follow-ups (A-G) | [!] Medium × 4, Low × 3, Pass × 2, Info × 1 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -530,6 +551,13 @@
 | 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-D | S12 / AUDIT-INPUT-002 | (Low) `InvoiceData::try_from` 中加 attribute discriminant 去重，使用既有 `InvoiceError::DuplicatedAttributeKey` 变体（当前 grep 0 命中） |
 | 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-E | S12 / AUDIT-INPUT-002 | (Info, 测试) 新增 fuzz target `fuzz_invoice_data` (`RawInvoiceData::from_slice`) 和 `fuzz_invoice_attr` (`Attribute::from`) 穿透 bech32m / ar_decompress 层；提供合法 invoice 字符串作为 corpus 种子 |
 | 2026-05-14 | AUDIT-INPUT-002-FOLLOWUP-F | S12 / AUDIT-INPUT-002 | (Low, 防御) 在 RPC handler 与 actor 入口包裹 `catch_unwind` 或建立 panic-hook，确保单次解析 panic 不击垮整个 fiber 进程（临时措施） |
+| 2026-05-14 | AUDIT-NET-001-FOLLOWUP-A | S22 / AUDIT-NET-001 | **🟡 Medium 优先** — 评估并默认禁用 `crates/fiber-lib/Cargo.toml:68` 的 tentacle `upnp` feature；如保留则添加 `FiberConfig::enable_upnp: bool`（默认 false）+ cfg gate；README 文档化 NAT/家用路由器部署注意事项 |
+| 2026-05-14 | AUDIT-NET-001-FOLLOWUP-B | S22 / AUDIT-NET-001 | **🟡 Medium 必修** — `ServiceBuilder` 显式 `set_max_connection_number(2 * max_inbound_peers + outbound + headroom)`，`RpcConfig`/`FiberConfig` 暴露 `max_total_connections` / `session_open_timeout` / `yamux_max_window`；评估 tentacle 0.7 是否有 io_idle_timeout API 防 "secio 完成但长期 idle" 占据 fd |
+| 2026-05-14 | AUDIT-NET-001-FOLLOWUP-C | S22 / AUDIT-NET-001 | **🟡 Medium 必修** — `enforce_inbound_peer_budget` 改为按 `control.session_list()` 而非 fiber `peer_session_map` 统计；区分 pre-secio / pre-init / post-init 三层 budget；定时复查（与 `MAINTAINING_CONNECTIONS_INTERVAL` 对齐）；驱逐顺序改为 LIFO（踢新留老）— 同时修复 AUTH-002.F1 |
+| 2026-05-14 | AUDIT-NET-001-FOLLOWUP-D | S22 / AUDIT-NET-001 | **🟡 Medium 必修** — 引入 `disconnected_peers: HashMap<Pubkey, (DisconnectReason, Instant)>` cooldown 表，对非 `Requested` 的 disconnect 写入；`on_peer_connected` 内查表，若 `now - disconnected_at < cooldown(reason)` 立即 disconnect；分级 cooldown: ChainHashMismatch 1h / InitMessageTimeout/FeatureIncompatible 5min / ProtocolViolation 30min；按 source IP 做次级限流 |
+| 2026-05-14 | AUDIT-NET-001-FOLLOWUP-E | S22 / AUDIT-NET-001 | (Low) `FiberProtocolHandle::received` / `Gossip received` 解析失败 misbehavior 计数 (per-session)，> N 次（如 16）后 `DisconnectPeer(ProtocolViolation)` 触发 FOLLOWUP-D ban |
+| 2026-05-14 | AUDIT-NET-001-FOLLOWUP-F | S22 / AUDIT-NET-001 | (Low) NetworkActor mailbox 改 bounded mpsc，深度接近上限时调用 `context.session.suspend()` 反压远端；恢复后 `resume()`；与 MEM-001-FOLLOWUP-A 联动 |
+| 2026-05-14 | AUDIT-NET-001-FOLLOWUP-G | S22 / AUDIT-NET-001 | (Info, 文档) 文档化 tentacle 0.7 `ServiceConfig` 全部默认值 (max_connection_number=65535 等) + fiber 覆盖项；供运维与后续审计 reference |
 
 ## 附录 C：修复建议
 
@@ -617,35 +645,27 @@
 
 ---
 
-## Phase 1 — 下一步建议 (Session S19)
+## Phase 1 — 下一步建议 (Session S23)
 
-按 SKILL §三选取规则，S19 计划：
+按 SKILL §三选取规则，S23 计划：
 
-1. **AUDIT-NET-001** — P2P 网络协议安全（peer 流控、握手鉴权、tentacle/secio 配置；与 AUTH-002 互补）
-2. **AUDIT-INPUT-005** — CKB Tx / Cell 数据校验（commitment / settlement / funding outpoint resolution）
-3. **AUDIT-CRYPTO-004** — 签名验证完整性 (gossip / commitment / shutdown 已分别在 AUTH-002.F8 / LOGIC-003 / LOGIC-007 部分覆盖，需统一审视)
+1. **AUDIT-MEM-003** — Actor mailbox 阻塞（与 NET-001.F7、MEM-001.F2 互补：bounded mailbox 设计 + backpressure 信道选择）
+2. **AUDIT-SPEC-001** — P2P 消息规范对照 (`docs/specs/p2p-message.md` vs 实现) — 与 NET-001 + LOGIC-001 协同验证规范-实现一致性
+3. **AUDIT-WASM-001** — `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量（仅 2 处 unsafe，目标审计面小）
 
-跟进遗留（按优先级）：
-- **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播（同时解锁 INPUT-003.F1）
-- **AUDIT-LOGIC-008-FOLLOWUP-A/B (high, 直接资金损失修复)** — `expire_order` Pending-only gating + LND/Fiber 对称 cancel 路径
-- **AUDIT-INPUT-003-FOLLOWUP-A (medium, 零成本 DoS 修复)** — list-type RPC `limit` 上界
-- **AUDIT-ERR-002-FOLLOWUP-A (medium, preimage 字面值移除)** — `watchtower/actor.rs:181` `error!` 字段裁剪
-- **AUDIT-ERR-001-FOLLOWUP-A/B (medium, probing + slander 修复)** — 折叠 final-hop 错误码 + `update_graph_with_tlc_fail` 加 route-membership 校验
-- **AUDIT-STORE-001-FOLLOWUP-A/B (medium, deployment hardening)** — DB 文件权限 0700/0600 + SQLite 独占 advisory lock
-- **AUDIT-MEM-001-FOLLOWUP-A** — gossip OOM PoC + 修复
-- **AUDIT-AUTH-001-FOLLOWUP-A** — standalone watchtower NodeId 冲突 PoC + 修复
-- **AUDIT-AUTH-002-FOLLOWUP-A** — inbound eviction Sybil PoC + 修复
-- **AUDIT-LOGIC-007-FOLLOWUP-A** — 协同 DoS PoC
-- **AUDIT-INPUT-002-FOLLOWUP-C/D/E/F** — panic 反模式 / dup attr / fuzz 改进 / catch_unwind 防御
-- **AUDIT-INPUT-003-FOLLOWUP-B/C/D/E/F** — `.expect` 防御化 + RpcConfig 字段扩展 + force_auth + inject_rpc_context Result + catch_unwind
-- **AUDIT-ERR-002-FOLLOWUP-B/C/D/E/F** — biscuit leftover warn / token 前缀 hash / PaymentPreimage newtype / 默认 info / redaction layer
-- **AUDIT-LOGIC-008-FOLLOWUP-C** — orphaned-preimage 旁路
-- **AUDIT-MEM-002-FOLLOWUP-B** — `build_settlement_data` checked_* 改造
-- **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
-- **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
-- **AUDIT-ERR-001-FOLLOWUP-C/D/E** — `.expect` 防御化 + timing padding 反汇编验证 + slander PoC 测试
-- **AUDIT-STORE-001-FOLLOWUP-C/D/E/F/G/H** — migration batch + bincode strict / deserialize Result / MissingMigration / auto-confirm / backend Result trait / check_validate unknown-prefix
-- **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+跟进遗留 (新增 NET-001 follow-ups)：
+- **AUDIT-NET-001-FOLLOWUP-A (Medium, 优先级最高)** — tentacle `upnp` feature 默认禁用或 fiber 层 enable_upnp 开关
+- **AUDIT-NET-001-FOLLOWUP-B (Medium)** — 显式 `set_max_connection_number` + RpcConfig/FiberConfig 字段
+- **AUDIT-NET-001-FOLLOWUP-C (Medium)** — admission control 按 tentacle session 而非 fiber peer_session_map 统计 + pre-secio/pre-init/post-init 三层 budget
+- **AUDIT-NET-001-FOLLOWUP-D (Medium)** — `disconnected_peers` cooldown 表按 reason 分级
+- **AUDIT-NET-001-FOLLOWUP-E/F/G (Low/Info)** — 解析 misbehavior 计数 / tentacle `session.suspend()` 集成 / 默认配置文档化
+
+（其余跟进项见原 S19 列表）
+
+## Phase 1 — Session 22 已完成
+
+按计划完成：
+- ✅ **AUDIT-NET-001** — P2P 网络协议安全 (tentacle / secio / 流控 / 准入)。发现 **F1 🟡 Medium — 无持久 ban 列表**: `requested_disconnect_peers` 仅在 `PeerDisconnectReason::Requested` 分支生效且只 throttle 本端 dial（network.rs:1803-1806）；`grep -rn "ban_list\|banned_peer\|misbehavior\|punish"` 在 `crates/fiber-lib/src/fiber/` 全 0 命中 → ChainHashMismatch/InitMessageTimeout/驱逐后远端可立即 reconnect，配合 AUTH-002.F1 LRU 顺序形成无成本 Sybil。**F2 🟡 Medium — `ServiceBuilder` 用全部默认**: `network.rs:5614-5662` 仅调用 `insert_protocol/handshake_type/tcp_proxy_config/tcp_onion_config/forever(true on wasm)`，无 `set_max_connection_number/set_session_open_timeout/set_yamux_config/set_send_buffer_size`；tentacle 0.7.5 默认 `max_connection_number=65535` + 默认 session_open_timeout，`max_inbound_peers=16` 只覆盖 fiber-protocol 层 → OS fd 万级耗尽攻击成立。**F3 🟡 Medium — `enforce_inbound_peer_budget` 颗粒度错位**: 仅在 `on_peer_connected` (fiber-protocol connected) 触发 + 仅统计 `peer_session_map`（fiber-protocol-only）→ secio-only/gossip-only/pre-Init 三类 ghost session 完全逃过 admission control，与 MEM-001.F1 协同绕过 gossip OOM 修复；驱逐顺序"踢老留新"放大攻击。**F4 🟡 Medium — `Cargo.toml:68` 启用 tentacle `upnp` feature**: 全 fiber 代码 `grep upnp` 0 命中（只剩 Cargo.toml 一行声明），即 fiber 层无 `enable_upnp` 开关；tentacle 自动 UPnP/NAT-PMP 把私网监听地址映射到公网，与 AUTH-002.F2 协同破坏隐私模式。**F5 🟢 Low**: `CHECK_PEER_INIT_INTERVAL=20s` + admission control 不偏向驱逐 pre-init session。**F6 🟢 Low**: protocol `received` 解析失败仅 debug log 无 misbehavior 计数。**F7 🟢 Low**: `try_send_actor_message` 转发 unbounded mailbox + tentacle `session.suspend()` 完全未使用（MEM-001.F2 加强）。**F8 ✅ Pass**: secio 强制 (tentacle 0.7 `handshake_type` 唯一类型) + tentacle-secio 0.6.7 在 GHAD 无 CVE。**F9 ✅ Pass**: `check_feature_compatibility` 在 Init 前门控其它 fiber 业务消息。**F10 ℹ️ Info**: `MAINTAINING_CONNECTIONS_INTERVAL=1200s` / `PEER_RECONNECT_BACKOFF_MAX=60s` 仅本端 outbound 节流，对远端 inbound 无效。**协同攻击链 L1-L4**: L1=F2+F3 socket-exhaustion；L2=F1+F3+F5+AUTH-002.F1 inbound 槽位 Sybil；L3=F3+MEM-001.F1 gossip-only OOM 绕过；L4=F4+(L1/L2/L3) UPnP 把攻击面从 LAN 升级公网 → 整体严重度 High。修复优先级 F4>F2>F3>F1，修复成本 F1 ~50 行 / F2 ~30 行 / F3 ~80 行 / F4 ~10 行。新增 7 个 follow-ups (A/B/C/D Medium + E/F Low + G Info)。
 
 ## Phase 1 — Session 18 已完成
 
