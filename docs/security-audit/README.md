@@ -18,7 +18,7 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 3. **Phase 2** — Doc updates after every session (status, findings, new attack-surface items).
 4. **Phase 3** — Final report.
 
-## Status (TODO v13, 2026-05-14)
+## Status (TODO v14, 2026-05-14)
 
 | Bucket | Count |
 |---|---|
@@ -26,9 +26,9 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | ✅ Passed | 0 |
 | ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
-| ⚠️ Weak design | 15 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001) |
+| ⚠️ Weak design | 16 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001 — no known CVE in surveyed deps) |
-| ⏳ Pending | 13 |
+| ⏳ Pending | 12 |
 
 ## Next session (S14) — planned
 
@@ -60,3 +60,4 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | AUDIT-LOGIC-008 | 🟠 **High** / 🟠 High × 1 + 🟢 Low × 1 + ℹ️ Info × 1 + ✅ Pass × 3 | CCH cross-chain HTLC — `expire_order` races outgoing flow → preimage dropped, no cancel paths in module → direct fund loss in default 24h window | [findings/AUDIT-LOGIC-008.md](./findings/AUDIT-LOGIC-008.md) |
 | AUDIT-INPUT-002 | 🟠 **High** / 🟠 High × 1 + 🟡 Medium × 2 + 🟢 Low × 2 + ℹ️ Info × 1 + ✅ Pass × 2 | Invoice parsing — `From<InvoiceAttr>` `.expect()` (UTF-8 / pubkey) and `ar_decompress(...).expect()` panic the entire fiber process from a single unauth'd `parse_invoice` / `send_payment` / `cch.receive_btc` call | [findings/AUDIT-INPUT-002.md](./findings/AUDIT-INPUT-002.md) |
 | AUDIT-ERR-001 | 🟡 Medium / 🟡 Medium × 2 + 🟢 Low × 3 + ℹ️ Info × 1 + ✅ Pass × 2 | Payment error codes & probing — final-hop `InvoiceExpired`/`InvoiceCancelled`/`FinalIncorrect{TlcAmount,ExpiryDelta}` leak invoice state (BOLT-04 deviation) → remote zero-cost probing; `update_graph_with_tlc_fail` trusts attacker-controlled `extra_data.node_id`/`channel_outpoint` without route-membership check → local-graph slander; three `.expect(...)` panic PaymentActor when `extra_data` absent | [findings/AUDIT-ERR-001.md](./findings/AUDIT-ERR-001.md) |
+| AUDIT-STORE-001 | 🟡 Medium / 🟡 Medium × 2 + 🟢 Low × 4 + ℹ️ Info × 1 + ✅ Pass × 2 | Persistence & migration — DB directory/files default to 0644/0755 (vs onion key/wallet enforcing 0o600) exposing `commitment_seed`/watchtower `Privkey`/preimage to same-host users; SQLite backend has no exclusive advisory lock (RocksDB has LOCK file) so systemd restart races / OOM-restarts can let two instances double-write `MIGRATION_VERSION_KEY` + ChannelActorState → revocation history split; global `deserialize_from` is `panic!`-on-error → single corrupted record = permanent boot-loop; per-step migrations are non-atomic (no batch/tx) and rely on bincode 1.x default not rejecting trailing bytes for "idempotency" — mid-crash can silently mis-skip records; backend `.expect` lifts I/O errors to process panic without graceful flush | [findings/AUDIT-STORE-001.md](./findings/AUDIT-STORE-001.md) |

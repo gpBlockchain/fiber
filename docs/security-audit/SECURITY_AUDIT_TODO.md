@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v13** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 13 完成)
+> 版本: **v14** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 14 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 15 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001)
+- ⚠️ 发现弱设计: 16 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-STORE-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 13
+- ⏳ 待审计: 12
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -332,6 +332,25 @@
 - [ ] 🟡 **AUDIT-WASM-001** `fiber-store` 浏览器 `unsafe impl Send/Sync` 不变量
 - [ ] 🟡 **AUDIT-WASM-002** WASM 持久化 / IndexedDB 读写一致性
 
+## 第 10 章 DIM-STORE 持久层与迁移
+
+- [!] 🟠 **AUDIT-STORE-001** 持久层与迁移安全 — **整体 🟡 Medium (Medium × 2 + Low × 4 + Info × 1 + Pass × 2)**
+  - **关联代码**: `crates/fiber-store/src/native.rs:17-105`, `crates/fiber-store/src/sqlite.rs:20-181`, `crates/fiber-store/src/browser.rs:84-198`, `crates/fiber-store/src/migration.rs:213-312`, `crates/fiber-store/src/migrations/mig_20260511_channel_connectivity_state.rs:30-93`, `crates/fiber-lib/src/store/store_impl/mod.rs:121-132,166-320`, `crates/fiber-bin/src/main.rs:121-129`
+  - **审计内容**:
+    - [x] 后端实现 (RocksDB/SQLite/WASM) 一致性 + I/O 错处理 → ⚠️ 全部 `.expect`/`panic!` 抬升至进程崩溃
+    - [x] `serialize_to_vec`/`deserialize_from` panic 表面 → ⚠️ 任何损坏记录永久 boot-loop
+    - [x] Migration 原子性 → ⚠️ 非 transaction，依赖 bincode 非自描述边界做"幂等"
+    - [x] DB 目录文件权限 → ⚠️ 0644/0755 默认，未与 onion key (0600)/wallet 对称
+    - [x] SQLite 并发开 DB → ⚠️ 无独占 advisory lock
+    - [x] `pending.is_empty()` 路径无条件升版本号 → ⚠️ 隐式掩盖缺失迁移
+    - [x] `cli_confirm` 非交互环境 → ⚠️ systemd/k8s 升级体验
+    - [x] `check_validate` 启动校验 → 默认未调用 + 默认分支 `_ => {}` 漏检
+    - [x] `INIT_DB_VERSION` 拒绝越过 epoch → ✅
+    - [x] Gossip 入 DB 前已验签（来自 MEM-001.F1 分析）→ ✅
+  - **最严重场景 (F1)**: 同主机多租户/共享托管环境下，非 root 用户可直读 `<store>/CHANNEL_ACTOR_STATE_PREFIX/...` 中的 `commitment_seed` 与 watchtower `Privkey`/preimage — 拿到 commitment_seed 等价于完全失去反 cheat 能力（HKDF 派生历史 revocation secret）。修复成本极低（5 行 `set_permissions(0o700)`）。
+  - **F2 协同场景**: SQLite 后端无独占 advisory lock + systemd 重启竞态/容器 OOM 重启 → 两实例同时迁移并双写 `MIGRATION_VERSION_KEY` 与 ChannelActorState → revocation 历史不一致 → cheat 成功
+  - **发现记录**: 见 [`findings/AUDIT-STORE-001.md`](./findings/AUDIT-STORE-001.md)
+
 ---
 
 ## 附录 A：审计执行日志
@@ -356,6 +375,8 @@
 | 2026-05-13 | S10 | AUDIT-MEM-002 | 整体 Medium，数值算术接近正确：F1 Low: check_tlc_limits fold 未 checked_add (max_tlc_value_in_flight 默认 u128::MAX 时无后果)；F2 Low: build_settlement_data 链式 +/- 未 checked，依赖状态机不变式 (force-close 路径最有价值修复)；F3 Low: commitment_fee*2 未 checked_mul / u128 as u64 截断；F4 Info: apply_remove_tlc checked_* 正面典范；F5 Info: funding < u64::MAX 显式 cap；F6-F9 Pass: payment/graph/onion checked_add 完整、retry/backoff saturating、MPP saturating_add、add_amount==0 拒绝 | [!] Low × 3, Info × 2, Pass × 4 |
 | 2026-05-13 | S11 | AUDIT-LOGIC-008 | 整体 High — F1 High: `expire_order` 不区分订单 status，默认 order_expiry=36h < TLC_expiry=60h 留 24h 窗口可让调度器在 outgoing 流程中强制 Fail 订单导致 preimage 事件被 `get_active_order_or_none` 丢弃 → CCH 直接资金损失（SendBTC/ReceiveBTC 双向均可利用）；模块完全无 cancel_invoice / cancel_payment 调用路径 (grep 0 命中)。F2 Low: `min_final_cltv_expiry_delta() * 600` 两处未 checked/saturating，与同文件 line 205 `saturating_mul` 不一致。F3 Info: BTC 600s/block 固定假设。F4-F6 Pass: preimage SHA256 hash 校验、静态 half-budget check（含 checked_mul）、动态 half-budget + max_outgoing limit + check_expiry_or_fail | [!] High × 1, Low × 1, Info × 1, Pass × 3 |
 | 2026-05-14 | S12 | AUDIT-INPUT-002 | 整体 High — F1 High: `From<InvoiceAttr>` 三处 `.expect()` (Description/FallbackAddr UTF-8、PayeePublicKey from_slice) 远程 DoS，攻击者绕过 Builder 构造 RawInvoiceData → `parse_invoice` / `send_payment` / `cch.receive_btc` 单次合法格式 RPC 即崩进程。F2 Medium: `ar_decompress(...).expect()` 同攻击面。F3 Medium: `from_str` line 902 `.expect("pack invoice data")` 在 F1 修复后变可触发。F4 Low: `panic!("no other error...")` 反模式。F5 Low: duplicate attribute 不拒绝，`DuplicatedAttributeKey` 错误定义但 grep 0 命中。F6 Info: 现有 `fuzz_invoice` 99.99% 被 bech32m checksum 拒绝，永远不到 attr 转换层。F7-F8 Pass: bech32m vs bech32 强制；签名校验路径完整。攻击面：parse_invoice (无授权)、send_payment、cch.receive_btc、cch_fiber_agent。修复成本极低 (`.expect → ?` + `From → TryFrom`) | [!] High × 1, Medium × 2, Low × 2, Info × 1, Pass × 2 |
+| 2026-05-14 | S13 | AUDIT-ERR-001 | 整体 Medium — F1 Medium: fiber 在 BOLT-04 之外引入独立 final-hop 错误码 `InvoiceExpired=PERM\|16`/`InvoiceCancelled=PERM\|17` 并保留 `FinalIncorrect{TlcAmount,ExpiryDelta}` 细分（LN 主网已折叠为 `IncorrectOrUnknownPaymentDetails`），攻击者用 1-sat 探测 TLC 即可远程零授权获取 invoice 状态/金额/cltv 匹配判定 = 商业隐私泄露 (channel.rs:840-844, 1156-1170)。F2 Medium: `update_graph_with_tlc_fail` (payment.rs:1099-1116) 信任 attacker-controlled `extra_data.node_id`/`channel_outpoint` 直接调 `mark_node_failed`/`mark_channel_failed`，未校验 ID 属于本次 attempt route → 中转 hop 可让发送方在本地图屏蔽任意目标；`record_payment_fail` (history.rs:170-180) 评分路径上有正确校验但 graph 路径未对称复用。F3 Low: `update_graph_with_tlc_fail` 三处 `.expect()` panic PaymentActor。F4 Low: `GetPaymentResult.failed_error: String` 直接透出错误码字面量。F5 Low: `TlcErr::serialize` `.expect()` 反模式。F6 Info: `ERROR_DECODING_PASSES=27` dummy XOR 在 release build 是否被 LLVM 优化消除待反汇编验证。F7-F8 Pass: Sphinx onion error encryption + history slander 防护。修复成本极低 (<50 行) | [!] Medium × 2, Low × 3, Info × 1, Pass × 2 |
+| 2026-05-14 | S14 | AUDIT-STORE-001 | 整体 Medium — F1 Medium: DB 目录/文件权限默认 0644/0755，store 中含 `ChannelActorState.commitment_seed` (HKDF 派生历史 revocation secret 种子) + watchtower `ChannelData.Privkey` + preimage 三类高敏数据；与 onion key/wallet 已 enforce 0o600 对称性差距明显，同主机多租户场景下非 root 用户可直读。F2 Medium: SQLite 后端无独占 advisory lock，`Connection::open + WAL` 允许多进程同开，systemd 重启竞态/容器 OOM 重启 → 两实例双写 `MIGRATION_VERSION_KEY` + ChannelActorState → revocation 历史不一致 → cheat 成功 (RocksDB 用 LOCK 文件不受影响)。F3 Low: `deserialize_from` 全局 `panic!` 让单条字节损坏永久 boot-loop。F4 Low: Migration 逐条 put 非原子 + bincode 默认不拒绝尾随字节 → mid-crash 后"幂等"误判致永久跳过迁移。F5 Low: `pending.is_empty()` 路径无条件升版本号掩盖缺失迁移。F6 Low: `cli_confirm` 在非 TTY 挂起。F7 Low: 后端 `.expect` 把 I/O 错抬升 panic 无 graceful flush。F8 Info: `check_validate` 默认分支 `_ => {}` 漏检未来前缀。F9-F10 Pass: INIT_DB_VERSION 拒绝跨 epoch + gossip 验签后才入 DB | [!] Medium × 2, Low × 4, Info × 1, Pass × 2 |
 
 ## 附录 B：新增项跟踪 (Phase 1 中发现的新攻击面)
 
@@ -488,16 +509,24 @@
 | AUDIT-ERR-001.F3 | 🟢 Low | `update_graph_with_tlc_fail` 三处 `.expect(...)` 改防御式 `if let Some(...)` | 未修复 |
 | AUDIT-ERR-001.F5 | 🟢 Low | `TlcErr::serialize` `.expect()` → `unwrap_or_else(unreachable!())` 或 Result | 未修复 |
 | AUDIT-ERR-001.F6 | ℹ️ Info | release build 反汇编验证 `ERROR_DECODING_PASSES=27` dummy XOR 未被优化消除 | 待动态验证 |
+| AUDIT-STORE-001.F1 | 🟡 Medium | DB 目录/文件权限强制 0700/0600 (与 onion key/wallet 对称) — 修复 `open_db` 后 `fs::set_permissions` | 未修复 |
+| AUDIT-STORE-001.F2 | 🟡 Medium | SQLite 后端添加 `fd_lock`/`fs2` 独占 advisory lock 防多实例并发 | 未修复 |
+| AUDIT-STORE-001.F3 | 🟢 Low | `deserialize_from` panic 改为 Result + quarantine 损坏记录 | 未修复 |
+| AUDIT-STORE-001.F4 | 🟢 Low | Migration 用 `store.batch()` 原子化 + bincode 配 `reject_trailing_bytes` | 未修复 |
+| AUDIT-STORE-001.F5 | 🟢 Low | `pending.is_empty()` 时报 MissingMigration 而不是隐式升版本 | 未修复 |
+| AUDIT-STORE-001.F6 | 🟢 Low | 添加 `--auto-confirm-migration` flag + 非 TTY 默认拒绝 | 未修复 |
+| AUDIT-STORE-001.F7 | 🟢 Low | 后端 trait 改 Result<...> 提供 graceful flush 钩子（大重构） | 未修复 |
+| AUDIT-STORE-001.F8 | ℹ️ Info | `check_validate` 默认分支报告 unknown prefix counts | 未修复 |
 
 ---
 
-## Phase 1 — 下一步建议 (Session S14)
+## Phase 1 — 下一步建议 (Session S15)
 
-按 SKILL §三选取规则，S14 计划：
+按 SKILL §三选取规则，S15 计划：
 
-1. **AUDIT-STORE-001** — 持久层与迁移安全（RocksDB CF、`.schema.json`、binary 反序列化）
-2. **AUDIT-INPUT-003** — JSON-RPC 参数校验（无授权端点 / 数值边界 / hex 解码 panic 面）
-3. **AUDIT-ERR-002** — 日志/tracing 中的敏感信息
+1. **AUDIT-INPUT-003** — JSON-RPC 参数校验（无授权端点 / 数值边界 / hex 解码 panic 面）
+2. **AUDIT-ERR-002** — 日志/tracing 中的敏感信息
+3. **AUDIT-AUTH-003** — RPC CORS / Tower-http 配置
 
 跟进遗留（按优先级）：
 - **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播
@@ -512,7 +541,13 @@
 - **AUDIT-LOGIC-005/004/002-FOLLOWUP-A** — MPP / slot jamming / expiry PoC
 - **AUDIT-LOGIC-003-FOLLOWUP-A** — 链上 commitment-lock 合约源码审计
 - **AUDIT-ERR-001-FOLLOWUP-A/B/C/D/E** — final-hop 错误码折叠 + graph slander 防护 + `.expect` 防御化 + timing padding 反汇编验证 + slander PoC 测试
+- **AUDIT-STORE-001-FOLLOWUP-A/B** — DB 文件权限 0700/0600 + SQLite 独占 advisory lock
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 14 已完成
+
+按计划完成：
+- ✅ **AUDIT-STORE-001** — 持久层与迁移安全。发现 **F1 🟡 Medium — DB 目录/文件权限默认 0644/0755**：`open_db` 用 `create_dir_all` + `DB::open` 不设权限，store 中含 `ChannelActorState.commitment_seed`（HKDF 派生历史 revocation secret 的种子，等价完全失去反 cheat 能力）+ watchtower `ChannelData.Privkey` + preimage 三类高敏数据。与 `onion_service.rs:485-491` 已 enforce 0o600 / wallet 已 enforce 0o600 的对称性差距显著。同主机多租户/共享托管/容器编排场景下非 root 用户可直读。**F2 🟡 Medium — SQLite 后端无独占 advisory lock**：`rusqlite::Connection::open` + `journal_mode = WAL` 允许多进程同时打开同一文件。systemd 重启竞态/容器 OOM 重启可让两实例同时迁移并双写 `MIGRATION_VERSION_KEY`，revocation 历史不一致 → cheat 成功。RocksDB 用 LOCK 文件强制独占，不受影响。**F3 🟢 Low — `deserialize_from` 全局 `panic!`**：30+ 调用点任何一条记录字节级损坏 → 永久 boot-loop。watchtower 受同一函数影响 → 攻击者可在 cheat 前制造 torn write 让 watchtower 反复 boot-fail。**F4 🟢 Low — Migration 非原子**：`m.migrate(store)` 内逐条 `store.put` 无 batch / transaction；mid-crash 后依赖 `if let Ok(_new) = bincode::deserialize::<NewChannelActorData>` 做"幂等"，而 bincode 1.x 默认 `DefaultOptions` 不拒绝尾随字节 → 旧字节流末尾恰好是合法 enum 变体即被误判为新格式 → 永久跳过迁移 → 后续读 panic。**F5 🟢 Low — `pending.is_empty()` 时无条件升 db_version**：构建错误（latest 升了但忘加 migration）被掩盖。**F6 🟢 Low — `cli_confirm` 非交互环境**：systemd/k8s 升级体验差。**F7 🟢 Low — 后端 `.expect` 把 I/O 错抬升为 panic**：disk-full/IO error 即崩溃，无 graceful flush，commitment state 一致性受损。**F8 ℹ️ Info — `check_validate` 默认分支 `_ => {}`**：未来新前缀盲检。**F9-F10 ✅ Pass**：`INIT_DB_VERSION` 拒绝跨 epoch + gossip 验签后才入 DB（来自 MEM-001.F1 分析）。整体评价：持久层保守可用，但机密性维度 (F1) 与一致性维度 (F2/F4/F7) 存在改进空间。F1 修复成本极低（5 行）。新增 8 个 follow-ups（A/B 必修 Medium，C-G Low 防御 + UX，H Info 维护性）。
 
 ## Phase 1 — Session 13 已完成
 
