@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v22** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 22 完成)
+> 版本: **v23** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 23 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 23 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
+- ⚠️ 发现弱设计: 24 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-CRYPTO-005, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-NET-001, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-MEM-003, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 7
+- ⏳ 待审计: 6
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -387,7 +387,18 @@
     - [✓] **F9 (Pass)**: `channel.rs:6410 check_tlc_limits` 显式拒绝 `add_amount == 0`。
   - **总体评价**: 与 MEM-001 形成鲜明对比 —— 数值算术整体**接近正确**。`apply_remove_tlc` 注释清楚说明 "deep defense" 意图；HopData 解析甚至有针对 u64::MAX overflow 的专门单元测试。3 个 Low 均属 "defense-in-depth" 缺口，实际触发需要前置状态机 bug。
   - **发现记录**: 见 [`findings/AUDIT-MEM-002.md`](./findings/AUDIT-MEM-002.md)
-- [ ] 🟡 **AUDIT-MEM-003** Actor mailbox 阻塞
+- [!] 🟡 **AUDIT-MEM-003** Actor mailbox 阻塞与 RPC 入口背压 — **整体 Medium / Medium × 1 + Low × 2 + Info × 3 + Pass × 1**
+  - **关联代码**: `crates/fiber-lib/src/rpc/utils.rs:50-84` (`handle_actor_call!` 宏), `crates/fiber-lib/src/fiber/network.rs:116,123,133-134,3484-3490,3608-3616,5944-5974`, `crates/fiber-lib/src/fiber/payment.rs:1423-1438`, `crates/fiber-lib/src/fiber/gossip.rs:1197-1240,1521-1546`, `crates/fiber-lib/src/rpc/cch.rs:40,70-115`, `crates/fiber-lib/src/utils/actor.rs:1-54`, `crates/fiber-lib/Cargo.toml:38-40`
+  - **审计内容**:
+    - [!] **F1 🟡 Medium**: `handle_actor_call!` (utils.rs:58-84) 全部用 `call!`(无超时)，被 channel/payment/invoice/peer/graph/info/dev RPC 模块大面积调用 → NetworkActor / ChannelActor 任一处慢路径 → 所有并发 RPC hang → jsonrpsee 100 并发耗尽（与 INPUT-005/NET-001 协同）
+    - [!] **F2 🟢 Low**: `gossip.rs:1521 QueryBroadcastMessages` 在 background 任务中 `call!`(无超时) → 单条 query 卡住 backlog GossipActor mailbox
+    - [!] **F3 🟢 Low**: `gossip.rs:1197 NewSubscription` startup-only `call!`(无超时) → ExtendedGossipMessageStoreActor 启动卡住 → 节点 init hang
+    - [i] **F4 ℹ️ Info**: `rpc/cch.rs TIMEOUT=1000ms` (1 秒) 偏短 — CchActor 调 LND gRPC 经常超时，UX/状态-外部行为脱节但非安全风险
+    - [i] **F5 ℹ️ Info**: `DEFAULT_CHAIN_ACTOR_TIMEOUT=300_000ms (5min)` + `.expect(ASSUME_CHAIN_ACTOR_ALWAYS_ALIVE_FOR_NOW)` (network.rs:3490,5186) → chain actor 死亡时 NetworkActor 直接 panic（已知 TODO）
+    - [i] **F6 ℹ️ Info**: `payment.rs:1423 SendPaymentOnionPacket` 复用 5min 超时 → 单 attempt 最差 5min × max_attempts=5 = 25min 拖住 PaymentSession
+    - [✓] **F7 Pass**: `ActorHandleLogGuard` (utils/actor.rs:1-54) + 15s 阈值在 NetworkActor / ChannelActor / GossipActor / CkbChainActor / WatchtowerActor / InFlightCkbTxActor 全部启用 → 有 observability（log + 可选 metrics histogram）
+  - **总体评价**: ractor 0.15 默认无界 mailbox + `call!` 无超时是 P0 设计缺陷；NetworkActor handle() 已 spawn async（network.rs:2058/2077/2357 注释）减轻被远程 RPC 拖累的概率，但只要任意一条消息走 chain actor / peer 往返 → 5 分钟级 hang → RPC 全线僵死。修复 F1 + F5 即可消除绝大部分实战影响。
+  - **发现记录**: 见 [`findings/AUDIT-MEM-003.md`](./findings/AUDIT-MEM-003.md)
 
 ## 第 6 章 DIM-ERRINFO 错误信息与隐私
 
