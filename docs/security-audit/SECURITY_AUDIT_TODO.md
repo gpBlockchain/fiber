@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v19** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 19 完成)
+> 版本: **v20** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 20 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -35,9 +35,9 @@
 - ✅ 通过: 0
 - ⚠️ 建议改进: 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001)
 - ❌ 发现疑似漏洞: 1 (AUDIT-CRYPTO-001 — 需动态验证)
-- ⚠️ 发现弱设计: 20 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
+- ⚠️ 发现弱设计: 21 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001)
 - ℹ️ 信息性: 1 (AUDIT-DEP-001)
-- ⏳ 待审计: 8
+- ⏳ 待审计: 7
 
 **状态标记**: `[ ]` 待审 ｜ `[~]` 审计中 ｜ `[x]` 通过 ｜ `[!]` 发现问题 ｜ `[?]` 疑似/需动态验证 ｜ `[i]` 信息性
 
@@ -80,9 +80,17 @@
     - [x] `fiber/key.rs::KeyPair` (节点身份密钥) 仍是**明文写盘**，无加密 ⚠️ (medium — 设计性)
   - **发现记录**: 见 [`findings/AUDIT-CRYPTO-003.md`](./findings/AUDIT-CRYPTO-003.md)
 
-- [ ] 🟠 **AUDIT-CRYPTO-004** 签名验证完整性 (gossip / commitment / shutdown)
-  - **关联代码**: `fiber/gossip.rs`、`fiber/channel.rs`
-  - **审计内容**: 所有外部消息分支强制签名校验；恶意 peer 是否能命中未验证路径；曲线点/标量有效性
+- [!] 🟠 **AUDIT-CRYPTO-004** 签名验证完整性 (gossip / commitment / shutdown) — **Medium × 4, Low × 2, Pass × 5**
+  - **关联代码**: `fiber/gossip.rs:2428-2530,2499-2505`、`fiber/channel.rs:792-803,4720-4737,7301-7356,8339-8340`、`fiber-types/src/invoice.rs:601-604`、`fiber-types/src/protocol.rs:547-590`
+  - **审计内容**:
+    - [!] **F1 (Medium)**: `ClosingSigned` partial_signature 不预校验 + 缺 state guard — 代码注释自承
+    - [!] **F2 (Medium)**: `RevokeAndAck` revocation_partial_signature 直接进 `sign_and_aggregate`，与 `CommitmentSigned` 不一致
+    - [!] **F3 (Medium)**: `AnnouncementSignatures` 聚合前不校验远端 partial，TODO stale 且未 ban peer
+    - [!] **F4 (Medium)**: UDT 通道 capacity 不做链上校验（TODO 占位），路由污染
+    - [!] **F5 (Low)**: `CkbInvoice::check_signature()` 对未签名 invoice 静默 pass + CCH 入口缺 `is_signed()` 守卫
+    - [!] **F6 (Low)**: gossip `message_to_sign` 无域分离 tag
+    - [x] **F7-F11 (Pass)**: `CommitmentSigned.verify_and_complete_tx` 正确预校验 / 三签全验 + on-chain 绑定 / Pubkey::from_slice 拒绝 identity / 编译期类型隔离 / Broadcast 依赖排序
+  - **发现记录**: 见 [`findings/AUDIT-CRYPTO-004.md`](./findings/AUDIT-CRYPTO-004.md)
 
 - [ ] 🟠 **AUDIT-CRYPTO-005** PTLC 点/标量代数操作
   - **关联代码**: `fiber/channel.rs`, `fiber/types.rs`

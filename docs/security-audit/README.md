@@ -26,16 +26,16 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | ✅ Passed | 0 |
 | ⚠️ Advisory / Improvement | 2 (AUDIT-CRYPTO-003, AUDIT-INPUT-001) |
 | ❌ Suspected vulnerability | 1 (AUDIT-CRYPTO-001, requires dynamic validation) |
-| ⚠️ Weak design | 21 (AUDIT-CRYPTO-002, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001) |
+| ⚠️ Weak design | 22 (AUDIT-CRYPTO-002, AUDIT-CRYPTO-004, AUDIT-LOGIC-001..008, AUDIT-INPUT-002, AUDIT-INPUT-003, AUDIT-INPUT-004, AUDIT-INPUT-005, AUDIT-AUTH-001, AUDIT-AUTH-002, AUDIT-AUTH-003, AUDIT-MEM-001, AUDIT-MEM-002, AUDIT-ERR-001, AUDIT-ERR-002, AUDIT-STORE-001) |
 | ℹ️ Informational | 1 (AUDIT-DEP-001) |
-| ⏳ Pending | 7 |
+| ⏳ Pending | 6 |
 
-## Next session (S20) — planned
+## Next session (S21) — planned
 
-- AUDIT-CRYPTO-004 — Signature verification consolidation (gossip / commitment / shutdown)
-- AUDIT-CRYPTO-005 — PTLC point/scalar algebra
-- AUDIT-SPEC-001 — P2P message specification consistency
-- **Highest-priority follow-ups (sticky)**: INPUT-005-A/B (watchtower lock_args/witness panic = funding loss), INPUT-002-A/B, LOGIC-008-A/B, INPUT-003-A, AUTH-003-A, INPUT-004-A/B, ERR-002-A, ERR-001-A/B, STORE-001-A/B, MEM-001-A, AUTH-001-A, AUTH-002-A, LOGIC-007-A
+- AUDIT-CRYPTO-005 — PTLC point/scalar algebra (identity / order boundary / scalar tweak domain separation)
+- AUDIT-SPEC-001 — P2P message specification vs implementation consistency
+- AUDIT-SPEC-002 — Invoice protocol specification consistency
+- **Highest-priority follow-ups (sticky)**: INPUT-005-A/B (watchtower lock_args/witness panic = funding loss), CRYPTO-004-A (MuSig2 partial verify_partial coverage on ClosingSigned / RevokeAndAck / AnnouncementSignatures), INPUT-002-A/B, LOGIC-008-A/B, INPUT-003-A, AUTH-003-A, INPUT-004-A/B, ERR-002-A, ERR-001-A/B, STORE-001-A/B, MEM-001-A, AUTH-001-A, AUTH-002-A, LOGIC-007-A
 
 ## Findings index
 
@@ -44,6 +44,7 @@ according to the [security-audit SKILL](https://github.com/gpBlockchain/ckb-test
 | AUDIT-CRYPTO-001 | 🔴 Suspected H/Critical | MuSig2 nonce reuse (requires dynamic PoC) | [findings/AUDIT-CRYPTO-001.md](./findings/AUDIT-CRYPTO-001.md) |
 | AUDIT-CRYPTO-002 | 🟡 Medium + 🟢 Low + ℹ️ Info | Sphinx onion peeling & replay protection | [findings/AUDIT-CRYPTO-002.md](./findings/AUDIT-CRYPTO-002.md) |
 | AUDIT-CRYPTO-003 | 🟡 Medium × 2 + 🟢 Low × 3 | Wallet encryption (key derivation, AEAD) | [findings/AUDIT-CRYPTO-003.md](./findings/AUDIT-CRYPTO-003.md) |
+| AUDIT-CRYPTO-004 | 🟡 Medium × 4 + 🟢 Low × 2 + ✅ Pass × 5 | Signature verification integrity — F1 Medium: `ClosingSigned` partial_signature stored without `verify_partial`, code-comment self-acknowledged + state guard also missing (`channel.rs:792-803,6591-6598`); malicious peer can DoS cooperative close → force-close required. F2 Medium: `RevokeAndAck` `revocation_partial_signature` goes straight to `sign_and_aggregate` without explicit pre-verification (`channel.rs:7301-7356`) — inconsistent with `CommitmentSigned.verify_and_complete_tx` template (`channel.rs:8339-8340` Pass F7); combined with INPUT-005.F1 watchtower panic creates "poison-revocation + cheat" two-stage attack chain. F3 Medium: `AnnouncementSignatures` aggregation without pre-verification (`channel.rs:4720-4737`); stale TODO misattributes failure to "wrong nonce", no peer-ban. F4 Medium: UDT channel `capacity` field skipped from on-chain verification in `verify_channel_announcement` (`gossip.rs:2499-2505`); TODO placeholder; attacker can pollute routing decisions with inflated capacity. F5 Low: `CkbInvoice::check_signature()` silently returns Ok for unsigned invoices (`invoice.rs:601-604`); CCH `ReceiveBTC` path lacks `is_signed()` guard. F6 Low: gossip `message_to_sign()` lacks domain-separation tag (`protocol.rs:547-590`). Pass: F7 `CommitmentSigned` correct verify_partial template; F8 gossip three-signature full verification + on-chain CKB cell binding (`gossip.rs:2428-2530`); F9 `Pubkey::from_slice` rejects identity/off-curve (secp256k1 0.30); F10 ECDSA/Schnorr compile-time type separation; F11 `BroadcastMessage::Ord` enforces NodeAnn < ChannelAnn < ChannelUpdate dependency order. **No funds at direct risk** (final aggregate verification catches invalid signatures) but **3 channel-stuck DoS vectors** in close/revoke/announce paths. | [findings/AUDIT-CRYPTO-004.md](./findings/AUDIT-CRYPTO-004.md) |
 | AUDIT-DEP-001 | ℹ️ Info | Dependency vulnerability scan | [findings/AUDIT-DEP-001.md](./findings/AUDIT-DEP-001.md) |
 | AUDIT-INPUT-001 | 🟢 Low + 🟡 Improvement × 3 | P2P Molecule input fuzz coverage | [findings/AUDIT-INPUT-001.md](./findings/AUDIT-INPUT-001.md) |
 | AUDIT-LOGIC-001 | 🟡 Medium × 1 + 🟢 Low × 4 + ℹ️ Info × 2 | Channel state-machine illegal transitions | [findings/AUDIT-LOGIC-001.md](./findings/AUDIT-LOGIC-001.md) |
