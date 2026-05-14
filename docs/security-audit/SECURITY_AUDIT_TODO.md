@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v17** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 17 完成)
+> 版本: **v18** | 最后更新: 2026-05-14 | 状态: 进行中 (Phase 1 — Session 18 完成)
 
 ## 项目概况 (Project Profile)
 
@@ -239,7 +239,23 @@
     - [✓] **F9 ✅ Pass**: 公网监听 (`is_public_addr`) + 未配置 `biscuit_public_key` 时启动 fail-fast，防止公网零鉴权暴露
   - **总体评价**: RPC 层**类型解析**严谨（Pubkey/Hash256 全部 fallible，公网强制鉴权，DevRpc 编译期剔除），但在**用户字符串透传**（F1，与 INPUT-002 共生）和**集合 size 边界**（F2，零成本资源耗尽）两个面有重要缺口。F3/F4/F5 是防御纵深问题，与 STORE-001/MEM-001/AUTH-001/002 协同放大攻击面。修复成本低（F1 依赖 INPUT-002 主修复；F2/F3 各 < 10 行；F4/F5 小幅 RpcConfig 扩展 + tower middleware）。
   - **发现记录**: 见 [`findings/AUDIT-INPUT-003.md`](./findings/AUDIT-INPUT-003.md)
-- [ ] 🟠 **AUDIT-INPUT-004** 存储反序列化 (bincode) 与迁移
+- [!] 🟡 **AUDIT-INPUT-004** 存储反序列化 (bincode) 与迁移 — **整体 Medium / Medium × 2 + Low × 3 + Info × 2 + Pass × 2**
+  - **关联代码**: `crates/fiber-store/Cargo.toml:19-25` (bincode 1.3.3 + fiber-types-081/090 snapshots), `crates/fiber-lib/src/store/store_impl/mod.rs:121-132,167-320` (deserialize_from / check_validate), `crates/fiber-store/src/migration.rs:41-312` (auto_migrate framework), `crates/fiber-store/src/migrations/mig_20260511_channel_connectivity_state.rs:1-99`
+  - **审计内容**:
+    - [x] bincode 1.3.3 默认配置实测（trailing bytes + struct prefix-overlap 静默接受 ❌；fixint encoding；enum discriminant=u32）
+    - [x] Migration framework 流程（DatabaseTooNew/Old 边界 ✓、版本号路径、空 pending 分支）
+    - [x] `check_validate` 覆盖完备性（10 个已知 prefix ✓、2 个空 case、1 个 catch-all `_ => {}` 静默忽略未知 prefix ❌）
+    - [!] **F1 (Medium)**: Migration "已迁移" 判定 `if let Ok(_new) = bincode::deserialize::<NewT>(&value) { skipped }` 依赖 bincode 默认接受 trailing bytes / 接受 struct-prefix → 当前"末尾追加字段"型 mig 安全，但模式是 footgun，未来"删字段"/"重命名"/"enum 重排" mig 会静默错过/破坏数据；实测 `/tmp/bctest`：`B { x: u32 }` 从 `A { x, y }` 编码反序列化成功
+    - [!] **F2 (Medium)**: `MIGRATION_VERSION_KEY = b"db-version"` 无完整性签名 + `auto_migrate` 在 `pending.is_empty() && db_version != latest` 时无条件 stamp latest → 配合 STORE-001.F1 (DB 0644) 同主机攻击者改版本号即可静默跳过 migration → 后续 OLD-format 字节被 NEW 反序列化 panic
+    - [!] **F3 (Low)**: `serialize_to_vec`/`deserialize_from` 全局 `panic!` 重申 STORE-001.F3
+    - [!] **F4 (Low)**: `check_validate` catch-all `_ => {}` 静默忽略未知 prefix → 升级路径上 health-check 假阳性
+    - [!] **F5 (Low)**: `fiber-types-090 = "0.9.0-rc1"` / `fiber-types-081 = "0.8.1"` 用 caret 而非 `=` → cargo update 拉新版本时 OLD/NEW schema 语义可能漂移
+    - [i] **F6 (Info)**: `add_migration` 同版本号 `BTreeMap::insert` 静默覆盖 + 版本号无 `^\d{14}$` 格式校验
+    - [i] **F7 (Info)**: `MigrationFailed { error: String }` 类型擦除让上层无法区分 IO/parse/schema 错误
+    - [✓] **F8/F9 Pass**: `DatabaseTooNew`/`DatabaseTooOld` 边界完备；`serde_json` 中转 schema 演化模式优雅 + `package = "fiber-types"` rename trick 引入双版本
+  - **最严重场景 (F1+F2 协同)**：同主机攻击者写 `db-version = LATEST_DB_VERSION` 字面值 → migration 完全跳过；下次新 binary 启动 deserialize OLD 字节为 NEW 类型 → `panic!("deserialization of ChannelActorState failed")` → boot-loop；或 F1 路径下未来某 mig 走"删字段"型 → bincode 静默接受 → `skipped++` → OLD 记录永不迁移 → 业务读到错误的默认字段值
+  - **总体评价**：bincode + migration 框架的**外形**专业（snapshot deps trick、`DatabaseTooNew/Old` 边界、`check_validate` 实现），但**内核**有两类系统性脆弱：bincode 1.3 默认配置过于宽松（实测 trailing bytes + prefix-overlap 静默成功）+ migration 版本号缺乏完整性保护。修复成本均低（每条 < 30 行）但需要项目层引入 strict bincode + schema-version-byte 约定。
+  - **发现记录**: 见 [`findings/AUDIT-INPUT-004.md`](./findings/AUDIT-INPUT-004.md)
 - [ ] 🟡 **AUDIT-INPUT-005** CKB Tx / Cell 数据
 
 ## 第 4 章 DIM-AUTH 认证与鉴权
@@ -571,13 +587,13 @@
 
 ---
 
-## Phase 1 — 下一步建议 (Session S17)
+## Phase 1 — 下一步建议 (Session S19)
 
-按 SKILL §三选取规则，S17 计划：
+按 SKILL §三选取规则，S19 计划：
 
-1. **AUDIT-AUTH-003** — RPC CORS / Tower-http 配置（已部分覆盖于 AUTH-001.F3 与 INPUT-003.F5，需补充 Origin allow-list 与 CSRF 防御纵深审计）
-2. **AUDIT-INPUT-004** — 存储反序列化 (bincode) 与迁移（已部分覆盖于 STORE-001.F3/F4，需补充 cross-version replay / downgrade 测试）
-3. **AUDIT-NET-001** — P2P 网络协议安全（peer 流控、握手鉴权、tentacle/secio 配置）
+1. **AUDIT-NET-001** — P2P 网络协议安全（peer 流控、握手鉴权、tentacle/secio 配置；与 AUTH-002 互补）
+2. **AUDIT-INPUT-005** — CKB Tx / Cell 数据校验（commitment / settlement / funding outpoint resolution）
+3. **AUDIT-CRYPTO-004** — 签名验证完整性 (gossip / commitment / shutdown 已分别在 AUTH-002.F8 / LOGIC-003 / LOGIC-007 部分覆盖，需统一审视)
 
 跟进遗留（按优先级）：
 - **AUDIT-INPUT-002-FOLLOWUP-A/B (highest, 远程零成本零授权 DoS 修复)** — `From<InvoiceAttr> → TryFrom` + `ar_decompress` 错误传播（同时解锁 INPUT-003.F1）
@@ -600,6 +616,11 @@
 - **AUDIT-ERR-001-FOLLOWUP-C/D/E** — `.expect` 防御化 + timing padding 反汇编验证 + slander PoC 测试
 - **AUDIT-STORE-001-FOLLOWUP-C/D/E/F/G/H** — migration batch + bincode strict / deserialize Result / MissingMigration / auto-confirm / backend Result trait / check_validate unknown-prefix
 - **AUDIT-CRYPTO-001/002-FOLLOWUP-A** — MuSig2 nonce-reuse / cross-channel onion replay 动态验证
+
+## Phase 1 — Session 18 已完成
+
+按计划完成：
+- ✅ **AUDIT-INPUT-004** — 存储反序列化 (bincode) 与迁移。发现 **F1 🟡 Medium — Migration "已迁移" 判定 `if let Ok(_new) = bincode::deserialize::<NewT>(&value) { skipped }` 依赖 bincode 1.3.3 默认接受 trailing bytes + 接受 struct-prefix**：实测 `/tmp/bctest` 用 `bincode 1.3.3` + serde 1.0 验证 `B { x: u32 }` 从 `A { x, y }` 编码反序列化成功（多余 4 字节静默忽略），且 `A` 反序列化于 `A bytes + 2 trailing` 也成功。当前 `mig_20260511_channel_connectivity_state` 走"末尾追加字段"型 mig（NEW 比 OLD 长一字段）所以 OLD bytes deserialize-as-NEW 大概率因 EOF 失败 — 当前安全；但模式是 footgun，未来"删字段"型 mig (NEW 比 OLD 短) 会让 OLD bytes 静默成功被 deserialize 为 NEW (trailing 忽略) → `skipped++` → OLD 记录**永不迁移**。"重命名字段"/"enum 变体重排"同样静默成功但语义错位。**F2 🟡 Medium — `MIGRATION_VERSION_KEY = b"db-version"` 无完整性签名 + `auto_migrate.pending.is_empty() → init_db_version` 路径**：(migration.rs:255-262) 配合 STORE-001.F1 (DB 0644) 同主机攻击者写 `db-version = LATEST_DB_VERSION` 字面值 → `db_version == latest` 提前 return → migration 完全跳过 → 下次启动 deserialize OLD 字节为 NEW 类型 panic → boot-loop。变体：写 `db-version = "20260511120001"`（介于 latest 与未来 mig 之间）→ `pending.is_empty()` → 静默 stamp latest → 缺失 mig 永远不会运行。**F3 🟢 Low — `serialize_to_vec`/`deserialize_from` 全局 `panic!`**（重申 STORE-001.F3）。**F4 🟢 Low — `check_validate` catch-all `_ => {}` 静默忽略未知 prefix**：升级路径 (DB v(N+1) by 新 binary, check by 旧 binary v(N)) 上新 prefix 被静默接受 → 报告 "All keys and values valid" → 实际未校验。**F5 🟢 Low — `fiber-types-090 = "0.9.0-rc1"` / `fiber-types-081 = "0.8.1"` 未用 `=` 精确锁版本**：cargo 默认 caret，未来上游发 0.9.0-rc2/0.9.0 含字段微调 → `cargo update` 后 migration 引用的 OLD/NEW schema 语义漂移 → supply-chain 风险。**F6 ℹ️ Info — `add_migration` 同版本号 `BTreeMap::insert` 静默覆盖 + 版本号无 `^\d{14}$` 格式校验**：内部 invariant 缺口（`"foo"` 字符串 > 所有数字版本被错认 latest）。**F7 ℹ️ Info — `MigrationFailed { error: String }` 类型擦除**：上层无法区分 IO（可重试）/parse（数据损坏）/schema（binary bug）。**F8/F9 ✅ Pass**：`DatabaseTooNew`/`DatabaseTooOld` 边界完备；`serde_json` 中转 schema 演化模式优雅 + `package = "fiber-types"` rename trick 引入双版本。整体评价：bincode + migration 框架的**外形**专业，但**内核**有两类系统性脆弱：bincode 1.3 默认配置过于宽松（实测验证）+ migration 版本号缺乏完整性保护。修复成本均低（每条 < 30 行），需要项目层引入 strict bincode + schema-version-byte 约定。新增 7 个 follow-ups（A/B 必修 Medium，C/D/E 防御 Low，F/G 工程 Info）。
 
 ## Phase 1 — Session 16 已完成
 
