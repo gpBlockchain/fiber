@@ -1,6 +1,8 @@
 # Fiber Network Node — 模块关系图（安全审计视角）
 
-> 版本: **v3** | 最后更新: 2026-05-14 (S29) | 配套文档: [`SECURITY_AUDIT_TODO.md`](./SECURITY_AUDIT_TODO.md), [`REPORT.md`](./REPORT.md)
+> 版本: **v4** | 最后更新: 2026-05-15 (S30) | 配套文档: [`SECURITY_AUDIT_TODO.md`](./SECURITY_AUDIT_TODO.md), [`REPORT.md`](./REPORT.md)
+>
+> v4 变更：新增 XMOD-017（rpc/pubsub ↔ store ↔ cch preimage 越权泄露 + 顺序广播 DoS）；§3 新增 E11/I13/O6 三条边；§5 新增 INV-18；§6 增加映射。
 
 ## 0. 文档目的
 
@@ -8,7 +10,7 @@
 
 1. 给出 9 个 crates / 8 个核心子模块的**职责分工**与**调用方向**；
 2. 在每条跨模块边上标注**信任级别**（攻击者控制度）、**关键序列化格式**、**actor 通信类型**；
-3. 给所有已发现的 XMOD-001..016 跨模块攻击链**画出明确的连通边**，便于回归测试规划。
+3. 给所有已发现的 XMOD-001..017 跨模块攻击链**画出明确的连通边**，便于回归测试规划。
 
 > **范围**：本文聚焦"攻击面图"，不重复每个 finding 的细节（细节看 `findings/AUDIT-*.md`）。
 
@@ -135,6 +137,7 @@
 | E8 | 磁盘（keyfile / db） | `fiber/key`, `store` | 🟨 | scrypt 加密 / bincode | DB 目录 0o644/0o755；db-version 无 HMAC | CRYPTO-003, STORE-001, INPUT-004, XMOD-003 |
 | E9 | 浏览器 IndexedDB / 跨 tab | `fiber-wasm-db-worker` | 🟨 | 自定义 batch | 单 worker 假设 / 无跨 tab 互斥 | WASM-001, WASM-002 |
 | E10 | OS env (`FIBER_SECRET_KEY_PASSWORD`) | `fiber/key`, `fiber-bin` | 🟦 | 字符串 | — | CRYPTO-003 |
+| E11 | JSON-RPC WebSocket subscriber (`subscribe_store_changes`) | `rpc/pubsub` (`PubSubServerActor::AddSink`) | 🟥 / 🟨 | JSON-RPC over WS + biscuit token (facet=`read("cch")`) | 鉴权 OK；但**授权粒度过粗** — `read("cch")` 同时获得 `get_cch_order` + preimage 流；`enable_auth=false` loopback 完全放行 | XMOD-017, XMOD-005 |
 
 ### 3.2 模块间边（fiber 内核内部 actor 消息流）
 
@@ -154,6 +157,7 @@
 | I10 | `store/store_impl/mod.rs` (`auto_migrate`) | `fiber-store::migration` | E8 (磁盘 db-version key) | 直接函数调用 | **XMOD-003**：bincode prefix-overlap + db-version 无签名 |
 | I11 | `fiber/channel` (`derive_tlc_pubkey`) | `fiber-types::primitives::Pubkey::tweak` | E2 (`tlc_basepoint`, `first_per_commitment_point`) | 内联函数 | **XMOD-010**：`.not_inf().expect` → channel state 已持久化先于 panic |
 | I12 | `fiber/channel` (`AnnouncementSignatures`) | `fiber/gossip` (广播 channel_announcement) | E2 | `cast!` → broadcast | **XMOD-008.F3**：partial 不预校验 → gossip 污染入口 |
+| I13 | `store/store_impl::notify` (PutPreimage / PutPaymentSession / PutCkbInvoiceStatus) | `rpc/pubsub::PubSubServerActor::Publish` | `channel`/`payment` 结算路径触发 | callback → `send_message` (无界 mailbox) | **XMOD-017**：preimage 进 WebSocket 广播；顺序 `sink.send().await` 单慢订阅者阻塞全广播 |
 
 ### 3.3 出站边
 
@@ -164,6 +168,7 @@
 | O3 | `cch/actor` | LND gRPC (上游) | gRPC | 服务端到 LND；CCH 单边出资见 LOGIC-008 |
 | O4 | `rpc/pubsub` | 订阅客户端 | JSON-RPC notification | 仅含已脱敏字段（待复审） |
 | O5 | `tracing` / log fd | stderr / file | 任意 `{:?}` 格式化 | **XMOD-011**：watchtower preimage、biscuit token 等敏感字段进入 |
+| O6 | `rpc/pubsub` (`PubSubServerActor::Publish`) | 远程 JSON-RPC WebSocket subscriber | `StoreChange` JSON（含 **明文 preimage**） | **XMOD-017**：与 O5 互补的第二条 preimage 出口；与 XMOD-002 时序窗口叠加可致跨链 preimage 失窃 |
 
 ---
 
@@ -189,6 +194,7 @@
 | **XMOD-014** | E9 + 隐式跨 tab 边 | wasm-db ↔ store ↔ channel | 多 tab 双签 → 资金罚没 |
 | **XMOD-015** | I5/I8 + E6 + 4-confs 常量 | network ↔ ckb/tx_tracing ↔ channel ↔ watchtower ↔ store | `CKB_TX_TRACING_CONFIRMATIONS=4` + 无 reorg rollback → funding/closing reorg-out 资金 brick |
 | **XMOD-016** | onion_service ↔ network ↔ O1/E5 | onion_service ↔ network ↔ gossip ↔ rpc | `announced_addrs` 合并 clearnet+onion → NodeAnnouncement 全网广播签名身份与 clearnet IP 关联 |
+| **XMOD-017** | E11 + I13 → O6 | rpc/pubsub ↔ store ↔ channel/payment ↔ cch | `subscribe_store_changes` 以 `read("cch")` facet 暴露明文 preimage / payment_session JSON stream；顺序广播 await + 无界 actor mailbox 让单慢订阅者拖死整通道（与 XMOD-002 时序叠加可致跨链 preimage 失窃） |
 
 ---
 
@@ -215,6 +221,7 @@
 | **INV-15** | 浏览器场景下同一 wallet 在同一时刻仅允许一个 tab 持有写权限（Web Locks + commitment_number 回退检测） | E9 + I 跨 tab 边 | ❌ XMOD-014 |
 | **INV-16** | CKB tx 确认必须有"reorg rollback 反向事件"——funding/closing/settlement 任一在 ≥N 块 reorg 后必须能撤销 channel 状态机的对应推进；confs 阈值应足够深（≥ 1 量级于 LN 主网经验） | I5, I8 + tx_tracing 出站 | ❌ XMOD-015 |
 | **INV-17** | 启用 onion service 隐私模式时，节点的广播身份（NodeAnnouncement）与 RPC 公开身份（`node_info`）不得泄露 clearnet IP；地址类型需在编译期分流 | onion_service + O1/E5 | ❌ XMOD-016 |
+| **INV-18** | 任何把"资金凭证级敏感数据"（preimage / 完整 PaymentSession / 私钥）推送到 RPC 出站的通道（订阅 / 推送 / 长连接）必须：(a) 拥有独立、专用、最高权 biscuit facet；(b) 即便 `enable_auth=false` 也强制 token；(c) 默认事件流仅含元数据，敏感字段由独立 RPC + token attenuation 拉取；(d) 广播 actor 必须 bounded mailbox + per-sink send timeout，避免单订阅者阻塞 | E11 + I13 + O6 | ❌ XMOD-017 |
 
 ---
 
@@ -240,6 +247,7 @@
 - INV-15 ↔ WASM-001/002 + STORE-001 + AUDIT-XMOD-014（新发现）
 - INV-16 ↔ LOGIC-003 + AUDIT-XMOD-006 + AUDIT-XMOD-015（新发现）
 - INV-17 ↔ AUTH-002.F2/F3 + AUDIT-XMOD-016（新发现）
+- INV-18 ↔ AUTH-001 + STORE-001 + XMOD-005 + XMOD-009 + AUDIT-XMOD-017（新发现）
 
 ---
 

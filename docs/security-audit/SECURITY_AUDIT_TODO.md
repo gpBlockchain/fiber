@@ -1,6 +1,6 @@
 # Fiber Network Node 安全审计 TODO
 
-> 版本: **v29** | 最后更新: 2026-05-14 | 状态: **Phase 1 完成 + Phase 1.5 跨模块审计补强 (XMOD-001..016)** — 见 [附录 C](#附录-c跨模块审计-phase-15) 与 [`MODULES.md`](./MODULES.md)
+> 版本: **v30** | 最后更新: 2026-05-15 | 状态: **Phase 1 完成 + Phase 1.5 跨模块审计补强 (XMOD-001..017)** — 见 [附录 C](#附录-c跨模块审计-phase-15) 与 [`MODULES.md`](./MODULES.md)
 
 ## 项目概况 (Project Profile)
 
@@ -881,7 +881,8 @@ Phase 1 按"维度 × 章节"切片做完 33 项后，**横向**复盘暴露出�
 | **AUDIT-XMOD-013** | fiber-bin ↔ env ↔ fiber/key ↔ store ↔ ckb | 🟡 Medium | CRYPTO-003、STORE-001 | [!] 见独立 finding |
 | **AUDIT-XMOD-014** | fiber-wasm-db-* ↔ store ↔ channel state (跨 tab) | 🟠 **High** | WASM-001、WASM-002、STORE-001（SQLite advisory lock 缺位） | [!] 见独立 finding |
 | **AUDIT-XMOD-015** | network ↔ ckb/tx_tracing ↔ channel ↔ watchtower ↔ store | 🟠 **High** | `CKB_TX_TRACING_CONFIRMATIONS=4` + 无 reorg rollback + tracer callback 一次性 | [!] 见独立 finding（本次新增 S29） |
-| **AUDIT-XMOD-016** | onion_service ↔ network ↔ gossip ↔ rpc | 🟡 Medium | AUTH-002.F2/F3（明文 TCP 监听）的出站姊妹问题：`announced_addrs` 合并 clearnet+onion → NodeAnnouncement 全网广播 | [!] 见独立 finding（本次新增 S29） |
+| **AUDIT-XMOD-016** | onion_service ↔ network ↔ gossip ↔ rpc | 🟡 Medium | AUTH-002.F2/F3（明文 TCP 监听）的出站姊妹问题：`announced_addrs` 合并 clearnet+onion → NodeAnnouncement 全网广播 | [!] 见独立 finding（S29 新增） |
+| **AUDIT-XMOD-017** | rpc/pubsub ↔ store ↔ channel/payment ↔ cch | 🟠 **High** | `subscribe_store_changes` 用 `read("cch")` facet 即可订阅 `StoreChange::PutPreimage` 明文 preimage JSON 流；权限粒度过粗 + loopback 默认 `enable_auth=false` 完全放行 + `PubSubServerActor` 顺序 `sink.send().await` + 默认无界 mailbox → 单慢订阅者阻塞全广播 + 进程 OOM；与 XMOD-002 时序窗口叠加 → 跨链 preimage 失窃 | [!] 见独立 finding（本次新增 S30） |
 
 ### AUDIT-XMOD-001 — Payment → Gossip channel_update slander 全网放大
 
@@ -921,6 +922,7 @@ XMOD 项**继承** Phase 1 优先级，但要求**链式修复**（部分模块�
 | **P0** | XMOD-001, XMOD-004, XMOD-008 | 远程零授权放大/panic/channel-stuck |
 | **P0** | XMOD-009 | 远程一行 RPC 全节点冻结（actor mailbox 无 timeout） |
 | **P0** | XMOD-014 | 浏览器多 tab 同 wallet 资金罚没 |
+| **P0** | XMOD-017 | `read("cch")` token 越权获得 preimage 实时流 → 跨链抢 settle 资金损失 |
 | **P1** | XMOD-005 | 多租户/浏览器鉴权穿透 |
 | **P1** | XMOD-003 | 同主机离线攻击者持久化破坏 |
 | **P1** | XMOD-010 | 单条 P2P 消息永久 brick 通道 |
@@ -975,6 +977,17 @@ XMOD 项**继承** Phase 1 优先级，但要求**链式修复**（部分模块�
 详见 [`findings/AUDIT-XMOD-016.md`](./findings/AUDIT-XMOD-016.md)。要点：`network.rs:5676-5765` 把 clearnet listening 地址 + `config.announced_addrs` + onion 地址全部 push 到同一个 `Vec<Multiaddr>`；`get_or_create_new_node_announcement_message` (`network.rs:3734-3760`) 直接 `clone()` 全量进 NodeAnnouncement 签名后向 gossip 全网广播；`NodeInfo` RPC (`network.rs:2463-2475`) 同样回全量 → 启用 `listen_on_onion=true` 时仍主动暴露 clearnet IP，pubkey ↔ clearnet IP ↔ .onion 三元组被任一邻居关联。与 AUTH-002.F2/F3（入站 clearnet 监听）互补：AUTH-002 堵入站、XMOD-016 堵出站；只修一边不够。
 
 **XMOD 提级理由**：`announced_addrs` 类型本身是 P2P 网络模块的内部状态，但其内容流到三个不同模块（onion_service 写入、gossip 出站签名、rpc 出站读取），单一类型成为隐私穿透的"汇合点"。修复 FOLLOWUP-1..3：`OnionServiceConfig::tor_strict_mode` 开关 + NodeAnnouncement / `node_info` RPC 出站过滤器 + 把类型拆为 `AnnouncedAddrs { tor, clearnet }` 在编译期强制分流；FOLLOWUP-4..6：规范、RPC 隐私策略、启动告警。报告 §11.2 链 L。
+
+### AUDIT-XMOD-017 — rpc/pubsub ↔ store/StoreChange ↔ cch 维度 preimage 越权泄露 + 顺序广播 DoS
+
+详见 [`findings/AUDIT-XMOD-017.md`](./findings/AUDIT-XMOD-017.md)。要点：`rpc/biscuit.rs:82` 把 `subscribe_store_changes` 的规则定为 `allow if read("cch")`，与 `receive_btc` / `get_cch_order` 共用 facet；但订阅事件 `StoreChange` (`store/store_impl/mod.rs:380-393`) 实际承载 `PutPreimage { payment_hash, payment_preimage }` / `PutPaymentSession` / `PutCkbInvoiceStatus` — 即任何拥有 `read("cch")` token 的客户端（CCH dashboard / 监控 / 集成）都能实时获得**所有已结算 invoice 的明文 preimage** + 完整路由 / 时序信息。`rpc/middleware.rs:62, 92-113` 在 `enable_auth=false`（loopback 默认）时**完全跳过** token 校验 → 同主机任意进程零门槛订阅。
+
+第二条独立问题：`rpc/pubsub.rs:55-65` 的 `PubSubServerActor::Publish` 用**顺序** `for sink in sinks { sink.send(...).await }` 广播；ractor 0.15 默认 mailbox 无界（XMOD-009）。**单一慢/挂起订阅者**就能阻塞 actor `handle` 协程 → 所有后续 `Publish` 消息进 mailbox 排队 → 进程 RSS 无界增长 + 合法 CCH 听众收不到 `PutPreimage` 事件 → 与 XMOD-002 的 24h 时序窗口叠加 = 跨链 preimage 失窃。
+
+`.expect("serialize to JSON")` (`pubsub.rs:57`) 是次要 panic 风险（当前 `StoreChange` 变体安全，但未来扩字段易 regression）。
+
+**XMOD 提级理由**：preimage 出口面从 XMOD-011 的"日志"扩展到"实时 RPC 推送"——两条独立外泄路径需分别堵；权限粒度 + 广播实现 + actor mailbox 三处缺陷耦合放大；与 XMOD-002 / XMOD-009 / XMOD-005 / XMOD-011 跨链合并构成可达资金损失场景。修复 FOLLOWUP-F1..F3 P0：独立高权 facet + preimage 不进默认事件流（由独立 `fetch_preimage` + token attenuation 拉取）+ loopback 也强制 token；FOLLOWUP-F4..F6 P1：per-sink send timeout + bounded mailbox + 替换 `expect`；FOLLOWUP-F7..F8 P2：AddSink audit log + `Preimage` 独立 newtype（与 XMOD-011 协同）。报告 §11.2 链 M。
+
 
 
 
