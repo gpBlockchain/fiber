@@ -2,6 +2,72 @@
 
 This document provides essential guidelines for AI coding agents working on the Fiber Network Node codebase. The Fiber Network is a reference implementation of a peer-to-peer payment/swap network built on CKB blockchain, similar to Lightning Network.
 
+## Codex Review Guidelines
+
+When Codex is asked to review a pull request, focus only on security issues and security regressions.
+
+Only leave review comments for findings with realistic security impact. Do not comment on style, formatting, naming, readability, refactoring, or general maintainability.
+
+Prioritize these Fiber / CKB security areas:
+
+1. Asset safety
+- Incorrect balance update
+- Asset loss or fund locking
+- Double spend or replayable payment
+- Incorrect fee handling
+- Incorrect payment amount
+- Incorrect channel settlement result
+
+2. Protocol and state machine safety
+- Invalid state transition
+- Replayable message or transaction
+- Missing nonce, timestamp, sequence, commitment, or revocation validation
+- Inconsistent local state and remote state
+- Race condition that can corrupt channel/payment state
+- State rollback or stale state acceptance
+
+3. Cryptography and authorization
+- Missing or incorrect signature verification
+- Wrong domain separation
+- Unsafe randomness
+- Secret, private key, token, or preimage leakage
+- Unauthorized RPC/API/admin access
+
+4. P2P and network security
+- Missing validation for incoming peer messages
+- Malformed message causing panic or resource exhaustion
+- Unbounded message size, queue growth, retry loop, or gossip/path-finding work
+- Peer authentication or identity-check bypass
+- Protocol downgrade or compatibility issue with security impact
+
+5. CKB/on-chain transaction safety
+- Incorrect witness/script validation assumption
+- Incorrect cell dependency, lock/type script, or capacity handling
+- Incorrect funding, settlement, withdrawal, HTLC, or UDT transaction construction
+- Any issue that may cause funds to be locked, stolen, or settled incorrectly
+
+6. Database and migration safety
+- Migration that can corrupt security-critical state
+- Missing backward compatibility for persisted channel/payment data
+- Inconsistent migration rollback or partial migration behavior
+- Unsafe default values for security-sensitive fields
+
+7. Supply-chain and configuration security
+- Unsafe dependency change
+- Unsafe feature flag or default config
+- Debug/test mode enabled in production path
+- Unsafe logging of secrets or sensitive payment data
+
+For each finding, include:
+- Severity: Critical / High / Medium / Low
+- Security impact
+- Attack path or failure scenario
+- Why this PR introduces or exposes the issue
+- Suggested minimal fix
+
+Do not report speculative issues unless there is a realistic exploit path.
+Do not report missing tests unless the missing test hides a concrete security regression.
+
 ## Build System & Commands
 
 ### Primary Language & Toolchain
