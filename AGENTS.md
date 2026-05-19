@@ -2,9 +2,11 @@
 
 This document provides essential guidelines for AI coding agents working on the Fiber Network Node codebase. The Fiber Network is a reference implementation of a peer-to-peer payment/swap network built on CKB blockchain, similar to Lightning Network.
 
-## Codex Review Guidelines
+## Security Code Review Guidelines
 
-When Codex is asked to review a pull request, focus only on security issues and security regressions.
+When Codex is explicitly asked to perform a security code review, focus only on security issues and security regressions.
+
+These instructions apply to security review requests such as `@codex review for security regressions`, `@codex review security only`, or equivalent security-focused review prompts. They should not turn every normal coding task into a security-only task.
 
 Only leave review comments for findings with realistic security impact. Do not comment on style, formatting, naming, readability, refactoring, or general maintainability.
 
