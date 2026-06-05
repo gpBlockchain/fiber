@@ -1,8 +1,9 @@
 use crate::ckb::tests::test_utils::complete_commitment_tx;
 use crate::fiber::channel::{
-    merge_external_funding_witnesses, AddTlcResponse, ChannelActorState, ChannelActorStateStore,
-    ChannelOpenRecordStore, ReloadParams, ReplayOrderHint, UpdateCommand,
-    DEFAULT_COMMITMENT_FEE_RATE, DEFAULT_MAX_TLC_VALUE_IN_FLIGHT, MAX_COMMITMENT_DELAY_EPOCHS,
+    funding_timeout_check_delay, merge_external_funding_witnesses, AddTlcResponse,
+    ChannelActorState, ChannelActorStateStore, ChannelOpenRecordStore, ProcessingChannelResult,
+    ReloadParams, ReplayOrderHint, UpdateCommand, DEFAULT_COMMITMENT_FEE_RATE, DEFAULT_FEE_RATE,
+    DEFAULT_MAX_TLC_VALUE_IN_FLIGHT, MAX_COMMITMENT_DELAY_EPOCHS, MAX_TLC_NUMBER_IN_FLIGHT,
     MIN_COMMITMENT_DELAY_EPOCHS, XUDT_COMPATIBLE_WITNESS,
 };
 use crate::fiber::config::{
@@ -10,6 +11,7 @@ use crate::fiber::config::{
     MAX_PAYMENT_TLC_EXPIRY_LIMIT, MILLI_SECONDS_PER_EPOCH, MIN_TLC_EXPIRY_DELTA,
 };
 
+use crate::fiber::fee::check_open_channel_parameters;
 use crate::fiber::graph::ChannelInfo;
 use crate::fiber::network::{
     DebugEvent, FiberMessageWithTarget, OpenChannelWithExternalFundingCommand, PeerConnectSource,
@@ -17,8 +19,8 @@ use crate::fiber::network::{
 };
 use crate::fiber::payment::SendPaymentCommand;
 use crate::fiber::types::{
-    AddTlc, FiberMessage, Hash256, Init, PeeledPaymentOnionPacket, Pubkey, ReestablishChannel,
-    TlcErr,
+    AddTlc, CommitmentSigned, FiberMessage, Hash256, Init, PeeledPaymentOnionPacket, Pubkey,
+    ReestablishChannel, TlcErr, TxSignatures,
 };
 use crate::fiber::ChannelConnectivityState;
 use crate::invoice::{CkbInvoiceStatus, Currency, InvoiceBuilder};
@@ -175,6 +177,26 @@ fn test_channel_state_bincode_compatibility() {
     assert_channel_state_encoding(
         ChannelState::NegotiatingFunding(NegotiatingFundingFlags::AWAITING_EXTERNAL_FUNDING),
         &[0, 0, 0, 0, 4, 0, 0, 0],
+    );
+}
+
+#[test]
+fn test_funding_timeout_check_delay_survives_hydrated_time_truncation() {
+    // Reproduces #1358: after persisting external_funding.started_at as millis,
+    // hydration can leave the timeout check a few hundred microseconds short of
+    // the threshold. Scheduling exactly that remainder may make the check fire
+    // as stale with no follow-up timeout.
+    assert_eq!(
+        funding_timeout_check_delay(Duration::from_micros(999_500), 1),
+        Some(Duration::from_micros(1_500))
+    );
+}
+
+#[test]
+fn test_funding_timeout_check_delay_is_immediate_after_timeout() {
+    assert_eq!(
+        funding_timeout_check_delay(Duration::from_micros(1_000_001), 1),
+        None
     );
 }
 
@@ -3482,6 +3504,91 @@ async fn do_test_add_tlc_waiting_ack() {
 }
 
 #[tokio::test]
+async fn test_open_channel_constraints_limit_incoming_tlcs() {
+    let node_a_funding_amount = 100000000000;
+    let node_b_funding_amount = 100000000000;
+
+    let [mut node_a, mut node_b] = NetworkNode::new_n_interconnected_nodes().await;
+
+    let node_a_max_accepted_tlc_number = 2;
+    let (new_channel_id, _funding_tx_hash) = establish_channel_between_nodes(
+        &mut node_a,
+        &mut node_b,
+        ChannelParameters {
+            public: true,
+            node_a_funding_amount,
+            node_b_funding_amount,
+            a_max_tlc_number_in_flight: Some(node_a_max_accepted_tlc_number),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let tlc_amount = 1000000000;
+
+    // A's advertised max is A's incoming/accepted TLC limit, so it should not
+    // limit TLCs A offers to B.
+    for i in 1..=node_a_max_accepted_tlc_number + 1 {
+        let add_tlc_command = AddTlcCommand {
+            amount: tlc_amount,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            payment_hash: gen_rand_sha256_hash(),
+            attempt_id: None,
+            expiry: now_timestamp_as_millis_u64() + 100000000,
+            onion_packet: None,
+            shared_secret: NO_SHARED_SECRET,
+            is_trampoline_hop: false,
+            previous_tlc: None,
+        };
+        let add_tlc_result = call!(node_a.network_actor, |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+                ChannelCommandWithId {
+                    channel_id: new_channel_id,
+                    command: ChannelCommand::AddTlc(add_tlc_command, rpc_reply),
+                },
+            ))
+        })
+        .expect("source node alive");
+
+        assert!(add_tlc_result.is_ok());
+        wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
+    }
+
+    // B offering TLCs to A consumes A's advertised incoming/accepted TLC limit.
+    for i in 1..=node_a_max_accepted_tlc_number + 1 {
+        let add_tlc_command = AddTlcCommand {
+            amount: tlc_amount,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            payment_hash: gen_rand_sha256_hash(),
+            attempt_id: None,
+            expiry: now_timestamp_as_millis_u64() + 100000000,
+            onion_packet: None,
+            shared_secret: NO_SHARED_SECRET,
+            is_trampoline_hop: false,
+            previous_tlc: None,
+        };
+        let add_tlc_result = call!(node_b.network_actor, |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+                ChannelCommandWithId {
+                    channel_id: new_channel_id,
+                    command: ChannelCommand::AddTlc(add_tlc_command, rpc_reply),
+                },
+            ))
+        })
+        .expect("source node alive");
+
+        if i == node_a_max_accepted_tlc_number + 1 {
+            assert!(add_tlc_result.is_err());
+            let code = add_tlc_result.unwrap_err();
+            assert_eq!(code.error_code, TlcErrorCode::TemporaryChannelFailure);
+        } else {
+            assert!(add_tlc_result.is_ok());
+            wait_for_tlc_sync(&node_b, &node_a, new_channel_id, i as usize).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn do_test_add_tlc_with_number_limit() {
     let node_a_funding_amount = 100000000000;
     let node_b_funding_amount = 100000000000;
@@ -3504,7 +3611,7 @@ async fn do_test_add_tlc_with_number_limit() {
 
     let tlc_amount = 1000000000;
 
-    // A -> B will have tlc number limit 2
+    // A's max applies to incoming TLCs, so it should not limit A -> B.
     for i in 1..=node_a_max_tlc_number + 1 {
         let add_tlc_command = AddTlcCommand {
             amount: tlc_amount,
@@ -3526,18 +3633,12 @@ async fn do_test_add_tlc_with_number_limit() {
             ))
         })
         .expect("source node alive");
-        if i == node_a_max_tlc_number + 1 {
-            assert!(add_tlc_result.is_err());
-            let code = add_tlc_result.unwrap_err();
-            assert_eq!(code.error_code, TlcErrorCode::TemporaryChannelFailure);
-        } else {
-            dbg!(&add_tlc_result);
-            assert!(add_tlc_result.is_ok());
-            wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
-        }
+        dbg!(&add_tlc_result);
+        assert!(add_tlc_result.is_ok());
+        wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
     }
 
-    // B -> A can still add tlc
+    // B -> A consumes A's advertised incoming TLC limit.
     for i in 1..=node_a_max_tlc_number + 1 {
         let add_tlc_command = AddTlcCommand {
             amount: tlc_amount,
@@ -3559,9 +3660,15 @@ async fn do_test_add_tlc_with_number_limit() {
             ))
         })
         .expect("source node alive");
-        dbg!(&add_tlc_result);
-        assert!(add_tlc_result.is_ok());
-        wait_for_tlc_sync(&node_b, &node_a, new_channel_id, i as usize).await;
+        if i == node_a_max_tlc_number + 1 {
+            assert!(add_tlc_result.is_err());
+            let code = add_tlc_result.unwrap_err();
+            assert_eq!(code.error_code, TlcErrorCode::TemporaryChannelFailure);
+        } else {
+            dbg!(&add_tlc_result);
+            assert!(add_tlc_result.is_ok());
+            wait_for_tlc_sync(&node_b, &node_a, new_channel_id, i as usize).await;
+        }
     }
 }
 
@@ -3587,7 +3694,7 @@ async fn do_test_add_tlc_number_limit_reverse() {
     .await;
 
     let tlc_amount = 1000000000;
-    // B -> A will have tlc number limit 2
+    // B's max applies to incoming TLCs, so it should not limit B -> A.
     for i in 1..=node_b_max_tlc_number + 1 {
         let add_tlc_command = AddTlcCommand {
             amount: tlc_amount,
@@ -3609,18 +3716,12 @@ async fn do_test_add_tlc_number_limit_reverse() {
             ))
         })
         .expect("source node alive");
-        if i == node_b_max_tlc_number + 1 {
-            assert!(add_tlc_result.is_err());
-            let code = add_tlc_result.unwrap_err();
-            assert_eq!(code.error_code, TlcErrorCode::TemporaryChannelFailure);
-        } else {
-            dbg!(&add_tlc_result);
-            assert!(add_tlc_result.is_ok());
-            wait_for_tlc_sync(&node_b, &node_a, new_channel_id, i as usize).await;
-        }
+        dbg!(&add_tlc_result);
+        assert!(add_tlc_result.is_ok());
+        wait_for_tlc_sync(&node_b, &node_a, new_channel_id, i as usize).await;
     }
 
-    // A -> B can still add tlc
+    // A -> B consumes B's advertised incoming TLC limit.
     for i in 1..=node_b_max_tlc_number + 1 {
         let add_tlc_command = AddTlcCommand {
             amount: tlc_amount,
@@ -3642,9 +3743,15 @@ async fn do_test_add_tlc_number_limit_reverse() {
             ))
         })
         .expect("source node alive");
-        dbg!(&add_tlc_result);
-        assert!(add_tlc_result.is_ok());
-        wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
+        if i == node_b_max_tlc_number + 1 {
+            assert!(add_tlc_result.is_err());
+            let code = add_tlc_result.unwrap_err();
+            assert_eq!(code.error_code, TlcErrorCode::TemporaryChannelFailure);
+        } else {
+            dbg!(&add_tlc_result);
+            assert!(add_tlc_result.is_ok());
+            wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
+        }
     }
 }
 
@@ -3671,7 +3778,7 @@ async fn do_test_add_tlc_value_limit() {
 
     let tlc_amount = 1000000000;
 
-    // A -> B have tlc value limit 3_000_000_000
+    // A's max applies to incoming TLCs, so it should not limit A -> B.
     for i in 1..=max_tlc_number + 1 {
         let add_tlc_command = AddTlcCommand {
             amount: tlc_amount,
@@ -3693,6 +3800,32 @@ async fn do_test_add_tlc_value_limit() {
             ))
         })
         .expect("node_b alive");
+        assert!(add_tlc_result.is_ok());
+        wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
+    }
+
+    // B -> A consumes A's advertised incoming TLC value limit.
+    for i in 1..=max_tlc_number + 1 {
+        let add_tlc_command = AddTlcCommand {
+            amount: tlc_amount,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            payment_hash: gen_rand_sha256_hash(),
+            attempt_id: None,
+            expiry: now_timestamp_as_millis_u64() + 100000000,
+            onion_packet: None,
+            shared_secret: NO_SHARED_SECRET,
+            is_trampoline_hop: false,
+            previous_tlc: None,
+        };
+        let add_tlc_result = call!(node_b.network_actor, |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+                ChannelCommandWithId {
+                    channel_id: new_channel_id,
+                    command: ChannelCommand::AddTlc(add_tlc_command, rpc_reply),
+                },
+            ))
+        })
+        .expect("node_b alive");
         if i == max_tlc_number + 1 {
             assert!(add_tlc_result.is_err());
             let code = add_tlc_result.unwrap_err();
@@ -3700,11 +3833,35 @@ async fn do_test_add_tlc_value_limit() {
             assert_eq!(code.error_code, TlcErrorCode::TemporaryChannelFailure);
         } else {
             assert!(add_tlc_result.is_ok());
-            wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
+            wait_for_tlc_sync(&node_b, &node_a, new_channel_id, i as usize).await;
         }
     }
+}
 
-    // B -> A can still add tlc
+#[tokio::test]
+async fn do_test_add_tlc_value_limit_reverse() {
+    let node_a_funding_amount = 100000000000;
+    let node_b_funding_amount = 100000000000;
+
+    let [mut node_a, mut node_b] = NetworkNode::new_n_interconnected_nodes().await;
+
+    let max_tlc_number = 3;
+    let (new_channel_id, _funding_tx_hash) = establish_channel_between_nodes(
+        &mut node_a,
+        &mut node_b,
+        ChannelParameters {
+            public: true,
+            node_a_funding_amount,
+            node_b_funding_amount,
+            b_max_tlc_value_in_flight: Some(3000000000),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let tlc_amount = 1000000000;
+
+    // B's max applies to incoming TLCs, so it should not limit B -> A.
     for i in 1..=max_tlc_number + 1 {
         let add_tlc_command = AddTlcCommand {
             amount: tlc_amount,
@@ -3729,6 +3886,91 @@ async fn do_test_add_tlc_value_limit() {
         assert!(add_tlc_result.is_ok());
         wait_for_tlc_sync(&node_b, &node_a, new_channel_id, i as usize).await;
     }
+
+    // A -> B consumes B's advertised incoming TLC value limit.
+    for i in 1..=max_tlc_number + 1 {
+        let add_tlc_command = AddTlcCommand {
+            amount: tlc_amount,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            payment_hash: gen_rand_sha256_hash(),
+            attempt_id: None,
+            expiry: now_timestamp_as_millis_u64() + 100000000,
+            onion_packet: None,
+            shared_secret: NO_SHARED_SECRET,
+            is_trampoline_hop: false,
+            previous_tlc: None,
+        };
+        let add_tlc_result = call!(node_a.network_actor, |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+                ChannelCommandWithId {
+                    channel_id: new_channel_id,
+                    command: ChannelCommand::AddTlc(add_tlc_command, rpc_reply),
+                },
+            ))
+        })
+        .expect("node_a alive");
+        if i == max_tlc_number + 1 {
+            assert!(add_tlc_result.is_err());
+            let code = add_tlc_result.unwrap_err();
+
+            assert_eq!(code.error_code, TlcErrorCode::TemporaryChannelFailure);
+        } else {
+            assert!(add_tlc_result.is_ok());
+            wait_for_tlc_sync(&node_a, &node_b, new_channel_id, i as usize).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_peer_add_tlc_checks_local_incoming_constraints() {
+    let node_a_funding_amount = 100000000000;
+    let node_b_funding_amount = 100000000000;
+
+    let [mut node_a, mut node_b] = NetworkNode::new_n_interconnected_nodes().await;
+
+    let (new_channel_id, _funding_tx_hash) = establish_channel_between_nodes(
+        &mut node_a,
+        &mut node_b,
+        ChannelParameters {
+            public: true,
+            node_a_funding_amount,
+            node_b_funding_amount,
+            a_max_tlc_value_in_flight: Some(1000),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    node_b
+        .network_actor
+        .send_message(NetworkActorMessage::Command(
+            NetworkActorCommand::SendFiberMessage(FiberMessageWithTarget::new(
+                node_a.pubkey,
+                FiberMessage::add_tlc(AddTlc {
+                    channel_id: new_channel_id,
+                    tlc_id: 0,
+                    amount: 1001,
+                    payment_hash: gen_rand_sha256_hash(),
+                    expiry: now_timestamp_as_millis_u64() + DEFAULT_TLC_EXPIRY_DELTA,
+                    hash_algorithm: HashAlgorithm::CkbHash,
+                    onion_packet: None,
+                }),
+            )),
+        ))
+        .expect("send add_tlc peer message");
+
+    node_a
+        .expect_event(|event| {
+            matches!(
+                event,
+                NetworkServiceEvent::DebugEvent(DebugEvent::Common(message))
+                    if message.contains("TlcValueInflightExceedLimit")
+            )
+        })
+        .await;
+
+    let node_a_state = node_a.get_channel_actor_state(new_channel_id);
+    assert_eq!(node_a_state.tlc_state.received_tlcs.tlcs.len(), 0);
 }
 
 #[tokio::test]
@@ -6049,7 +6291,7 @@ async fn test_shutdown_channel_with_large_size_shutdown_script_should_fail() {
                 channel_id: new_channel_id,
                 command: ChannelCommand::Shutdown(
                     ShutdownCommand {
-                        close_script: Some(Script::new_builder().args([0u8; 21].pack()).build()),
+                        close_script: Some(script_with_large_args()),
                         fee_rate: Some(FeeRate::from_u64(u64::MAX)),
                         force: false,
                     },
@@ -6063,7 +6305,7 @@ async fn test_shutdown_channel_with_large_size_shutdown_script_should_fail() {
     assert!(shutdown_channel_result
         .err()
         .unwrap()
-        .contains("Local balance is not enough to pay the fee"));
+        .contains("overflows shutdown fee"));
 }
 
 #[tokio::test]
@@ -7879,62 +8121,26 @@ async fn test_reestablish_restores_send_nonce() {
     let (mut node_a, mut node_b, channel_id) =
         create_nodes_with_established_channel(100000000000, 100000000000, true).await;
 
-    // Trigger payment A -> B and restart one peer while the payment is still
-    // inflight. This test focuses on restoring the missing send nonce during
-    // reestablish; payment completion is covered by broader reestablish tests.
-    let payment_hash = node_a
-        .send_payment_keysend(&node_b, 1000, false)
-        .await
-        .unwrap()
-        .payment_hash;
+    node_a.stop().await;
 
-    let start = std::time::Instant::now();
-    let restart_node_a = loop {
-        let state_a_before_restart = node_a.get_channel_actor_state(channel_id);
-        let state_b_before_restart = node_b.get_channel_actor_state(channel_id);
-        if node_a.get_inflight_payment_count().await == 1 {
-            if state_a_before_restart
-                .remote_revocation_nonce_for_send
-                .is_none()
-                && state_a_before_restart.last_revoke_ack_msg.is_some()
-            {
-                break true;
-            }
-            if state_b_before_restart
-                .remote_revocation_nonce_for_send
-                .is_none()
-                && state_b_before_restart.last_revoke_ack_msg.is_some()
-            {
-                break false;
-            }
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "Payment did not reach the pre-restart reestablish state in time"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    let pre_restart_status = node_a.get_payment_status(payment_hash).await;
-    debug!(
-        ?pre_restart_status,
-        "Initial payment status before restarting remote peer"
+    let mut state = node_a.get_channel_actor_state(channel_id);
+    assert!(
+        state.remote_revocation_nonce_for_send.is_some(),
+        "established channel should start with a send nonce"
     );
-    assert_ne!(
-        pre_restart_status,
-        PaymentStatus::Failed,
-        "initial payment should not fail before reestablish"
+    assert!(
+        state.remote_revocation_nonce_for_verify.is_some()
+            || state.remote_revocation_nonce_for_next.is_some(),
+        "established channel should have a nonce source for reestablish recovery"
     );
-    assert_eq!(node_a.get_inflight_payment_count().await, 1);
 
-    // Restart the peer that actually lost the send nonce to make the
-    // reestablish scenario deterministic across scheduler interleavings.
-    if restart_node_a {
-        node_a.restart().await;
-        node_a.connect_to(&mut node_b).await;
-    } else {
-        node_b.restart().await;
-        node_b.connect_to(&mut node_a).await;
-    }
+    state.remote_revocation_nonce_for_send = None;
+    state.last_revoke_ack_msg = None;
+    node_a.store.insert_channel_actor_state(state);
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    node_a.start().await;
+    node_a.connect_to(&mut node_b).await;
 
     node_a
         .expect_debug_event("Reestablished channel in ChannelReady")
@@ -7944,7 +8150,7 @@ async fn test_reestablish_restores_send_nonce() {
         .await;
 
     // Wait until both peers persist the recovered send nonce after reestablish.
-    let now = std::time::Instant::now();
+    let start = std::time::Instant::now();
     loop {
         let node_b_state = node_b.get_channel_actor_state(channel_id);
         let node_a_state = node_a.get_channel_actor_state(channel_id);
@@ -7954,18 +8160,11 @@ async fn test_reestablish_restores_send_nonce() {
             break;
         }
         assert!(
-            now.elapsed() < Duration::from_secs(5),
+            start.elapsed() < Duration::from_secs(5),
             "reestablish did not restore send nonce in time"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
-    node_a.wait_until_success(payment_hash).await;
-    assert_eq!(node_a.get_inflight_payment_count().await, 0);
-    assert_eq!(
-        node_a.get_payment_status(payment_hash).await,
-        PaymentStatus::Success
-    );
 
     let state = node_b.get_channel_actor_state(channel_id);
     assert!(
@@ -8914,6 +9113,69 @@ async fn test_submit_signed_funding_tx_unblocks_acceptor_commitment_handshake() 
 }
 
 #[tokio::test]
+async fn test_external_funding_duplicate_tx_complete_after_signed_submit_is_ignored() {
+    init_tracing();
+
+    let [node_a, node_b] = new_2_nodes_with_auto_accept().await;
+    let (channel_id, unsigned_tx) =
+        open_external_funding_channel(&node_a, &node_b, 100_000_000_000).await;
+    let signed_tx = mock_sign_external_funding_tx(&unsigned_tx);
+
+    let submit_message = |rpc_reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::SubmitSignedFundingTx {
+            channel_id,
+            signed_tx: signed_tx.clone(),
+            reply: rpc_reply,
+        })
+    };
+    call!(node_a.network_actor, submit_message)
+        .expect("node_a alive")
+        .expect("submit signed funding tx success");
+
+    let progressed = wait_for_external_funding_post_submit_progress(&node_a, channel_id).await;
+    assert!(
+        matches!(
+            progressed.state,
+            ChannelState::AwaitingTxSignatures(_)
+                | ChannelState::AwaitingChannelReady(_)
+                | ChannelState::ChannelReady
+        ),
+        "channel should progress beyond tx collaboration after signed submit, got {:?}",
+        progressed.state
+    );
+
+    let duplicate_tx_complete = FiberMessage::tx_complete(crate::fiber::types::TxComplete {
+        channel_id,
+        next_commitment_nonce: musig2::SecNonceBuilder::new([3u8; 32])
+            .build()
+            .public_nonce(),
+    });
+    node_b
+        .network_actor
+        .send_message(NetworkActorMessage::Command(
+            NetworkActorCommand::SendFiberMessage(FiberMessageWithTarget::new(
+                node_a.pubkey,
+                duplicate_tx_complete,
+            )),
+        ))
+        .expect("send duplicate tx_complete");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let state_after_duplicate = node_a.get_channel_actor_state(channel_id);
+    assert!(
+        matches!(
+            state_after_duplicate.state,
+            ChannelState::AwaitingTxSignatures(_)
+                | ChannelState::AwaitingChannelReady(_)
+                | ChannelState::ChannelReady
+        ),
+        "duplicate tx_complete should be ignored after signed submit, got {:?}",
+        state_after_duplicate.state
+    );
+}
+
+#[tokio::test]
 async fn test_submit_signed_funding_tx_wrong_state() {
     init_tracing();
 
@@ -9498,6 +9760,62 @@ fn test_external_funding_hydrate_restores_early_peer_commitment_signed_state() {
     );
 }
 
+#[test]
+fn test_external_funding_duplicate_commitment_signed_detection_requires_matching_nonce() {
+    let mut persisted_state = ChannelActorState::samples(42)
+        .into_iter()
+        .next()
+        .expect("sample channel state should exist");
+    let duplicate_nonce = musig2::SecNonceBuilder::new([1u8; 32])
+        .build()
+        .public_nonce();
+    let different_nonce = musig2::SecNonceBuilder::new([2u8; 32])
+        .build()
+        .public_nonce();
+    persisted_state.state = ChannelState::AwaitingTxSignatures(AwaitingTxSignaturesFlags::empty());
+    persisted_state.last_committed_remote_nonce = Some(duplicate_nonce.clone());
+    persisted_state.external_funding = Some(fiber_types::ExternalFundingPersistState {
+        funding_lock_script: Script::default(),
+        funding_lock_script_cell_deps: vec![],
+        unsigned_funding_tx: Transaction::default(),
+        started_at_ms: now_timestamp_as_millis_u64(),
+        signed_submitted: true,
+        peer_commitment_signed_received: true,
+    });
+    persisted_state.hydrate_external_funding_runtime();
+
+    let duplicate_commitment_signed = CommitmentSigned {
+        channel_id: persisted_state.get_id(),
+        funding_tx_partial_signature: musig2::PartialSignature::from_slice(&[1u8; 32])
+            .expect("valid partial signature bytes"),
+        next_commitment_nonce: duplicate_nonce,
+    };
+    assert!(
+        persisted_state
+            .is_duplicate_external_funding_commitment_signed_for_test(&duplicate_commitment_signed),
+        "matching committed remote nonce in external funding AwaitingTxSignatures should be duplicate"
+    );
+
+    let different_commitment_signed = CommitmentSigned {
+        channel_id: persisted_state.get_id(),
+        funding_tx_partial_signature: musig2::PartialSignature::from_slice(&[1u8; 32])
+            .expect("valid partial signature bytes"),
+        next_commitment_nonce: different_nonce,
+    };
+    assert!(
+        !persisted_state
+            .is_duplicate_external_funding_commitment_signed_for_test(&different_commitment_signed),
+        "different next commitment nonce should not be treated as duplicate"
+    );
+
+    persisted_state.clear_external_funding_runtime();
+    assert!(
+        !persisted_state
+            .is_duplicate_external_funding_commitment_signed_for_test(&duplicate_commitment_signed),
+        "non-external-funding state should not use external funding duplicate handling"
+    );
+}
+
 #[tokio::test]
 async fn test_external_funding_initiator_restart_after_signed_submit_resumes_handshake() {
     init_tracing();
@@ -9635,6 +9953,85 @@ async fn test_external_funding_initiator_send_tx_signatures_first_preserves_exte
     );
 }
 
+/// Regression test for GHSA-x6rw-txsignatures-verification: a stale `TxSignatures`
+/// from the peer against an established channel must be rejected by the state guard.
+/// Exercises branch #3 of the `FiberChannelMessage::TxSignatures` handler (the
+/// `should_local_send_tx_signatures_first()` variant) by configuring the funding
+/// split so node_a's `to_local_amount` is below `to_remote_amount`.
+///
+/// Before the fix, branch #3 unconditionally installed the peer-supplied witnesses
+/// into `funding_tx`, broadcast `FundingTransactionPending`, and transitioned to
+/// `AwaitingChannelReady` regardless of the channel's actual state. With the guard
+/// in place, the message is rejected because the channel is in `ChannelReady`, not
+/// `AwaitingTxSignatures(_)`. (Branch #4, the `should_local_send_tx_signatures_first()
+/// == false` variant for non-external-funding channels, was already protected by an
+/// inner state check in `handle_tx_signatures`; branches #1 and #2 cover the
+/// external-funding fast paths and are protected by the same outer guard.)
+#[tokio::test]
+async fn test_tx_signatures_after_channel_ready_rejected() {
+    init_tracing();
+
+    let (node_a, node_b, channel_id) =
+        create_nodes_with_established_channel(50_000_000_000, 200_000_000_000, false).await;
+
+    let state_before = node_a.get_channel_actor_state(channel_id);
+    assert!(
+        matches!(state_before.state, ChannelState::ChannelReady),
+        "channel should be ready before attack, got {:?}",
+        state_before.state
+    );
+    assert!(
+        state_before.to_local_amount < state_before.to_remote_amount,
+        "this regression test relies on node_a's to_local_amount being below to_remote_amount so should_local_send_tx_signatures_first() is true (branch #3 fires); got to_local={} to_remote={}",
+        state_before.to_local_amount,
+        state_before.to_remote_amount,
+    );
+    let funding_tx_bytes_before = state_before
+        .funding_tx
+        .as_ref()
+        .map(|tx| tx.as_slice().to_vec());
+    let latest_commitment_bytes_before = state_before
+        .latest_commitment_transaction
+        .as_ref()
+        .map(|tx| tx.as_slice().to_vec());
+
+    node_a
+        .network_actor
+        .send_message(NetworkActorMessage::Event(NetworkActorEvent::FiberMessage(
+            node_b.pubkey,
+            FiberMessage::tx_signatures(TxSignatures {
+                channel_id,
+                witnesses: vec![vec![0u8; 65]],
+            }),
+        )))
+        .expect("network actor alive");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let state_after = node_a.get_channel_actor_state(channel_id);
+    assert!(
+        matches!(state_after.state, ChannelState::ChannelReady),
+        "channel state must remain ChannelReady after a stale peer TxSignatures, got {:?}",
+        state_after.state
+    );
+    let funding_tx_bytes_after = state_after
+        .funding_tx
+        .as_ref()
+        .map(|tx| tx.as_slice().to_vec());
+    assert_eq!(
+        funding_tx_bytes_after, funding_tx_bytes_before,
+        "funding_tx must not be mutated by a stale peer TxSignatures"
+    );
+    let latest_commitment_bytes_after = state_after
+        .latest_commitment_transaction
+        .as_ref()
+        .map(|tx| tx.as_slice().to_vec());
+    assert_eq!(
+        latest_commitment_bytes_after, latest_commitment_bytes_before,
+        "latest_commitment_transaction must be unchanged by a stale peer TxSignatures"
+    );
+}
+
 #[tokio::test]
 async fn test_external_funding_acceptor_restart_after_signed_submit_resumes_handshake() {
     init_tracing();
@@ -9699,6 +10096,64 @@ async fn test_external_funding_acceptor_restart_after_signed_submit_resumes_hand
             TxStatus::Committed(..)
         ),
         "funding tx should be committed after acceptor restart"
+    );
+
+    node_a
+        .expect_event(|event| matches!(event, NetworkServiceEvent::ChannelReady(_, id, _) if *id == channel_id))
+        .await;
+    node_b
+        .expect_event(|event| matches!(event, NetworkServiceEvent::ChannelReady(_, id, _) if *id == channel_id))
+        .await;
+}
+
+/// Covers acceptor restart after it has sent its external-funding
+/// CommitmentSigned. Depending on scheduler timing, the initiator's
+/// CommitmentSigned may or may not have reached the acceptor before restart.
+#[tokio::test]
+async fn test_reproduce_acceptor_restart_race_in_external_funding() {
+    init_tracing();
+
+    let [mut node_a, mut node_b] = new_2_nodes_with_auto_accept().await;
+    let (channel_id, unsigned_tx) =
+        open_external_funding_channel(&node_a, &node_b, 100_000_000_000).await;
+    let signed_tx = unsigned_tx
+        .as_advanced_builder()
+        .set_witnesses(vec![ckb_types::packed::Bytes::default()])
+        .build()
+        .data();
+
+    let submit_message = |rpc_reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::SubmitSignedFundingTx {
+            channel_id,
+            signed_tx: signed_tx.clone(),
+            reply: rpc_reply,
+        })
+    };
+    call!(node_a.network_actor, submit_message)
+        .expect("node_a alive")
+        .expect("submit signed funding tx success");
+
+    node_b
+        .expect_event(|event| {
+            matches!(
+                event,
+                NetworkServiceEvent::LocalCommitmentSigned(id, _) if *id == channel_id
+            )
+        })
+        .await;
+
+    node_b.restart().await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    node_a.connect_to(&mut node_b).await;
+
+    let _state = wait_for_external_funding_post_submit_progress(&node_b, channel_id).await;
+
+    assert!(
+        matches!(
+            node_a.submit_tx(signed_tx.clone().into_view()).await,
+            TxStatus::Committed(..)
+        ),
+        "funding tx should be committed after acceptor restarts after local commitment signing"
     );
 
     node_a
@@ -9790,5 +10245,112 @@ async fn test_external_funding_state_cleared_after_terminal_path() {
     assert!(
         state.external_funding.is_none(),
         "persisted external funding state should be cleared after channel ready"
+    );
+}
+
+fn expect_invalid_parameter(result: ProcessingChannelResult, expected: &str) {
+    let err = result.expect_err("parameters must be rejected");
+    assert!(
+        err.to_string().contains(expected),
+        "expected error containing {expected:?}, got {err}"
+    );
+}
+
+fn script_with_large_args() -> Script {
+    Script::new_builder().args([0u8; 2_000].pack()).build()
+}
+
+#[test]
+fn check_accept_channel_parameters_rejects_total_reserved_overflow() {
+    expect_invalid_parameter(
+        ChannelActorState::check_accept_channel_parameters_for_values(
+            0,
+            0,
+            u64::MAX,
+            1,
+            DEFAULT_COMMITMENT_FEE_RATE,
+            &None,
+            &Script::default(),
+            MAX_TLC_NUMBER_IN_FLIGHT,
+            MAX_TLC_NUMBER_IN_FLIGHT,
+        ),
+        "Total reserved CKB amount overflows",
+    );
+}
+
+#[test]
+fn check_accept_channel_parameters_rejects_commitment_fee_overflow() {
+    let udt_type_script = Some(script_with_large_args());
+    expect_invalid_parameter(
+        ChannelActorState::check_accept_channel_parameters_for_values(
+            0,
+            0,
+            0,
+            u64::MAX,
+            u64::MAX,
+            &udt_type_script,
+            &Script::default(),
+            MAX_TLC_NUMBER_IN_FLIGHT,
+            MAX_TLC_NUMBER_IN_FLIGHT,
+        ),
+        "overflows commitment fee",
+    );
+}
+
+#[test]
+fn check_accept_channel_parameters_rejects_non_udt_total_capacity_overflow() {
+    expect_invalid_parameter(
+        ChannelActorState::check_accept_channel_parameters_for_values(
+            u64::MAX as u128,
+            1,
+            0,
+            0,
+            DEFAULT_COMMITMENT_FEE_RATE,
+            &None,
+            &Script::default(),
+            MAX_TLC_NUMBER_IN_FLIGHT,
+            MAX_TLC_NUMBER_IN_FLIGHT,
+        ),
+        "The total funding amount",
+    );
+}
+
+#[test]
+fn check_open_channel_parameters_rejects_commitment_fee_overflow() {
+    let udt_type_script = Some(script_with_large_args());
+    let err = check_open_channel_parameters(
+        &udt_type_script,
+        &Script::default(),
+        u64::MAX - 1_000_000_000_000,
+        DEFAULT_FEE_RATE,
+        u64::MAX,
+        EpochNumberWithFraction::new(MIN_COMMITMENT_DELAY_EPOCHS, 0, 1).full_value(),
+        MAX_TLC_NUMBER_IN_FLIGHT,
+    )
+    .expect_err("fee-rate overflow must be rejected");
+
+    assert!(
+        err.to_string().contains("overflows commitment fee"),
+        "expected commitment fee overflow, got {err}"
+    );
+}
+
+#[test]
+fn check_open_channel_parameters_rejects_total_reserved_overflow() {
+    let err = check_open_channel_parameters(
+        &None,
+        &Script::default(),
+        u64::MAX,
+        DEFAULT_FEE_RATE,
+        DEFAULT_COMMITMENT_FEE_RATE,
+        EpochNumberWithFraction::new(MIN_COMMITMENT_DELAY_EPOCHS, 0, 1).full_value(),
+        MAX_TLC_NUMBER_IN_FLIGHT,
+    )
+    .expect_err("reserved amount that no acceptor can add to must be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("Total reserved CKB amount overflows"),
+        "expected total reserved overflow, got {err}"
     );
 }

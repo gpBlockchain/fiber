@@ -4,5 +4,7 @@ mod actor;
 mod config;
 #[cfg(test)]
 mod error;
+#[cfg(test)]
+mod funding_tx_tests;
 
 pub mod test_utils;

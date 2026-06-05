@@ -188,19 +188,7 @@ pub struct TlcErr {
 
 impl Display for TlcErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.extra_data {
-            Some(TlcErrData::TrampolineFailed {
-                node_id,
-                inner_error_packet,
-            }) => write!(
-                f,
-                "{} (TrampolineFailed node_id={:?} inner_error_packet_len={})",
-                self.error_code_as_str(),
-                node_id,
-                inner_error_packet.len()
-            ),
-            _ => write!(f, "{}", self.error_code_as_str()),
-        }
+        write!(f, "{}", self.error_code_as_str())
     }
 }
 
@@ -713,6 +701,7 @@ impl Attempt {
             self.status = AttemptStatus::Failed;
         } else {
             self.status = AttemptStatus::Retrying;
+            // already checked tried_times < try_limit
             self.tried_times += 1;
         }
     }

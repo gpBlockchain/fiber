@@ -4,13 +4,14 @@ use crate::fiber::gossip::GossipMessageStore;
 use crate::fiber::graph::NetworkGraph;
 use crate::fiber::graph::PathFindError;
 use crate::fiber::graph::SendPaymentState;
-use crate::fiber::network::get_chain_hash;
+use crate::fiber::network::{get_chain_hash, BuildRouterCommand};
 use crate::fiber::payment::{SendPaymentCommand, SendPaymentDataBuilder, SendPaymentDataExt};
 use crate::fiber::types::new_channel_update_unsigned;
 use crate::fiber::types::TrampolineOnionPacket;
 use crate::fiber::{
     ChannelAnnouncement, ChannelUpdateChannelFlags, ChannelUpdateMessageFlags, FeatureVector,
-    Hash256, NodeAnnouncement, Privkey, Pubkey, RouterHop, SendPaymentData, SessionRoute,
+    Hash256, HopHint, HopRequire, NodeAnnouncement, Privkey, Pubkey, RouterHop, SendPaymentData,
+    SessionRoute,
 };
 use crate::store::Store;
 use ckb_types::{
@@ -408,6 +409,47 @@ fn test_graph_find_path_three_nodes() {
     // Test route from node 3 to node 1 (should fail)
     let route = network.find_path(3, 1, 100, 1000);
     assert!(route.is_err());
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_graph_find_path_with_private_hop_hint() {
+    let mut network = MockNetworkGraph::new(3);
+    network.add_edge(1, 2, Some(500), Some(0));
+
+    let source = network.keys[1];
+    let hint_node = network.keys[2];
+    let target = network.keys[3];
+    let private_channel_outpoint = OutPoint::from_slice(&[0x42; 36]).unwrap();
+    let hop_hints = vec![HopHint {
+        pubkey: hint_node.into(),
+        channel_outpoint: private_channel_outpoint.clone(),
+        fee_rate: 0,
+        tlc_expiry_delta: DEFAULT_TLC_EXPIRY_DELTA,
+    }];
+
+    let route = network
+        .graph
+        .find_path(
+            source.into(),
+            target.into(),
+            Some(100),
+            Some(1000),
+            None,
+            FINAL_TLC_EXPIRY_DELTA_IN_TESTS,
+            MAX_PAYMENT_TLC_EXPIRY_LIMIT,
+            false,
+            &hop_hints,
+            &Default::default(),
+            true,
+        )
+        .expect("private hop hint should be routable");
+
+    assert_eq!(route.len(), 2);
+    assert_eq!(route[0].target, hint_node.into());
+    assert_eq!(route[0].channel_outpoint, network.edges[0].2);
+    assert_eq!(route[1].target, target.into());
+    assert_eq!(route[1].channel_outpoint, private_channel_outpoint);
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), test)]
@@ -812,6 +854,96 @@ fn test_graph_trampoline_routing_no_sender_precheck_to_final() {
     // The amount sent to the trampoline includes the remaining fee budget.
     // With 1000 amount and 500 max fee, we expect 1500.
     assert_eq!(last.amount, 1500);
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_graph_trampoline_routing_outer_route_fee_is_deducted_from_budget() {
+    init_tracing();
+
+    // Topology:
+    //   sender(A)=node1 --(public)--> relay(B)=node2 --(public)--> trampoline(C)=node3
+    //   final(D)=node4 is intentionally disconnected from the graph.
+    //
+    // The B->C forwarding fee must consume part of max_fee_amount before the remaining
+    // budget is allocated to the inner trampoline payload.
+    let mut network = MockNetworkGraph::new(4);
+    network.graph.set_add_rand_expiry_delta(false);
+
+    let sender = network.keys[1];
+    network.set_source(sender);
+    let relay = network.keys[2];
+    let trampoline = network.keys[3];
+    let final_recipient = network.keys[4];
+
+    network.add_edge(1, 2, Some(10_000), Some(0));
+    network.add_edge(2, 3, Some(10_000), Some(10_000));
+
+    let final_amount: u128 = 1000;
+    let max_fee_amount: u128 = 20;
+    let payment_state: SendPaymentState =
+        SendPaymentDataBuilder::new(final_recipient.into(), final_amount, Hash256::default())
+            .final_tlc_expiry_delta(FINAL_TLC_EXPIRY_DELTA_IN_TESTS)
+            .tlc_expiry_limit(MAX_PAYMENT_TLC_EXPIRY_LIMIT)
+            .max_fee_amount(Some(max_fee_amount))
+            .trampoline_hops(Some(vec![trampoline.into()]))
+            .build()
+            .expect("valid payment_data")
+            .into();
+
+    let route = network
+        .graph
+        .build_route(payment_state.amount, None, None, &payment_state)
+        .expect("trampoline route should be built");
+
+    assert_eq!(route.len(), 3);
+    assert_eq!(route[0].next_hop, Some(relay.into()));
+    assert_eq!(route[1].next_hop, Some(trampoline.into()));
+    assert!(route.last().unwrap().trampoline_onion().is_some());
+
+    let amounts = route.iter().map(|hop| hop.amount).collect::<Vec<_>>();
+    assert_eq!(amounts, vec![1020, 1009, 1009]);
+
+    assert_eq!(route.first().unwrap().amount - final_amount, max_fee_amount);
+    assert_eq!(route[0].amount - route[1].amount, 11);
+    assert_eq!(route[1].amount - final_amount, 9);
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_graph_trampoline_routing_outer_route_fee_can_exhaust_inner_budget() {
+    init_tracing();
+
+    let mut network = MockNetworkGraph::new(4);
+    network.graph.set_add_rand_expiry_delta(false);
+
+    let sender = network.keys[1];
+    network.set_source(sender);
+    let trampoline = network.keys[3];
+    let final_recipient = network.keys[4];
+
+    network.add_edge(1, 2, Some(10_000), Some(0));
+    network.add_edge(2, 3, Some(10_000), Some(10_000));
+
+    let payment_state: SendPaymentState =
+        SendPaymentDataBuilder::new(final_recipient.into(), 1000, Hash256::default())
+            .final_tlc_expiry_delta(FINAL_TLC_EXPIRY_DELTA_IN_TESTS)
+            .tlc_expiry_limit(MAX_PAYMENT_TLC_EXPIRY_LIMIT)
+            .max_fee_amount(Some(11))
+            .trampoline_hops(Some(vec![trampoline.into()]))
+            .build()
+            .expect("valid payment_data")
+            .into();
+
+    let err = network
+        .graph
+        .build_route(payment_state.amount, None, None, &payment_state)
+        .expect_err("outer route fee should leave insufficient inner trampoline budget");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("recommend_minimal_fee=12") && msg.contains("current_fee=11"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), test)]
@@ -1698,6 +1830,109 @@ fn test_graph_session_router() {
 
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_graph_explicit_router_rejects_overflowing_expiry() {
+    let mut network = MockNetworkGraph::new(2);
+    network.add_edge(0, 1, Some(1000), Some(0));
+
+    let node1 = network.keys[1];
+    let payment_state: SendPaymentState =
+        SendPaymentDataBuilder::new(node1.into(), 100, Hash256::default())
+            .max_fee_amount(Some(0))
+            .router(vec![RouterHop {
+                target: node1.into(),
+                channel_outpoint: network.edges[0].2.clone(),
+                amount_received: 100,
+                incoming_tlc_expiry: u64::MAX,
+            }])
+            .build()
+            .expect("valid payment data")
+            .into();
+
+    let route = network
+        .graph
+        .build_route(payment_state.amount, None, None, &payment_state);
+    assert!(matches!(route, Err(PathFindError::Overflow(_))));
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_graph_explicit_router_validates_udt() {
+    let mut network = MockNetworkGraph::new(2);
+    network.add_edge_udt(0, 1, Some(1000), Some(0), Script::default());
+
+    let node1 = network.keys[1];
+    let payment_state: SendPaymentState =
+        SendPaymentDataBuilder::new(node1.into(), 100, Hash256::default())
+            .max_fee_amount(Some(0))
+            .router(vec![RouterHop {
+                target: node1.into(),
+                channel_outpoint: network.edges[0].2.clone(),
+                amount_received: 100,
+                incoming_tlc_expiry: FINAL_TLC_EXPIRY_DELTA_IN_TESTS,
+            }])
+            .build()
+            .expect("valid payment data")
+            .into();
+
+    let route = network
+        .graph
+        .build_route(payment_state.amount, None, None, &payment_state);
+    assert!(matches!(route, Err(PathFindError::NoPathFound)));
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_graph_build_path_rejects_amount_overflow() {
+    let mut network = MockNetworkGraph::new(3);
+    network.add_edge(0, 1, Some(u128::MAX), Some(0));
+    network.add_edge(1, 2, Some(u128::MAX), Some(1));
+
+    let result = network.graph.build_path(
+        network.keys[0].into(),
+        BuildRouterCommand {
+            amount: Some(u128::MAX),
+            udt_type_script: None,
+            hops_info: vec![
+                HopRequire {
+                    pubkey: network.keys[1].into(),
+                    channel_outpoint: Some(network.edges[0].2.clone()),
+                },
+                HopRequire {
+                    pubkey: network.keys[2].into(),
+                    channel_outpoint: Some(network.edges[1].2.clone()),
+                },
+            ],
+            final_tlc_expiry_delta: Some(FINAL_TLC_EXPIRY_DELTA_IN_TESTS),
+        },
+    );
+
+    assert!(matches!(result, Err(PathFindError::Overflow(_))));
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_graph_build_path_rejects_expiry_overflow() {
+    let mut network = MockNetworkGraph::new(2);
+    network.add_edge(0, 1, Some(1000), Some(0));
+
+    let result = network.graph.build_path(
+        network.keys[0].into(),
+        BuildRouterCommand {
+            amount: Some(100),
+            udt_type_script: None,
+            hops_info: vec![HopRequire {
+                pubkey: network.keys[1].into(),
+                channel_outpoint: Some(network.edges[0].2.clone()),
+            }],
+            final_tlc_expiry_delta: Some(u64::MAX),
+        },
+    );
+
+    assert!(matches!(result, Err(PathFindError::Overflow(_))));
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn test_graph_mark_failed_node() {
     let mut network = MockNetworkGraph::new(5);
     network.add_edge(0, 2, Some(500), Some(2));
@@ -2468,4 +2703,38 @@ fn test_graph_find_path_max_capacity_with_fee_rate() {
     // Now we don't consider fee rate for max_capacity_search
     assert_eq!(route[0].amount_received, 500);
     assert_eq!(route[1].amount_received, 500);
+}
+
+#[test]
+fn test_graph_find_path_rejects_hop_hint_expiry_delta_overflow() {
+    init_tracing();
+
+    let network = MockNetworkGraph::new(3);
+    let node1 = network.keys[1];
+    let node2 = network.keys[2];
+    let node3 = network.keys[3];
+    let hinted_channel = OutPoint::from_slice(&[42; 36]).unwrap();
+    let hop_hints = vec![HopHint {
+        pubkey: node2.into(),
+        channel_outpoint: hinted_channel,
+        fee_rate: 0,
+        tlc_expiry_delta: u64::MAX,
+    }];
+
+    let route = network.graph.find_path(
+        node1.into(),
+        node3.into(),
+        Some(100),
+        Some(1000),
+        None,
+        FINAL_TLC_EXPIRY_DELTA_IN_TESTS,
+        MAX_PAYMENT_TLC_EXPIRY_LIMIT,
+        false,
+        &hop_hints,
+        &Default::default(),
+        true,
+    );
+
+    eprintln!("debug router: {:?}", route);
+    assert!(matches!(route, Err(PathFindError::Overflow(_))));
 }

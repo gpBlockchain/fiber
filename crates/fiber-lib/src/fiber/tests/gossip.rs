@@ -2,8 +2,8 @@ use std::{collections::HashSet, sync::Arc};
 
 use ckb_types::{
     core::{tx_pool::TxStatus, TransactionView},
-    packed::Bytes,
-    prelude::{Builder, Entity},
+    packed::{Bytes, OutPoint},
+    prelude::{Builder, Entity, Unpack},
 };
 use molecule::prelude::Byte;
 use ractor::{concurrency::Duration, Actor, ActorProcessingErr, ActorRef};
@@ -13,12 +13,19 @@ use crate::tests::test_utils::{
     establish_channel_between_nodes, ChannelParameters, NetworkNode, NetworkNodeConfigBuilder,
 };
 use crate::{
-    ckb::tests::test_utils::MockCkbChainClient,
-    fiber::gossip::{GossipActorMessage, GossipConfig, GossipService},
-};
-use crate::{
     ckb::tests::test_utils::{MockChainActor, MockChainState},
     fiber::types::{ChannelUpdateChannelFlags, NodeAnnouncement},
+};
+use crate::{
+    ckb::{
+        contracts::{get_script_by_contract, Contract},
+        tests::test_utils::MockCkbChainClient,
+    },
+    fiber::{
+        gossip::{GossipActorMessage, GossipConfig, GossipService},
+        network::{get_chain_hash, PeerChannelIndex},
+        ChannelAnnouncement,
+    },
 };
 use crate::{
     ckb::{tests::test_utils::submit_tx, CkbChainMessage},
@@ -44,6 +51,10 @@ struct GossipTestingContext {
 
 impl GossipTestingContext {
     async fn new() -> Self {
+        Self::new_with_gossip_config(GossipConfig::default()).await
+    }
+
+    async fn new_with_gossip_config(gossip_config: GossipConfig) -> Self {
         let dir = TempDir::new("test-gossip-store");
         let store = open_store(dir).expect("created store failed");
         let shared_state = Arc::new(std::sync::RwLock::new(MockChainState::new()));
@@ -54,10 +65,12 @@ impl GossipTestingContext {
         let root_actor = get_test_root_actor().await;
 
         let (gossip_service, gossip_protocol_handle) = GossipService::start(
-            GossipConfig::default(),
+            gossip_config,
             store.clone(),
             chain_actor.clone(),
             MockCkbChainClient::new(shared_state.clone()),
+            None,
+            PeerChannelIndex::default(),
             root_actor.get_cell(),
         )
         .await;
@@ -101,6 +114,14 @@ impl GossipTestingContext {
             .send_message(ExtendedGossipMessageStoreMessage::SaveMessages(
                 crate::gen_rand_fiber_public_key(),
                 vec![message],
+            ))
+            .expect("send message");
+    }
+
+    fn process_remote_messages(&self, peer: crate::fiber::Pubkey, messages: Vec<BroadcastMessage>) {
+        self.get_extended_actor()
+            .send_message(ExtendedGossipMessageStoreMessage::SaveMessages(
+                peer, messages,
             ))
             .expect("send message");
     }
@@ -255,6 +276,64 @@ async fn test_saving_invalid_channel_announcement() {
 }
 
 #[tokio::test]
+async fn test_reject_channel_announcement_with_outpoint_index_not_zero() {
+    let context = GossipTestingContext::new().await;
+    let channel_context = ChannelTestContext::gen().await;
+
+    let real_output = channel_context
+        .funding_tx
+        .output(0)
+        .expect("get output")
+        .clone();
+    let dummy_lock = get_script_by_contract(Contract::Secp256k1Lock, b"dummy_placeholder");
+    let dummy_output = real_output.clone().as_builder().lock(dummy_lock).build();
+
+    let tx_with_output_at_index_1 = TransactionView::new_advanced_builder()
+        .output(dummy_output)
+        .output_data(Bytes::default())
+        .output(real_output)
+        .output_data(Bytes::default())
+        .build();
+
+    let outpoint_index_1 = OutPoint::new_builder()
+        .tx_hash(tx_with_output_at_index_1.hash())
+        .index(1u32)
+        .build();
+    let xonly = channel_context.funding_tx_sk.x_only_pub_key();
+    let capacity: u64 = channel_context
+        .funding_tx
+        .output(0)
+        .unwrap()
+        .capacity()
+        .unpack();
+    let mut announcement = ChannelAnnouncement::new_unsigned(
+        &channel_context.node1_sk.pubkey(),
+        &channel_context.node2_sk.pubkey(),
+        outpoint_index_1.clone(),
+        get_chain_hash(),
+        &xonly,
+        capacity as u128,
+        None,
+    );
+    let message = announcement.message_to_sign();
+    announcement.ckb_signature = Some(channel_context.funding_tx_sk.sign_schnorr(message));
+    announcement.node1_signature = Some(channel_context.node1_sk.sign(message));
+    announcement.node2_signature = Some(channel_context.node2_sk.sign(message));
+
+    context.save_message(BroadcastMessage::ChannelAnnouncement(announcement));
+    let status = context.submit_tx(tx_with_output_at_index_1).await;
+    assert!(matches!(status, TxStatus::Committed(..)));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let saved = context
+        .get_store()
+        .get_latest_channel_announcement(&outpoint_index_1);
+    assert!(
+        saved.is_some(),
+        "should accept ChannelAnnouncement when funding output matches the announced outpoint index"
+    );
+}
+
+#[tokio::test]
 // Not supported on wasm: requires filesystem
 async fn test_saving_channel_update_after_saving_channel_announcement() {
     let context = GossipTestingContext::new().await;
@@ -344,6 +423,61 @@ async fn test_saving_channel_update_before_saving_channel_announcement() {
         // The channel update messages are discarded because we thought they are invalid.
         assert_eq!(channel_update, None);
     }
+}
+
+#[tokio::test]
+async fn test_deferred_channel_announcement_keeps_dependent_update_pending() {
+    let context = GossipTestingContext::new().await;
+    let peer = crate::gen_rand_fiber_public_key();
+    let channel_context = ChannelTestContext::gen().await;
+    let channel_update = channel_context.create_channel_update_of_node1(
+        ChannelUpdateChannelFlags::empty(),
+        42,
+        42,
+        42,
+        None,
+    );
+
+    context.process_remote_messages(
+        peer,
+        vec![
+            BroadcastMessage::ChannelAnnouncement(channel_context.channel_announcement.clone()),
+            BroadcastMessage::ChannelUpdate(channel_update.clone()),
+        ],
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        context
+            .get_store()
+            .get_latest_channel_announcement(channel_context.channel_outpoint()),
+        None
+    );
+    assert_eq!(
+        context
+            .get_store()
+            .get_latest_channel_update(channel_context.channel_outpoint(), true),
+        None
+    );
+
+    let status = context.submit_tx(channel_context.funding_tx.clone()).await;
+    assert!(matches!(status, TxStatus::Committed(..)));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_ne!(
+        context
+            .get_store()
+            .get_latest_channel_announcement(channel_context.channel_outpoint()),
+        None,
+        "deferred channel announcement should remain pending until funding tx is visible",
+    );
+    assert_eq!(
+        context
+            .get_store()
+            .get_latest_channel_update(channel_context.channel_outpoint(), true),
+        Some(channel_update),
+        "dependent channel update should remain pending until deferred announcement is verified",
+    );
 }
 
 #[tokio::test]
@@ -455,6 +589,171 @@ async fn test_saving_channel_update_independency() {
 }
 
 #[tokio::test]
+async fn test_channel_update_limiter_drops_excess_updates_for_same_direction() {
+    let gossip_config = GossipConfig {
+        policy: crate::fiber::gossip_policy::GossipPolicyConfig {
+            inbound_channel_update: crate::fiber::gossip_policy::ChannelUpdateRateLimitConfig {
+                interval_ms: 60_000,
+                burst: 1,
+            },
+            ..crate::fiber::gossip_policy::GossipPolicyConfig::default()
+        },
+        ..GossipConfig::default()
+    };
+    let context = GossipTestingContext::new_with_gossip_config(gossip_config).await;
+    let channel_context = ChannelTestContext::gen().await;
+    context.save_message(BroadcastMessage::ChannelAnnouncement(
+        channel_context.channel_announcement.clone(),
+    ));
+    let status = context.submit_tx(channel_context.funding_tx.clone()).await;
+    assert!(matches!(status, TxStatus::Committed(..)));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let update1 = channel_context.create_channel_update_of_node1(
+        ChannelUpdateChannelFlags::empty(),
+        42,
+        42,
+        42,
+        Some(1_000),
+    );
+    let update2 = channel_context.create_channel_update_of_node1(
+        ChannelUpdateChannelFlags::empty(),
+        43,
+        43,
+        43,
+        Some(2_000),
+    );
+    context.process_remote_messages(
+        crate::gen_rand_fiber_public_key(),
+        vec![
+            BroadcastMessage::ChannelUpdate(update1.clone()),
+            BroadcastMessage::ChannelUpdate(update2),
+        ],
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        context
+            .get_store()
+            .get_latest_channel_update(channel_context.channel_outpoint(), true),
+        Some(update1)
+    );
+}
+
+#[tokio::test]
+async fn test_channel_update_limiter_does_not_block_other_direction() {
+    let gossip_config = GossipConfig {
+        policy: crate::fiber::gossip_policy::GossipPolicyConfig {
+            inbound_channel_update: crate::fiber::gossip_policy::ChannelUpdateRateLimitConfig {
+                interval_ms: 60_000,
+                burst: 1,
+            },
+            ..crate::fiber::gossip_policy::GossipPolicyConfig::default()
+        },
+        ..GossipConfig::default()
+    };
+    let context = GossipTestingContext::new_with_gossip_config(gossip_config).await;
+    let channel_context = ChannelTestContext::gen().await;
+    context.save_message(BroadcastMessage::ChannelAnnouncement(
+        channel_context.channel_announcement.clone(),
+    ));
+    let status = context.submit_tx(channel_context.funding_tx.clone()).await;
+    assert!(matches!(status, TxStatus::Committed(..)));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let update_of_node1 = channel_context.create_channel_update_of_node1(
+        ChannelUpdateChannelFlags::empty(),
+        42,
+        42,
+        42,
+        Some(1_000),
+    );
+    let update_of_node2 = channel_context.create_channel_update_of_node2(
+        ChannelUpdateChannelFlags::empty(),
+        43,
+        43,
+        43,
+        Some(2_000),
+    );
+    context.process_remote_messages(
+        crate::gen_rand_fiber_public_key(),
+        vec![
+            BroadcastMessage::ChannelUpdate(update_of_node1.clone()),
+            BroadcastMessage::ChannelUpdate(update_of_node2.clone()),
+        ],
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        context
+            .get_store()
+            .get_latest_channel_update(channel_context.channel_outpoint(), true),
+        Some(update_of_node1)
+    );
+    assert_eq!(
+        context
+            .get_store()
+            .get_latest_channel_update(channel_context.channel_outpoint(), false),
+        Some(update_of_node2)
+    );
+}
+
+#[tokio::test]
+async fn test_channel_update_limiter_isolated_per_peer_for_same_direction() {
+    let gossip_config = GossipConfig {
+        policy: crate::fiber::gossip_policy::GossipPolicyConfig {
+            inbound_channel_update: crate::fiber::gossip_policy::ChannelUpdateRateLimitConfig {
+                interval_ms: 60_000,
+                burst: 1,
+            },
+            ..crate::fiber::gossip_policy::GossipPolicyConfig::default()
+        },
+        ..GossipConfig::default()
+    };
+    let context = GossipTestingContext::new_with_gossip_config(gossip_config).await;
+    let channel_context = ChannelTestContext::gen().await;
+    context.save_message(BroadcastMessage::ChannelAnnouncement(
+        channel_context.channel_announcement.clone(),
+    ));
+    let status = context.submit_tx(channel_context.funding_tx.clone()).await;
+    assert!(matches!(status, TxStatus::Committed(..)));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut invalid = channel_context.create_channel_update_of_node1(
+        ChannelUpdateChannelFlags::empty(),
+        41,
+        41,
+        41,
+        Some(1_000),
+    );
+    invalid.signature = Some(create_invalid_ecdsa_signature());
+    let valid = channel_context.create_channel_update_of_node1(
+        ChannelUpdateChannelFlags::empty(),
+        42,
+        42,
+        42,
+        Some(2_000),
+    );
+
+    context.process_remote_messages(
+        crate::gen_rand_fiber_public_key(),
+        vec![BroadcastMessage::ChannelUpdate(invalid)],
+    );
+    context.process_remote_messages(
+        crate::gen_rand_fiber_public_key(),
+        vec![BroadcastMessage::ChannelUpdate(valid.clone())],
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        context
+            .get_store()
+            .get_latest_channel_update(channel_context.channel_outpoint(), true),
+        Some(valid)
+    );
+}
+
+#[tokio::test]
 async fn test_saving_channel_update_with_invalid_channel_announcement() {
     let context = GossipTestingContext::new().await;
     let channel_context = ChannelTestContext::gen().await;
@@ -563,7 +862,7 @@ async fn test_gossip_store_updates_repeated_saving() {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     let messages = messages.read().await;
-    assert!(messages.len() == 1);
+    assert_eq!(messages.len(), 1, "{messages:?}");
     assert_eq!(
         messages[0],
         BroadcastMessageWithTimestamp::NodeAnnouncement(announcement)

@@ -31,8 +31,8 @@ pub use fiber_types::SendPaymentData;
 use fiber_types::{
     Attempt, BasicMppPaymentData, EntityHex, Hash256, HashAlgorithm, HopHint, PaymentCustomRecords,
     PaymentHopData, PaymentStatus, PeeledPaymentOnionPacket, Privkey, Pubkey, RemoveTlcReason,
-    RouterHop, TlcErr, TlcErrData, TlcErrorCode, TrampolineContext, DEFAULT_MAX_PARTS,
-    DEFAULT_PAYMENT_MPP_ATTEMPT_TRY_LIMIT, USER_CUSTOM_RECORDS_MAX_INDEX,
+    RouterHop, TlcErr, TlcErrData, TlcErrPacket, TlcErrorCode, TrampolineContext,
+    DEFAULT_MAX_PARTS, DEFAULT_PAYMENT_MPP_ATTEMPT_TRY_LIMIT, USER_CUSTOM_RECORDS_MAX_INDEX,
 };
 use ractor::{call_t, Actor, ActorProcessingErr};
 use ractor::{concurrency::Duration, ActorRef, RpcReplyPort};
@@ -766,6 +766,7 @@ pub enum PaymentActorMessage {
 pub struct PaymentActorState {
     payment_hash: Hash256,
     init_command: Option<PaymentActorMessage>,
+    last_error_packet: Option<TlcErrPacket>,
 
     // the number of pending retrying send payments, we track it for
     // set retry delay dynamically, pending too many payments may have a negative impact
@@ -783,6 +784,7 @@ impl PaymentActorState {
         Self {
             payment_hash,
             init_command: Some(init_command),
+            last_error_packet: None,
             retry_send_payment_count: 0,
         }
     }
@@ -852,7 +854,10 @@ where
         debug!("Payment actor is stopped {:?}", myself.get_name());
         self.network
             .send_message(NetworkActorMessage::Event(
-                NetworkActorEvent::PaymentActorStopped(state.payment_hash),
+                NetworkActorEvent::PaymentActorStopped(
+                    state.payment_hash,
+                    state.last_error_packet.clone(),
+                ),
             ))
             .map_err(Into::into)
     }
@@ -1129,7 +1134,14 @@ where
             // `session.remain_amount()` do not contains this part of amount,
             // so we need to add the receiver amount to it, so we may make fewer
             // attempts to send the payment.
-            let amount = session.remain_amount() + attempt.route.receiver_amount();
+            let amount = session
+                .remain_amount()
+                .checked_add(attempt.route.receiver_amount())
+                .ok_or_else(|| {
+                    Error::SendPaymentError(
+                        "Retry payment amount overflows remaining amount".to_string(),
+                    )
+                })?;
             let max_fee = session.remain_fee_amount();
             let channel_stats = {
                 let graph = self.network_graph.read().await;
@@ -1186,7 +1198,7 @@ where
         let mut attempt_id = session.attempts_count() as u64;
         let mut target_amount = remain_amount;
         let mut single_path_max = None;
-        let mut iteration = 0;
+        let mut iteration = 0_u64;
 
         if session.max_parts() > 1 && !is_self_pay {
             let path_max = {
@@ -1196,15 +1208,29 @@ where
                     channel_stats.clone(),
                 ))?
             };
-            if path_max * (session.max_parts() as u128) < remain_amount {
+            if path_max
+                .checked_mul(session.max_parts() as u128)
+                .ok_or_else(|| {
+                    Error::SendPaymentError("MPP path capacity calculation overflows".to_string())
+                })?
+                < remain_amount
+            {
                 let error = "Failed to build enough routes for MPP payment".to_string();
                 return Err(Error::SendPaymentError(error));
             }
             single_path_max = Some(path_max);
         }
 
-        while (result.len() < session.max_parts() - active_parts) && remain_amount > 0 {
-            iteration += 1;
+        let max_new_parts = session
+            .max_parts()
+            .checked_sub(active_parts)
+            .ok_or_else(|| {
+                Error::SendPaymentError("active payment parts exceed max_parts".to_string())
+            })?;
+        while (result.len() < max_new_parts) && remain_amount > 0 {
+            iteration = iteration.checked_add(1).ok_or_else(|| {
+                Error::SendPaymentError("route build iteration overflows".to_string())
+            })?;
 
             debug!(
                 "build route iteration {}, target_amount: {} amount_low_bound: {:?} remain_amount: {}, max_parts: {}, max_fee: {:?}",
@@ -1236,7 +1262,14 @@ where
             match build_route_result {
                 Err(e) => {
                     error!("build_payment_routes failed to build route: {}", e);
-                    let error = format!("Failed to build route, {}", e);
+                    let error = if session.request.trampoline_context.is_some() {
+                        session
+                            .last_error_code
+                            .get_or_insert(TlcErrorCode::TemporaryNodeFailure);
+                        TlcErrorCode::TemporaryNodeFailure.as_ref().to_string()
+                    } else {
+                        format!("Failed to build route, {}", e)
+                    };
                     return Err(Error::SendPaymentError(error));
                 }
                 Ok(mut hops) => {
@@ -1257,7 +1290,9 @@ where
                     let new_attempt_id = if session.is_dry_run() {
                         0
                     } else {
-                        attempt_id += 1;
+                        attempt_id = attempt_id.checked_add(1).ok_or_else(|| {
+                            Error::SendPaymentError("attempt id overflows".to_string())
+                        })?;
                         attempt_id
                     };
 
@@ -1315,10 +1350,22 @@ where
                         })?);
                     }
                     result.push(attempt);
-                    if remain_amount > 0
-                        && remain_amount
-                            > current_amount * (session.max_parts() - result.len()) as u128
-                    {
+                    let remaining_slots = session
+                        .max_parts()
+                        .checked_sub(result.len())
+                        .ok_or_else(|| {
+                            Error::SendPaymentError(
+                                "built payment parts exceed max_parts".to_string(),
+                            )
+                        })?;
+                    let max_remaining_amount = current_amount
+                        .checked_mul(remaining_slots as u128)
+                        .ok_or_else(|| {
+                            Error::SendPaymentError(
+                                "MPP remaining amount calculation overflows".to_string(),
+                            )
+                        })?;
+                    if remain_amount > 0 && remain_amount > max_remaining_amount {
                         break;
                     }
                 }
@@ -1382,10 +1429,12 @@ where
                 cur_max_fee, local_fee
             );
             return Err(Error::SendPaymentError(
-                "Trampoline forwarding fee insufficient".to_string(),
+                TlcErrorCode::FeeInsufficient.as_ref().to_string(),
             ));
         }
-        *max_fee = Some(cur_max_fee - local_fee);
+        *max_fee = Some(cur_max_fee.checked_sub(local_fee).ok_or_else(|| {
+            Error::SendPaymentError("Trampoline forwarding fee insufficient".to_string())
+        })?);
         Ok(())
     }
 
@@ -1394,18 +1443,18 @@ where
         session: &mut PaymentSession,
         attempt: &mut Attempt,
     ) -> Result<(), Error> {
-        let session_key = Privkey::from_slice(KeyPair::generate_random_key().as_ref());
         assert_ne!(attempt.route_hops[0].funding_tx_hash, Hash256::default());
 
-        attempt.session_key.copy_from_slice(session_key.as_ref());
-
-        let peeled_onion_packet = match PeeledPaymentOnionPacket::create(
-            session_key,
+        let peeled_onion_packet = match PeeledPaymentOnionPacket::create_with_session_key_fn(
+            || Privkey::from_slice(KeyPair::generate_random_key().as_ref()),
             attempt.route_hops.clone(),
             Some(attempt.hash.as_ref().to_vec()),
             &Secp256k1::signing_only(),
         ) {
-            Ok(packet) => packet,
+            Ok((packet, session_key)) => {
+                attempt.session_key.copy_from_slice(session_key.as_ref());
+                packet
+            }
             Err(e) => {
                 let err = format!(
                     "Failed to create onion packet: {:?}, error: {:?}",
@@ -1743,12 +1792,13 @@ where
                     tlc_error.error_code.as_ref(),
                     need_to_retry
                 );
+                state.last_error_packet = Some(reason.clone());
 
                 self.set_attempt_fail_with_error(
                     &mut session,
                     &mut attempt,
                     Some(tlc_error.error_code),
-                    tlc_error.error_code.as_ref(),
+                    &tlc_error.to_string(),
                     need_to_retry,
                 );
 
@@ -1792,8 +1842,19 @@ where
         // This is a performance tuning result, the basic idea is when there are more pending
         // retrying payment in ractor framework, we will increase the delay time to avoid
         // flooding the network actor with too many retrying payments.
-        state.retry_send_payment_count += 1;
-        let delay = (state.retry_send_payment_count as u64) * 20_u64;
+        let Some(next_retry_count) = state.retry_send_payment_count.checked_add(1) else {
+            error!("retry_send_payment_count overflow");
+            return;
+        };
+        state.retry_send_payment_count = next_retry_count;
+        let Ok(retry_count) = u64::try_from(state.retry_send_payment_count) else {
+            error!("retry_send_payment_count does not fit into u64");
+            return;
+        };
+        let Some(delay) = retry_count.checked_mul(20_u64) else {
+            error!("retry payment delay overflow");
+            return;
+        };
         myself.send_after(Duration::from_millis(delay), move || {
             PaymentActorMessage::RetrySendPayment(attempt_id)
         });
@@ -1871,7 +1932,11 @@ where
         }
 
         let try_limit = if payment_data.allow_mpp() {
-            payment_data.max_parts() as u32 * DEFAULT_PAYMENT_MPP_ATTEMPT_TRY_LIMIT
+            (payment_data.max_parts() as u32)
+                .checked_mul(DEFAULT_PAYMENT_MPP_ATTEMPT_TRY_LIMIT)
+                .ok_or_else(|| {
+                    Error::InvalidParameter("MPP payment try limit overflows".to_string())
+                })?
         } else {
             DEFAULT_PAYMENT_TRY_LIMIT
         };

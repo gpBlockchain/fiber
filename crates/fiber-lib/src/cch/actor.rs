@@ -20,6 +20,7 @@ use crate::cch::order::CchOrderStateMachine;
 use crate::cch::scheduler::{CchOrderSchedulerActor, SchedulerArgs, SchedulerMessage};
 use crate::cch::trackers::{
     CchTrackingEvent, LndConnectionInfo, LndTrackerActor, LndTrackerArgs, LndTrackerMessage,
+    RedactedCchTrackingEvent,
 };
 use crate::cch::{CchConfig, CchError, CchOrderStore, CchStoreError};
 use crate::ckb::contracts::{get_script_by_contract, Contract};
@@ -339,7 +340,7 @@ impl<S: CchOrderStore + Send + Sync + Clone + 'static> Actor for CchActor<S> {
                 Ok(())
             }
             CchMessage::TrackingEvent(event) => {
-                tracing::debug!("event {:?}", event);
+                tracing::debug!("tracking event {:?}", RedactedCchTrackingEvent(&event));
                 let payment_hash = *event.payment_hash();
                 match state.handle_tracking_event(event).await {
                     Ok(actions) => {
@@ -357,7 +358,13 @@ impl<S: CchOrderStore + Send + Sync + Clone + 'static> Actor for CchActor<S> {
                 Ok(())
             }
             CchMessage::StoreChangeEvent(change) => {
-                tracing::debug!("store change event {:?}", change);
+                let summary = redacted_store_change_summary(&change);
+                tracing::debug!(
+                    "store change event kind={} payment_hash={:x} has_payment_preimage={}",
+                    summary.kind,
+                    summary.payment_hash,
+                    summary.has_payment_preimage
+                );
                 let events = state.map_store_change_to_events(&change);
                 for event in events {
                     let payment_hash = *event.payment_hash();
@@ -540,7 +547,12 @@ impl<S: CchOrderStore> CchState<S> {
         }
 
         let invoice = Bolt11Invoice::from_str(&send_btc.btc_pay_req)?;
-        tracing::debug!("BTC invoice: {:?}", invoice);
+        tracing::debug!(
+            "BTC invoice parsed payment_hash={:x} currency={:?} has_amount={}",
+            Hash256::from(*invoice.payment_hash()),
+            invoice.currency(),
+            invoice.amount_milli_satoshis().is_some()
+        );
 
         // Validate that the BTC invoice network matches the expected BTC network (#978)
         let expected_ln_currency = expected_ln_currency(self.currency);
@@ -557,7 +569,10 @@ impl<S: CchOrderStore> CchState<S> {
         // Validate that outgoing BTC invoice's final CLTV is less than half of incoming CKB invoice's final TLC expiry.
         // This ensures the CCH operator has sufficient time to settle the incoming side before the outgoing side expires.
         // BTC uses blocks (~10 min each), CKB uses seconds.
-        let btc_final_cltv_seconds = invoice.min_final_cltv_expiry_delta() * 600;
+        let btc_final_cltv_seconds = invoice
+            .min_final_cltv_expiry_delta()
+            .checked_mul(600)
+            .ok_or(CchError::BTCInvoiceFinalTlcExpiryDeltaTooLarge)?;
         let ckb_final_tlc_seconds = self.config.ckb_final_tlc_expiry_delta_seconds;
         if btc_final_cltv_seconds >= ckb_final_tlc_seconds / 2 {
             return Err(CchError::BTCInvoiceFinalTlcExpiryDeltaTooLarge);
@@ -578,9 +593,11 @@ impl<S: CchOrderStore> CchState<S> {
             .amount_milli_satoshis()
             .ok_or(CchError::BTCInvoiceMissingAmount)? as u128;
 
-        let fee_sats = amount_msat * (self.config.fee_rate_per_million_sats as u128)
-            / 1_000_000_000u128
-            + (self.config.base_fee_sats as u128);
+        let fee_sats = amount_msat
+            .checked_mul(self.config.fee_rate_per_million_sats as u128)
+            .and_then(|v| v.checked_div(1_000_000_000u128))
+            .and_then(|v| v.checked_add(self.config.base_fee_sats as u128))
+            .ok_or(CchError::SendBTCOrderAmountTooLarge)?;
 
         let wrapped_btc_type_script = self.resolve_wrapped_btc_type_script()?;
         let invoice_amount_sats = amount_msat
@@ -593,7 +610,17 @@ impl<S: CchOrderStore> CchState<S> {
             .payment_hash(payment_hash)
             .hash_algorithm(HashAlgorithm::Sha256)
             .expiry_time(Duration::from_secs(outgoing_invoice_expiry_delta_seconds))
-            .final_expiry_delta(self.config.ckb_final_tlc_expiry_delta_seconds * 1000)
+            .final_expiry_delta(
+                self.config
+                    .ckb_final_tlc_expiry_delta_seconds
+                    .checked_mul(1000)
+                    .ok_or_else(|| {
+                        CchError::ConfigError(format!(
+                            "ckb_final_tlc_expiry_delta_seconds ({}) is too large and causes overflow when converting to milliseconds",
+                            self.config.ckb_final_tlc_expiry_delta_seconds
+                        ))
+                    })?,
+            )
             .udt_type_script(wrapped_btc_type_script.clone().into());
 
         let invoice = if let Some((public_key, secret_key)) = &self.node_keypair {
@@ -687,7 +714,11 @@ impl<S: CchOrderStore> CchState<S> {
                 })
                 .ok_or(CchError::OutgoingInvoiceExpiryTooShort)?,
             // CKB invoice has no default expiry, use minimal * 2 to create the invoice
-            None => self.config.min_outgoing_invoice_expiry_delta_seconds * 2,
+            None => self
+                .config
+                .min_outgoing_invoice_expiry_delta_seconds
+                .checked_mul(2)
+                .ok_or(CchError::OutgoingInvoiceExpiryTooShort)?,
         };
         if outgoing_invoice_expiry_delta_seconds
             < self.config.min_outgoing_invoice_expiry_delta_seconds
@@ -932,7 +963,13 @@ async fn subscribe_store_changes_ws(
                 item = subscription.next() => {
                     match item {
                         Some(Ok(change)) => {
-                            tracing::debug!("Received store change via WebSocket: {:?}", change);
+                            let summary = redacted_store_change_summary(&change);
+                            tracing::debug!(
+                                "received store change via websocket kind={} payment_hash={:x} has_payment_preimage={}",
+                                summary.kind,
+                                summary.payment_hash,
+                                summary.has_payment_preimage
+                            );
                             if let Err(err) = actor.send_message(CchMessage::StoreChangeEvent(change)) {
                                 tracing::error!("Failed to forward store change to CCH actor: {}", err);
                                 return;
@@ -954,5 +991,32 @@ async fn subscribe_store_changes_ws(
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RedactedStoreChangeSummary {
+    pub kind: &'static str,
+    pub payment_hash: Hash256,
+    pub has_payment_preimage: bool,
+}
+
+pub(crate) fn redacted_store_change_summary(change: &StoreChange) -> RedactedStoreChangeSummary {
+    match change {
+        StoreChange::PutCkbInvoiceStatus { payment_hash, .. } => RedactedStoreChangeSummary {
+            kind: "PutCkbInvoiceStatus",
+            payment_hash: *payment_hash,
+            has_payment_preimage: false,
+        },
+        StoreChange::PutPaymentSession { payment_hash, .. } => RedactedStoreChangeSummary {
+            kind: "PutPaymentSession",
+            payment_hash: *payment_hash,
+            has_payment_preimage: false,
+        },
+        StoreChange::PutPreimage { payment_hash, .. } => RedactedStoreChangeSummary {
+            kind: "PutPreimage",
+            payment_hash: *payment_hash,
+            has_payment_preimage: true,
+        },
     }
 }

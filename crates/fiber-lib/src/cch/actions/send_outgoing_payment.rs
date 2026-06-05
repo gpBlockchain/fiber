@@ -81,17 +81,38 @@ impl ActionExecutor for SendLightningOutgoingPaymentExecutor {
             cltv_limit: self.cltv_limit,
             ..Default::default()
         };
-        tracing::debug!("SendLightningOutgoingPaymentExecutor req: {:?}", req);
+        tracing::debug!(
+            "SendLightningOutgoingPaymentExecutor request payment_hash={:x} timeout_seconds={} cltv_limit={}",
+            self.payment_hash,
+            req.timeout_seconds,
+            req.cltv_limit
+        );
 
         let mut client = self.lnd_connection.create_router_client().await?;
         // TODO: set a fee
         let mut stream = client.send_payment_v2(req).await?.into_inner();
         // Wait for the first message then quit
         let payment_result_opt = stream.next().await;
-        tracing::debug!(
-            "SendLightningOutgoingPaymentExecutor resp: {:?}",
-            payment_result_opt
-        );
+        match &payment_result_opt {
+            Some(Ok(payment)) => {
+                let has_payment_preimage = !payment.payment_preimage.is_empty()
+                    && !payment.payment_preimage.chars().all(|c| c == '0');
+                tracing::debug!(
+                    "SendLightningOutgoingPaymentExecutor response payment_hash={} status={:?} has_payment_preimage={}",
+                    payment.payment_hash,
+                    payment.status(),
+                    has_payment_preimage
+                );
+            }
+            Some(Err(err)) => {
+                tracing::debug!(
+                    "SendLightningOutgoingPaymentExecutor response error code={} message={}",
+                    err.code(),
+                    err.message()
+                );
+            }
+            None => tracing::debug!("SendLightningOutgoingPaymentExecutor response stream_closed"),
+        }
         let event = match payment_result_opt {
             Some(Ok(payment)) => map_lnd_payment_changed_event(payment)?,
             Some(Err(err)) if err.code() == tonic::Code::AlreadyExists => {
@@ -246,7 +267,7 @@ impl SendOutgoingPaymentDispatcher {
                 // Outgoing is BTC Lightning: parse the BTC invoice's min_final_cltv_expiry_delta
                 Bolt11Invoice::from_str(&order.outgoing_pay_req)
                     .ok()
-                    .map(|inv| inv.min_final_cltv_expiry_delta() * 600)
+                    .and_then(|inv| inv.min_final_cltv_expiry_delta().checked_mul(600))
                     .unwrap_or(0)
             }
             CchInvoice::Lightning(_) => {
