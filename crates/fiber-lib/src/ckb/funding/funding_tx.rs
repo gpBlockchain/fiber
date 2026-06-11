@@ -1,4 +1,5 @@
 use super::super::FundingError;
+use super::limits::validate_peer_funding_tx_complexity;
 use crate::ckb::{
     config::{new_ckb_rpc_async_client, new_default_cell_collector},
     contracts::get_udt_cell_deps,
@@ -205,6 +206,12 @@ pub struct FundingContext {
     pub funding_source_lock_script_cell_deps: Vec<packed::CellDep>,
     pub funding_cell_lock_script: packed::Script,
     pub funding_udt_type_script: Option<packed::Script>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PeerInputCell {
+    pub(crate) output: packed::CellOutput,
+    pub(crate) data: ckb_types::bytes::Bytes,
 }
 
 struct ExternalFundingCellDepResolver {
@@ -819,6 +826,10 @@ impl FundingTx {
             remote_tx.outputs().len(),
         );
 
+        // Bound the peer-added complexity before any chain lookup, so a single
+        // TxUpdate cannot amplify into an unbounded number of CKB RPC requests.
+        validate_peer_funding_tx_complexity(&local_tx, &remote_tx)?;
+
         // Version MUST be the same
         if remote_tx.version() != local_tx.version() {
             debug!(
@@ -886,30 +897,6 @@ impl FundingTx {
         {
             debug!("invalid funding tx (inputs)");
             return Err(FundingError::InvalidPeerFundingTx);
-        }
-        // Peer SHOULD NOT add inputs locked by our lock scripts
-        let ckb_client = new_ckb_rpc_async_client(&context.rpc_url);
-        for (input_index, input) in remote_tx
-            .input_pts_iter()
-            .enumerate()
-            .skip(local_tx.inputs().len())
-        {
-            match ckb_client.get_live_cell(input.into(), false).await?.cell {
-                Some(cell) => {
-                    let cell_output_lock: packed::Script = cell.output.lock.into();
-                    if cell_output_lock == context.funding_source_lock_script {
-                        debug!(
-                            "invalid funding tx (inputs): peer uses input #{} with our lock script",
-                            input_index
-                        );
-                        return Err(FundingError::PeerInputUsesOurFundingLock { input_index });
-                    }
-                }
-                None => {
-                    debug!("invalid funding tx (inputs): dead input");
-                    return Err(FundingError::InvalidPeerFundingTx);
-                }
-            };
         }
 
         // Peer SHOULD NOT remove outputs
@@ -992,7 +979,181 @@ impl FundingTx {
 
         // Ignore witnesses
 
+        // Peer SHOULD NOT add inputs locked by our lock scripts. This requires one
+        // get_live_cell RPC per peer-added input, so it runs last, after all the
+        // cheap structural checks above (including the complexity budget) have
+        // passed.
+        let ckb_client = new_ckb_rpc_async_client(&context.rpc_url);
+        let mut peer_input_cells = Vec::new();
+        for (input_index, input) in remote_tx
+            .input_pts_iter()
+            .enumerate()
+            .skip(local_tx.inputs().len())
+        {
+            match ckb_client.get_live_cell(input.into(), true).await?.cell {
+                Some(cell) => {
+                    let cell_output: packed::CellOutput = cell.output.into();
+                    let cell_output_lock = cell_output.lock();
+                    if cell_output_lock == context.funding_source_lock_script {
+                        debug!(
+                            "invalid funding tx (inputs): peer uses input #{} with our lock script",
+                            input_index
+                        );
+                        return Err(FundingError::PeerInputUsesOurFundingLock { input_index });
+                    }
+                    peer_input_cells.push(PeerInputCell {
+                        output: cell_output,
+                        data: cell
+                            .data
+                            .map(|data| data.content.into_bytes())
+                            .unwrap_or_default(),
+                    });
+                }
+                None => {
+                    debug!("invalid funding tx (inputs): dead input");
+                    return Err(FundingError::InvalidPeerFundingTx);
+                }
+            };
+        }
+        verify_peer_funding_contribution(&local_tx, &remote_tx, &peer_input_cells)?;
+
         self.tx = Some(remote_tx);
         Ok(())
     }
+}
+
+fn output_capacity(output: &packed::CellOutput) -> u128 {
+    let capacity: u64 = output.capacity().unpack();
+    capacity as u128
+}
+
+fn checked_sub_u128(lhs: u128, rhs: u128) -> Result<u128, FundingError> {
+    lhs.checked_sub(rhs).ok_or_else(|| {
+        debug!(
+            "invalid peer funding tx: value decreased from {} to {}",
+            rhs, lhs
+        );
+        FundingError::InvalidPeerFundingTx
+    })
+}
+
+fn read_udt_amount(data: &[u8]) -> Result<u128, FundingError> {
+    if data.len() < 16 {
+        debug!("invalid peer funding tx: UDT data too short");
+        return Err(FundingError::InvalidPeerFundingTx);
+    }
+
+    let mut amount_bytes = [0u8; 16];
+    amount_bytes.copy_from_slice(&data[0..16]);
+    Ok(u128::from_le_bytes(amount_bytes))
+}
+
+fn funding_output_delta(
+    local_tx: &TransactionView,
+    remote_tx: &TransactionView,
+) -> Result<(u128, Option<(packed::Script, u128)>), FundingError> {
+    let remote_output = remote_tx
+        .output(0)
+        .ok_or(FundingError::InvalidPeerFundingTx)?;
+    let remote_data = remote_tx
+        .outputs_data()
+        .get(0)
+        .ok_or(FundingError::InvalidPeerFundingTx)?;
+
+    let local_capacity = local_tx.output(0).map(|output| output_capacity(&output));
+    let ckb_delta = checked_sub_u128(
+        output_capacity(&remote_output),
+        local_capacity.unwrap_or_default(),
+    )?;
+
+    let udt_delta = match remote_output.type_().to_opt() {
+        Some(type_script) => {
+            let local_amount = match local_tx.output_with_data(0) {
+                Some((_, data)) => read_udt_amount(data.as_ref())?,
+                None => 0,
+            };
+            let remote_amount = read_udt_amount(remote_data.raw_data().as_ref())?;
+            Some((type_script, checked_sub_u128(remote_amount, local_amount)?))
+        }
+        None => None,
+    };
+
+    Ok((ckb_delta, udt_delta))
+}
+
+fn added_peer_outputs(
+    remote_tx: &TransactionView,
+    local_output_len: usize,
+) -> Vec<(packed::CellOutput, packed::Bytes)> {
+    remote_tx
+        .outputs()
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 0 && *index >= local_output_len)
+        .map(|(index, output)| {
+            (
+                output,
+                remote_tx.outputs_data().get(index).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn verify_peer_funding_contribution(
+    local_tx: &TransactionView,
+    remote_tx: &TransactionView,
+    peer_input_cells: &[PeerInputCell],
+) -> Result<(), FundingError> {
+    let (funding_ckb_delta, funding_udt_delta) = funding_output_delta(local_tx, remote_tx)?;
+    let peer_outputs = added_peer_outputs(remote_tx, local_tx.outputs().len());
+
+    let peer_input_ckb = peer_input_cells
+        .iter()
+        .map(|cell| output_capacity(&cell.output))
+        .sum::<u128>();
+    let peer_output_ckb = peer_outputs
+        .iter()
+        .map(|(output, _)| output_capacity(output))
+        .sum::<u128>();
+    let required_ckb = funding_ckb_delta
+        .checked_add(peer_output_ckb)
+        .ok_or(FundingError::OverflowError)?;
+    if peer_input_ckb < required_ckb {
+        debug!(
+            "invalid peer funding tx: peer input CKB {} is less than funding delta {} plus peer output CKB {}",
+            peer_input_ckb, funding_ckb_delta, peer_output_ckb
+        );
+        return Err(FundingError::InvalidPeerFundingTx);
+    }
+
+    if let Some((udt_type_script, funding_udt_delta)) = funding_udt_delta {
+        let peer_input_udt = peer_input_cells.iter().try_fold(0u128, |sum, cell| {
+            if cell.output.type_().to_opt() == Some(udt_type_script.clone()) {
+                sum.checked_add(read_udt_amount(cell.data.as_ref())?)
+                    .ok_or(FundingError::OverflowError)
+            } else {
+                Ok(sum)
+            }
+        })?;
+        let peer_output_udt = peer_outputs.iter().try_fold(0u128, |sum, (output, data)| {
+            if output.type_().to_opt() == Some(udt_type_script.clone()) {
+                sum.checked_add(read_udt_amount(data.raw_data().as_ref())?)
+                    .ok_or(FundingError::OverflowError)
+            } else {
+                Ok(sum)
+            }
+        })?;
+        let required_udt = funding_udt_delta
+            .checked_add(peer_output_udt)
+            .ok_or(FundingError::OverflowError)?;
+        if peer_input_udt < required_udt {
+            debug!(
+                "invalid peer funding tx: peer input UDT {} is less than funding delta {} plus peer output UDT {}",
+                peer_input_udt, funding_udt_delta, peer_output_udt
+            );
+            return Err(FundingError::InvalidPeerFundingTx);
+        }
+    }
+
+    Ok(())
 }

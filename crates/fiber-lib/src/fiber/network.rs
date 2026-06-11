@@ -106,7 +106,7 @@ use fiber_types::{
     PeeledPaymentOnionPacket, PersistentNetworkActorState, PrevTlcInfo, Privkey, Pubkey,
     PublicChannelInfo, RemoveTlcFulfill, RemoveTlcReason, RetryableTlcOperation, RevocationData,
     RouterHop, SettlementData, ShuttingDownFlags, TLCId, TlcErr, TlcErrPacket, TlcErrorCode,
-    TrampolineContext, UdtCfgInfos, NO_SHARED_SECRET,
+    TrampolineContext, UdtCfgInfos,
 };
 
 pub const FIBER_PROTOCOL_ID: ProtocolId = ProtocolId::new(42);
@@ -1885,7 +1885,7 @@ where
             NetworkActorCommand::ConnectPeerWithPubkey(pubkey, addr_type, source, reply) => {
                 let addresses = state.get_peer_addresses_by_pubkey(&pubkey);
                 let has_known_addresses = !addresses.is_empty();
-                let address = select_connect_peer_address(addresses.into_iter(), addr_type);
+                let address = select_connect_peer_address(addresses, addr_type);
                 let Some(addr) = address else {
                     let err = if let Some(transport) = addr_type {
                         Error::NoMatchingAddress(pubkey, transport)
@@ -5688,12 +5688,18 @@ where
                     for prev_tlc in &context.previous_tlcs {
                         let (send, _recv) = oneshot::channel();
                         let rpc_reply = RpcReplyPort::from(send);
-                        let shared_secret = prev_tlc.shared_secret.unwrap_or(NO_SHARED_SECRET);
+                        let Some(shared_secret) = prev_tlc.shared_secret else {
+                            error!(
+                                "Can't fail upstream trampoline TLC without shared secret: payment_hash={:?}, channel_id={:?}, tlc_id={:?}",
+                                payment_hash, prev_tlc.prev_channel_id, prev_tlc.prev_tlc_id
+                            );
+                            continue;
+                        };
                         let inner_error_packet = last_error_packet
                             .as_ref()
                             .map(|packet| packet.onion_packet.clone())
                             .unwrap_or_else(|| {
-                                TlcErrPacket::new(TlcErr::new(error_code), &NO_SHARED_SECRET)
+                                TlcErrPacket::new(TlcErr::new(error_code), &shared_secret)
                                     .onion_packet
                             });
                         let wrapper_packet = TlcErrPacket::new_trampoline_failed(
@@ -5996,14 +6002,14 @@ where
             let mut multiaddr =
                 MultiAddr::from_str(announced_addr.as_str()).expect("valid announced listen addr");
             match multiaddr.pop() {
-                Some(Protocol::P2P(c)) => {
-                    // If the announced listen addr has a peer id, it must match our peer id.
-                    if c.as_ref() != my_peer_id.as_bytes() {
-                        panic!(
-                            "Announced listen addr is using invalid peer id: announced addr {}, actual peer id {:?}",
-                            announced_addr, my_peer_id
-                        );
-                    }
+                Some(Protocol::P2P(c)) if c.as_ref() != my_peer_id.as_bytes() => {
+                    panic!(
+                        "Announced listen addr is using invalid peer id: announced addr {}, actual peer id {:?}",
+                        announced_addr, my_peer_id
+                    );
+                }
+                Some(Protocol::P2P(_)) => {
+                    // Peer id matches, continue.
                 }
                 Some(component) => {
                     // Push this unrecognized component back to the multiaddr.

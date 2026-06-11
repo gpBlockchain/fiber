@@ -1,4 +1,3 @@
-use ckb_sdk::RpcError;
 use ckb_types::{
     core::{tx_pool::TxStatus, TransactionView},
     packed::OutPoint,
@@ -16,22 +15,6 @@ use crate::{
 
 use super::{NetworkActorMessage, ASSUME_NETWORK_ACTOR_ALIVE};
 use fiber_types::Hash256;
-
-/// Check if an RPC error is a permanent error that should not be retried.
-/// Currently checks for TransactionFailedToResolve errors.
-fn is_permanent_error(err: &RpcError) -> bool {
-    match err {
-        RpcError::Rpc(e) => {
-            // Check error code -301 (TransactionFailedToResolve)
-            if e.code.code() == -301 {
-                return true;
-            }
-            // Also check message content as fallback
-            e.message.contains("TransactionFailedToResolve")
-        }
-        _ => false,
-    }
-}
 
 // tx index is not returned on older ckb version, using dummy tx index instead.
 // Waiting for https://github.com/nervosnetwork/ckb/pull/4583/ to be released.
@@ -240,6 +223,37 @@ where
             self.tx_hash,
             self.tx_kind
         );
+
+        // Check the current tx status before broadcasting. The tx may already
+        // be committed on chain (e.g. after a restart of the node that
+        // originally broadcast the funding transaction). Re-broadcasting an
+        // already committed tx returns `-301 TransactionFailedToResolve` from
+        // CKB because the inputs are already spent. Defer to the tracer for
+        // status rather than re-broadcasting.
+        match self.chain_client.get_transaction(self.tx_hash.into()).await {
+            Ok(response) => match response.tx_status {
+                TxStatus::Committed(..) | TxStatus::Rejected(_) => {
+                    tracing::debug!(
+                        "Skipping broadcast for tx {} ({:?}): already {:?}",
+                        self.tx_hash,
+                        self.tx_kind,
+                        response.tx_status,
+                    );
+                    return Ok(());
+                }
+                TxStatus::Pending | TxStatus::Proposed | TxStatus::Unknown => {
+                    // proceed with broadcast
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    "failed to query tx status for {} before broadcasting: {}; will attempt broadcast anyway",
+                    self.tx_hash,
+                    err
+                );
+            }
+        }
+
         match ractor::call_t!(
             self.chain_actor,
             CkbChainMessage::SendTx,
@@ -255,12 +269,6 @@ where
                     self.tx_hash,
                     err
                 );
-                // Check if this is a permanent error that should stop retrying
-                if is_permanent_error(&err) {
-                    let _ = self
-                        .chain_actor
-                        .send_message(CkbChainMessage::ReportRejected(self.tx_hash));
-                }
             }
             Err(err) => {
                 tracing::error!(

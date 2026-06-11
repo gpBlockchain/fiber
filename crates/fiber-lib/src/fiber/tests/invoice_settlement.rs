@@ -22,6 +22,7 @@ use fiber_types::{
     SettlementTlc, ShuttingDownFlags, TLCId,
 };
 use ractor::{ActorProcessingErr, ActorRef};
+use secp256k1::SECP256K1;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -485,7 +486,7 @@ async fn test_send_mpp_to_hold_invoice() {
         .payee_pub_key(target_pubkey.into())
         .allow_mpp(true)
         .payment_secret(gen_rand_sha256_hash())
-        .build()
+        .build_with_sign(|hash| SECP256K1.sign_ecdsa_recoverable(hash, &node_1.private_key.0))
         .expect("build invoice success");
     node_1.insert_invoice(ckb_invoice.clone(), None);
 
@@ -569,7 +570,7 @@ async fn test_mpp_force_close_keeps_preimage_for_onchain_split() {
         .payee_pub_key(node_2.get_public_key().into())
         .allow_mpp(true)
         .payment_secret(gen_rand_sha256_hash())
-        .build()
+        .build_with_sign(|hash| SECP256K1.sign_ecdsa_recoverable(hash, &node_2.private_key.0))
         .expect("build invoice success");
     node_2.insert_invoice(invoice.clone(), None);
 
@@ -686,7 +687,7 @@ async fn test_mpp_payer_force_close_keeps_watchtower_preimage_for_onchain_split(
         .payee_pub_key(node_2.get_public_key().into())
         .allow_mpp(true)
         .payment_secret(gen_rand_sha256_hash())
-        .build()
+        .build_with_sign(|hash| SECP256K1.sign_ecdsa_recoverable(hash, &node_2.private_key.0))
         .expect("build invoice success");
     node_2.insert_invoice(invoice.clone(), None);
 
@@ -767,7 +768,10 @@ async fn test_mpp_payer_force_close_keeps_watchtower_preimage_for_onchain_split(
     insert_watch_channel_with_pending_tlc(&node_1, channels[0], payment_hash);
     replay_watchtower_preimage_events(&node_1, payment_hash, &preimage_events);
     assert!(
-        node_1.store.get_watch_preimage(&payment_hash).is_some(),
+        node_1
+            .store
+            .get_watch_preimage(&NodeId::local(), &payment_hash)
+            .is_some(),
         "watchtower must keep the preimage after the payer force-closes one same-hash MPP split; preimage events: {preimage_events:?}"
     );
 }
@@ -881,7 +885,7 @@ async fn test_mpp_force_close_pending_confirmation_removes_watchtower_preimage_r
         .payee_pub_key(node_2.get_public_key().into())
         .allow_mpp(true)
         .payment_secret(gen_rand_sha256_hash())
-        .build()
+        .build_with_sign(|hash| SECP256K1.sign_ecdsa_recoverable(hash, &node_2.private_key.0))
         .expect("build invoice success");
     node_2.insert_invoice(invoice.clone(), None);
 
@@ -945,7 +949,10 @@ async fn test_mpp_force_close_pending_confirmation_removes_watchtower_preimage_r
     insert_watch_channel_with_pending_tlc(&node_1, channels[0], payment_hash);
     replay_watchtower_preimage_events(&node_1, payment_hash, &preimage_events);
     assert!(
-        node_1.store.get_watch_preimage(&payment_hash).is_some(),
+        node_1
+            .store
+            .get_watch_preimage(&NodeId::local(), &payment_hash)
+            .is_some(),
         "watchtower must keep the preimage while another same-hash split is still waiting for on-chain settlement; preimage events: {preimage_events:?}"
     );
 }

@@ -737,6 +737,28 @@ impl ChannelActorStateStore for Store {
         batch.commit();
     }
 
+    fn insert_channel_actor_state_with_pending_commit_diff(
+        &self,
+        state: ChannelActorState,
+        diff: &CommitDiff,
+    ) {
+        let channel_id = state.get_id();
+        let mut batch = self.batch();
+
+        let kv = KeyValue::PubkeyChannelId((state.get_remote_pubkey(), state.id), state.state);
+        batch.put(kv.key(), kv.value());
+        if let Some(outpoint) = state.get_funding_transaction_outpoint() {
+            let kv = KeyValue::OutPointChannelId(outpoint, state.id);
+            batch.put(kv.key(), kv.value());
+        }
+        let kv = KeyValue::ChannelActorState(state.id, state);
+        batch.put(kv.key(), kv.value());
+
+        let key = [&[PENDING_COMMIT_DIFF_PREFIX], channel_id.as_ref()].concat();
+        batch.put(key, serialize_to_vec(diff, "CommitDiff"));
+        batch.commit();
+    }
+
     fn move_channel_actor_state(&self, old_id: &Hash256, state: ChannelActorState) {
         if old_id == &state.id {
             self.insert_channel_actor_state(state);
@@ -1043,15 +1065,7 @@ impl PreimageStore for Store {
         let key = [&[PREIMAGE_PREFIX], payment_hash.as_ref()].concat();
         self.get(key)
             .map(|v| deserialize_from(v.as_ref(), "Preimage"))
-            // Try to get the preimage from watchtower store
-            .or_else(|| {
-                let prefix = [&[WATCHTOWER_PREIMAGE_PREFIX], payment_hash.as_ref()].concat();
-                let iter = self
-                    .collect_by_prefix_with(prefix.as_slice(), PrefixIterOptions::new().limit(1));
-                iter.into_iter()
-                    .next()
-                    .map(|kv| deserialize_from(kv.value.as_ref(), "Watchtower Preimage"))
-            })
+            .or_else(|| self.get_watch_preimage(&NodeId::local(), payment_hash))
     }
 
     #[cfg(not(feature = "watchtower"))]
@@ -1327,11 +1341,15 @@ impl NetworkGraphStateStore for Store {
 
 #[cfg(feature = "watchtower")]
 impl WatchtowerStore for Store {
-    fn get_watch_channels(&self) -> Vec<ChannelData> {
+    fn get_watch_channels_with_nodes(&self) -> Vec<(NodeId, ChannelData)> {
         let prefix = vec![WATCHTOWER_CHANNEL_PREFIX];
         self.collect_by_prefix(&prefix)
             .into_iter()
-            .map(|kv| deserialize_from(kv.value.as_ref(), "ChannelData"))
+            .filter_map(|kv| {
+                let (node_id, _) = Self::parse_watchtower_channel_key(&kv.key)?;
+                let channel_data = deserialize_from(kv.value.as_ref(), "ChannelData");
+                Some((node_id, channel_data))
+            })
             .collect()
     }
 
@@ -1481,20 +1499,20 @@ impl WatchtowerStore for Store {
         );
     }
 
-    fn get_watch_preimage(&self, payment_hash: &Hash256) -> Option<Hash256> {
-        // The preimage is verified before insert_watch_preimage, so we can just pick one.
-        let prefix = [&[WATCHTOWER_PREIMAGE_PREFIX], payment_hash.as_ref()].concat();
-        self.collect_by_prefix_with(prefix.as_slice(), PrefixIterOptions::new().limit(1))
-            .into_iter()
-            .next()
-            .map(|kv| deserialize_from(kv.value.as_ref(), "Preimage"))
+    fn get_watch_preimage(&self, node_id: &NodeId, payment_hash: &Hash256) -> Option<Hash256> {
+        self.get(Self::watchtower_preimage_key(node_id, payment_hash))
+            .map(|v| deserialize_from(v.as_ref(), "Preimage"))
     }
 
-    fn search_preimage(&self, payment_hash_prefix: &[u8]) -> Option<Hash256> {
+    fn search_preimage(&self, node_id: &NodeId, payment_hash_prefix: &[u8]) -> Option<Hash256> {
         let prefix = [&[WATCHTOWER_PREIMAGE_PREFIX], payment_hash_prefix].concat();
-        self.collect_by_prefix_with(prefix.as_slice(), PrefixIterOptions::new().limit(1))
+        self.collect_by_prefix(prefix.as_slice())
             .into_iter()
-            .next()
+            .find(|kv| {
+                let key = &kv.key;
+                let node_offset = 1 + 32;
+                key.len() >= node_offset && key[node_offset..] == node_id.as_ref()[..]
+            })
             .map(|kv| deserialize_from(kv.value.as_ref(), "Preimage"))
     }
 

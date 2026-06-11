@@ -24,7 +24,7 @@ use crate::utils::payment::is_invoice_fulfilled;
 use crate::{
     ckb::{
         contracts::{get_cell_deps, get_script_by_contract, Contract},
-        is_secp_sighash_placeholder_witness, FundingRequest,
+        is_secp_sighash_placeholder_witness, validate_peer_funding_tx_complexity, FundingRequest,
     },
     fiber::{
         config::{DEFAULT_MIN_SHUTDOWN_FEE, MAX_PAYMENT_TLC_EXPIRY_LIMIT, MIN_TLC_EXPIRY_DELTA},
@@ -864,15 +864,10 @@ where
             }
             FiberChannelMessage::ChannelReady(_channel_ready) => {
                 let flags = match state.state {
-                    ChannelState::AwaitingTxSignatures(flags) => {
-                        if flags.contains(AwaitingTxSignaturesFlags::TX_SIGNATURES_SENT) {
-                            AwaitingChannelReadyFlags::empty()
-                        } else {
-                            return Err(ProcessingChannelError::InvalidState(format!(
-                                "received ChannelReady message, but we're not ready for ChannelReady, state is currently {:?}",
-                                state.state
-                            )));
-                        }
+                    ChannelState::AwaitingTxSignatures(flags)
+                        if flags.contains(AwaitingTxSignaturesFlags::TX_SIGNATURES_SENT) =>
+                    {
+                        AwaitingChannelReadyFlags::empty()
                     }
                     ChannelState::AwaitingChannelReady(flags) => flags,
                     _ => {
@@ -1433,7 +1428,7 @@ where
         // - Extract public key from onion_packet[1..34]
         // - Obtain share secret using DH Key Exchange from the public key
         // and the network private key stored in the network actor state.
-        let should_settle = match add_tlc.onion_packet.clone() {
+        let (should_settle, shared_secret) = match add_tlc.onion_packet.clone() {
             Some(onion_packet) => {
                 let peeled = onion_packet
                     .peel(
@@ -1444,7 +1439,6 @@ where
                     .map_err(|err| ProcessingChannelError::PeelingOnionPacketError(err.to_string()))
                     .map_err(ProcessingChannelError::without_shared_secret)?;
                 let shared_secret = peeled.shared_secret;
-
                 // The onion payload is encrypted but the hash_algorithm field is
                 // not cryptographically bound to the onion. A malicious sender
                 // can set a different hash_algorithm on the wire AddTlc than in
@@ -1456,23 +1450,33 @@ where
                         "TLC hash_algorithm ({:?}) does not match onion hash_algorithm ({:?})",
                         add_tlc.hash_algorithm, peeled.current.hash_algorithm
                     ))
-                    .without_shared_secret());
+                    .with_shared_secret(shared_secret));
                 }
 
-                self.apply_add_tlc_operation_with_peeled_onion_packet(state, add_tlc, peeled)
-                    .map_err(move |err| err.with_shared_secret(shared_secret))?
+                let should_settle = self
+                    .apply_add_tlc_operation_with_peeled_onion_packet(state, add_tlc, peeled)
+                    .map_err(move |err| err.with_shared_secret(shared_secret))?;
+                // Persist the secret only after onion validation succeeds. Delayed
+                // final-hop failures read it later from the stored TLC.
+                state
+                    .tlc_state
+                    .get_mut(&add_tlc.tlc_id)
+                    .expect("expect tlc")
+                    .shared_secret = shared_secret;
+                (should_settle, shared_secret)
             }
             None => {
-                // The TLC is with a NO_SHARED_SECRET and no onion packet.
-                // this may only happen in testing or development environment.
-                debug_assert!(add_tlc.onion_packet.is_none());
-                if cfg!(debug_assertions) {
-                    warn!(
-                        "Processing TLC with no onion packet, only for testing or development environment"
-                    );
-                    // allow test code to manually add tlc without onion packet
-                    true
-                } else {
+                #[cfg(all(debug_assertions, feature = "debug-add-tlc"))]
+                {
+                    state
+                        .tlc_state
+                        .get_mut(&add_tlc.tlc_id)
+                        .expect("expect tlc")
+                        .applied_flags = AppliedFlags::ADD;
+                    (true, NO_SHARED_SECRET)
+                }
+                #[cfg(not(all(debug_assertions, feature = "debug-add-tlc")))]
+                {
                     return Err(ProcessingChannelError::PeelingOnionPacketError(
                         "TLC with no onion packet is not supported".to_string(),
                     )
@@ -1481,12 +1485,11 @@ where
             }
         };
 
-        // we don't need to settle down the tlc if it is not the last hop here,
-        // some e2e tests are calling AddTlc manually, so we can not use onion packet to
-        // check whether it's the last hop here, maybe need to revisit in future.
+        // We don't need to settle the TLC if the authenticated onion payload shows
+        // this node is not the last hop.
         if should_settle {
             self.try_to_settle_down_tlc(myself, state, add_tlc.tlc_id)
-                .map_err(|err| err.without_shared_secret())?;
+                .map_err(|err| err.with_shared_secret(shared_secret))?;
         }
 
         Ok(())
@@ -1771,6 +1774,14 @@ where
         state.check_for_tlc_update(TlcUpdateAction::RemoveTlcPeer)?;
         // TODO: here if we received a invalid remove tlc, it's maybe a malioucious peer,
         // maybe we need to go through shutdown process for this error
+        if matches!(&remove_tlc.reason, RemoveTlcReason::RemoveTlcFail(packet) if packet.is_plaintext())
+        {
+            // Reject before mutating state; plaintext peer failures are unauthenticated and
+            // would otherwise strand the upstream TLC.
+            return Err(ProcessingChannelError::InvalidParameter(
+                "Plaintext TLC failure is not accepted from peers".to_string(),
+            ));
+        }
         state
             .check_remove_tlc_with_reason(TLCId::Offered(remove_tlc.tlc_id), &remove_tlc.reason)?;
         let payment_hash = state
@@ -1877,7 +1888,20 @@ where
 
         if tlc_info.is_offered() {
             if let Some((previous_channel_id, previous_tlc_id)) = tlc_info.forwarding_tlc {
-                let remove_reason = remove_reason.backward(&tlc_info.shared_secret);
+                let remove_reason = match remove_reason.backward(&tlc_info.shared_secret) {
+                    Ok(remove_reason) => remove_reason,
+                    Err(err) => {
+                        warn!(
+                            "Not forwarding TLC failure: error={}, channel_id={:?}, tlc_id={:?}, previous_channel_id={:?}, previous_tlc_id={:?}",
+                            err,
+                            state.get_id(),
+                            tlc_id,
+                            previous_channel_id,
+                            previous_tlc_id
+                        );
+                        return Ok(());
+                    }
+                };
 
                 let _ = self.register_retryable_relay_tlc_remove(
                     TLCId::Received(previous_tlc_id),
@@ -2034,8 +2058,21 @@ where
             replay_order_hint: Some(ReplayOrderHint::RevokeThenCommit),
             created_at_ms: now_timestamp_as_millis_u64(),
         };
+        state.last_was_revoke = false;
+        let signing_flags = match flags {
+            CommitmentSignedFlags::SigningCommitment(flags) => {
+                let flags = flags | SigningCommitmentFlags::OUR_COMMITMENT_SIGNED_SENT;
+                state.update_state(ChannelState::SigningCommitment(flags));
+                Some(flags)
+            }
+            CommitmentSignedFlags::ChannelReady() | CommitmentSignedFlags::PendingShutdown() => {
+                state.set_waiting_ack(myself, true);
+                None
+            }
+        };
         self.store
-            .store_pending_commit_diff(&state.get_id(), &commit_diff);
+            .insert_channel_actor_state_with_pending_commit_diff(state.clone(), &commit_diff);
+
         // Notify outside observers.
         self.network
             .send_message(NetworkActorMessage::new_notification(
@@ -2058,19 +2095,14 @@ where
                 )),
             ))
             .expect(ASSUME_NETWORK_ACTOR_ALIVE);
-        state.last_was_revoke = false;
 
         match flags {
-            CommitmentSignedFlags::SigningCommitment(flags) => {
-                let flags = flags | SigningCommitmentFlags::OUR_COMMITMENT_SIGNED_SENT;
-                state.update_state(ChannelState::SigningCommitment(flags));
+            CommitmentSignedFlags::SigningCommitment(_) => {
+                let flags = signing_flags.expect("signing flags should be set");
                 state.maybe_transfer_to_tx_signatures(flags)?;
             }
-            CommitmentSignedFlags::ChannelReady() => {
-                state.set_waiting_ack(myself, true);
-            }
+            CommitmentSignedFlags::ChannelReady() => {}
             CommitmentSignedFlags::PendingShutdown() => {
-                state.set_waiting_ack(myself, true);
                 state.maybe_transfer_to_shutdown().await?;
             }
         }
@@ -7392,6 +7424,24 @@ impl ChannelActorState {
                         }
                     }
                 }
+                // Defense in depth: reject overly complex peer funding txs before
+                // queueing work on the shared CKB chain actor. The same budget is
+                // re-checked inside VerifyFundingTx prior to any chain lookup.
+                let local_tx_view = self.funding_tx.clone().unwrap_or_default().into_view();
+                let remote_tx_view = msg.tx.clone().into_view();
+                if let Err(err) =
+                    validate_peer_funding_tx_complexity(&local_tx_view, &remote_tx_view)
+                {
+                    error!("rejecting TxUpdate from peer before verification: {}", err);
+                    let abort_reason = err.to_string();
+                    myself
+                        .send_message(ChannelActorMessage::Event(ChannelEvent::Stop(
+                            StopReason::AbortFundingWithDetail(abort_reason),
+                        )))
+                        .expect("myself alive");
+                    return Ok(());
+                }
+
                 if let Err(err) = call!(network, |tx| NetworkActorMessage::Command(
                     NetworkActorCommand::VerifyFundingTx {
                         local_tx: self.funding_tx.clone().unwrap_or_default(),
@@ -7421,6 +7471,18 @@ impl ChannelActorState {
                             .expect("myself alive");
                     }
                     return Ok(());
+                }
+
+                if self.is_acceptor && self.funding_tx.is_none() {
+                    if let Err(err) = self.check_remote_initial_funding_contribution(&msg.tx) {
+                        error!("Rejecting underfunded initial funding tx: {}", err);
+                        myself
+                            .send_message(ChannelActorMessage::Event(ChannelEvent::Stop(
+                                StopReason::AbortFunding,
+                            )))
+                            .expect("myself alive");
+                        return Ok(());
+                    }
                 }
 
                 self.funding_tx = Some(msg.tx.clone());
@@ -7468,6 +7530,66 @@ impl ChannelActorState {
                 self.update_state(ChannelState::CollaboratingFundingTx(flags));
             }
         }
+        Ok(())
+    }
+
+    fn check_remote_initial_funding_contribution(
+        &self,
+        tx: &Transaction,
+    ) -> ProcessingChannelResult {
+        let tx = tx.clone().into_view();
+        let (output, data) =
+            tx.output_with_data(0)
+                .ok_or(ProcessingChannelError::InvalidParameter(
+                    "Funding transaction should have at least one output".to_string(),
+                ))?;
+        let current_capacity: u64 = output.capacity().unpack();
+
+        if self.funding_udt_type_script.is_some() {
+            if current_capacity < self.remote_reserved_ckb_amount {
+                return Err(ProcessingChannelError::InvalidState(format!(
+                    "Initial funding tx CKB capacity {} is less than required remote reserved CKB {}",
+                    current_capacity, self.remote_reserved_ckb_amount
+                )));
+            }
+
+            if data.as_ref().len() < 16 {
+                return Err(ProcessingChannelError::InvalidParameter(
+                    "UDT output data too short, expected at least 16 bytes".to_string(),
+                ));
+            }
+            let mut amount_bytes = [0u8; 16];
+            amount_bytes.copy_from_slice(&data.as_ref()[0..16]);
+            let udt_amount = u128::from_le_bytes(amount_bytes);
+            if udt_amount < self.to_remote_amount {
+                return Err(ProcessingChannelError::InvalidState(format!(
+                    "Initial funding tx UDT amount {} is less than required remote amount {}",
+                    udt_amount, self.to_remote_amount
+                )));
+            }
+
+            return Ok(());
+        }
+
+        let remote_amount = u64::try_from(self.to_remote_amount).map_err(|_| {
+            ProcessingChannelError::InvalidState(
+                "Remote CKB funding amount does not fit into u64".to_string(),
+            )
+        })?;
+        let required_capacity = remote_amount
+            .checked_add(self.remote_reserved_ckb_amount)
+            .ok_or_else(|| {
+                ProcessingChannelError::InvalidState(
+                    "Remote CKB funding amount overflows capacity".to_string(),
+                )
+            })?;
+        if current_capacity < required_capacity {
+            return Err(ProcessingChannelError::InvalidState(format!(
+                "Initial funding tx CKB capacity {} is less than required remote contribution {}",
+                current_capacity, required_capacity
+            )));
+        }
+
         Ok(())
     }
 
@@ -8296,9 +8418,23 @@ impl ChannelActorState {
                 if my_local_commitment_number == peer_remote_commitment_number
                     && my_remote_commitment_number == peer_local_commitment_number
                 {
-                    // commitments are the same, sync up the tlcs
-                    self.set_waiting_ack(myself, false);
-                    self.resend_tlcs_on_reestablish(true)?;
+                    // We persist waiting_ack and CommitDiff before sending CommitmentSigned. If
+                    // the node crashes after that persist but before the frame reaches the peer,
+                    // reestablish sees equal commitment numbers and must replay the stored commit.
+                    if let (true, Some(commit_diff)) =
+                        (my_waiting_ack, pending_commit_diff.as_ref())
+                    {
+                        self.validate_commit_diff_for_replay(reestablish_channel, commit_diff)?;
+                        self.resend_commitment_from_diff(commit_diff)?;
+                        self.last_was_revoke = false;
+                        self.reestablishing = false;
+                        self.pending_reestablish_channel_ready = true;
+                        reestablish_complete = false;
+                    } else {
+                        // commitments are the same, sync up the tlcs
+                        self.set_waiting_ack(myself, false);
+                        self.resend_tlcs_on_reestablish(true)?;
+                    }
                 } else if peer_local_commitment_number
                     .checked_add(1)
                     .is_some_and(|next| my_remote_commitment_number == next)
@@ -8507,7 +8643,7 @@ impl ChannelActorState {
                             )),
                         ))
                         .expect(ASSUME_NETWORK_ACTOR_ALIVE);
-                    debug_event!(network, "resend add tlc from diff");
+                    debug_event!(network, "resend add tlc");
                 }
                 TlcReplayUpdate::Remove(remove) => {
                     network
@@ -8518,7 +8654,7 @@ impl ChannelActorState {
                             )),
                         ))
                         .expect(ASSUME_NETWORK_ACTOR_ALIVE);
-                    debug_event!(network, "resend remove tlc from diff");
+                    debug_event!(network, "resend remove tlc");
                 }
             }
         }
@@ -8572,7 +8708,7 @@ impl ChannelActorState {
 
         Ok(())
     }
-    fn is_tx_final(&self, tx: &Transaction) -> Result<bool, ProcessingChannelError> {
+    pub fn is_tx_final(&self, tx: &Transaction) -> Result<bool, ProcessingChannelError> {
         let tx = tx.clone().into_view();
 
         let first_output = tx
@@ -8611,6 +8747,15 @@ impl ChannelActorState {
         }
 
         if self.funding_udt_type_script.is_some() {
+            // For UDT channels the funding cell carries the negotiated reserved CKB on top
+            // of the UDT amount in cell data. Reject anything below the negotiated total so
+            // that a peer cannot ship an under-funded output[0] (e.g. `local_reserved + 1`
+            // shannon) and silently advance the channel to a state where every close path
+            // requires more CKB than the funding cell holds.
+            if current_capacity < self.get_total_reserved_ckb_amount()? {
+                return Ok(false);
+            }
+
             let (_output, data) =
                 tx.output_with_data(0)
                     .ok_or(ProcessingChannelError::InvalidParameter(
@@ -9434,6 +9579,15 @@ impl ChannelActorState {
 pub trait ChannelActorStateStore {
     fn get_channel_actor_state(&self, id: &Hash256) -> Option<ChannelActorState>;
     fn insert_channel_actor_state(&self, state: ChannelActorState);
+    fn insert_channel_actor_state_with_pending_commit_diff(
+        &self,
+        state: ChannelActorState,
+        diff: &CommitDiff,
+    ) {
+        let channel_id = state.get_id();
+        self.insert_channel_actor_state(state);
+        self.store_pending_commit_diff(&channel_id, diff);
+    }
     fn move_channel_actor_state(&self, old_id: &Hash256, state: ChannelActorState);
     fn delete_channel_actor_state(&self, id: &Hash256);
     fn get_channel_ids_by_pubkey(&self, pubkey: &Pubkey) -> Vec<Hash256>;
