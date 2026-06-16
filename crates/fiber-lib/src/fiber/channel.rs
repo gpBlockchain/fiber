@@ -34,10 +34,11 @@ use crate::{
             get_chain_hash, sign_network_message, FiberMessageWithTarget, CHECK_CHANNELS_INTERVAL,
         },
         types::{
-            peeled_packet_mpp_custom_records, AcceptChannel, AddTlc, AnnouncementSignatures,
-            ChannelReady, ClosingSigned, CommitmentSigned, FiberChannelMessage, FiberMessage,
-            HoldTlc, OpenChannel, ReestablishChannel, RemoveTlc, Shutdown, TrampolineHopPayload,
-            TrampolineOnionPacket, TxCollaborationMsg, TxComplete, TxUpdate,
+            peeled_packet_mpp_custom_records, validate_payment_custom_records_size, AcceptChannel,
+            AddTlc, AnnouncementSignatures, ChannelReady, ClosingSigned, CommitmentSigned,
+            FiberChannelMessage, FiberMessage, HoldTlc, OpenChannel, ReestablishChannel, RemoveTlc,
+            Shutdown, TrampolineHopPayload, TrampolineOnionPacket, TxCollaborationMsg, TxComplete,
+            TxUpdate,
         },
         NetworkActorCommand, NetworkActorEvent, NetworkActorMessage, ASSUME_NETWORK_ACTOR_ALIVE,
     },
@@ -57,18 +58,18 @@ use ckb_types::{
     H256,
 };
 use fiber_types::{
-    blake2b_hash_with_salt, derive_tlc_pubkey, AddTlcCommand, AppliedFlags,
-    AwaitingChannelReadyFlags, AwaitingTxSignaturesFlags, BasicMppPaymentData, ChannelActorData,
-    ChannelAnnouncement, ChannelBasePublicKeys, ChannelConnectivityState, ChannelConstraints,
-    ChannelFlags, ChannelOpenRecord, ChannelState, ChannelTlcInfo, ChannelUpdate,
-    ChannelUpdateChannelFlags, ChannelUpdateMessageFlags, CloseFlags, CollaboratingFundingTxFlags,
-    CommitmentNumbers, EcdsaSignature, ExternalFundingPersistState, Hash256, InMemorySigner,
-    InboundTlcStatus, Musig2Context, NegotiatingFundingFlags, OutboundTlcStatus,
-    PaymentCustomRecords, PeeledPaymentOnionPacket, PendingNotifySettleTlc, PrevTlcInfo, Privkey,
-    Pubkey, PublicChannelInfo, RemoveTlcFulfill, RemoveTlcReason, RetryableTlcOperation,
-    RevocationData, RevokeAndAck, SettlementData, SettlementTlc, ShutdownInfo, ShuttingDownFlags,
-    SigningCommitmentFlags, TLCId, TlcErr, TlcErrPacket, TlcErrorCode, TlcInfo, TlcStatus,
-    NO_SHARED_SECRET,
+    blake2b_hash_with_salt, derive_tlc_pubkey, is_tlc_key_derivation_safe, AddTlcCommand,
+    AppliedFlags, AwaitingChannelReadyFlags, AwaitingTxSignaturesFlags, BasicMppPaymentData,
+    ChannelActorData, ChannelAnnouncement, ChannelBasePublicKeys, ChannelConnectivityState,
+    ChannelConstraints, ChannelFlags, ChannelOpenRecord, ChannelState, ChannelTlcInfo,
+    ChannelUpdate, ChannelUpdateChannelFlags, ChannelUpdateMessageFlags, CloseFlags,
+    CollaboratingFundingTxFlags, CommitmentNumbers, EcdsaSignature, ExternalFundingPersistState,
+    Hash256, InMemorySigner, InboundTlcStatus, Musig2Context, NegotiatingFundingFlags,
+    OutboundTlcStatus, PaymentCustomRecords, PeeledPaymentOnionPacket, PendingNotifySettleTlc,
+    PrevTlcInfo, Privkey, Pubkey, PublicChannelInfo, RemoveTlcFulfill, RemoveTlcReason,
+    RetryableTlcOperation, RevocationData, RevokeAndAck, SettlementData, SettlementTlc,
+    ShutdownInfo, ShuttingDownFlags, SigningCommitmentFlags, TLCId, TlcErr, TlcErrPacket,
+    TlcErrorCode, TlcInfo, TlcStatus, NO_SHARED_SECRET,
 };
 pub use fiber_types::{
     CommitDiff, CommitmentSignedTemplate, ReplayOrderHint, TlcReplayUpdate,
@@ -587,6 +588,8 @@ where
             FiberChannelMessage::TxUpdate(tx) => {
                 if state.ephemeral_config.external_funding.enabled
                     && state.state.is_awaiting_external_funding()
+                    && (state.is_acceptor
+                        || state.ephemeral_config.external_funding.signed_submitted)
                 {
                     self.handle_external_funding_tx_sync(myself, state, tx.tx)
                         .await?;
@@ -1607,12 +1610,18 @@ where
 
         if let Some(TrampolineHopPayload::Final {
             final_amount,
-            final_tlc_expiry_delta: _,
+            final_tlc_expiry_delta,
             payment_preimage,
             custom_records,
         }) = last_hop_inner_onion
         {
-            if forward_amount != add_tlc.amount || forward_amount > final_amount {
+            let inner_mpp_record = custom_records.as_ref().and_then(BasicMppPaymentData::read);
+            let final_amount_matches = inner_mpp_record
+                .as_ref()
+                .map(|record| record.total_amount == final_amount && add_tlc.amount <= final_amount)
+                .unwrap_or(add_tlc.amount == final_amount);
+
+            if forward_amount != add_tlc.amount || !final_amount_matches {
                 error!(
                     "final amount mismatch for trampoline final hop: {:?}, {:?}, {:?} add_tlc.amount: {:?}",
                     payment_hash, forward_amount, final_amount, add_tlc.amount
@@ -1620,8 +1629,15 @@ where
                 return Err(ProcessingChannelError::FinalIncorrectHTLCAmount);
             }
 
+            let required_final_expiry = now_timestamp_as_millis_u64()
+                .checked_add(final_tlc_expiry_delta.max(MIN_TLC_EXPIRY_DELTA))
+                .ok_or(ProcessingChannelError::IncorrectFinalTlcExpiry)?;
+            if add_tlc.expiry < peeled_payment_expiry || add_tlc.expiry < required_final_expiry {
+                return Err(ProcessingChannelError::IncorrectFinalTlcExpiry);
+            }
+
             final_payment_preimage = payment_preimage;
-            mpp_record = custom_records.as_ref().and_then(BasicMppPaymentData::read);
+            mpp_record = inner_mpp_record;
             final_custom_records = custom_records;
         } else {
             if forward_amount != add_tlc.amount {
@@ -1724,6 +1740,8 @@ where
             }
 
             if let Some(custom_records) = final_custom_records {
+                validate_payment_custom_records_size(&custom_records)
+                    .map_err(ProcessingChannelError::InvalidParameter)?;
                 self.store
                     .insert_payment_custom_records(&payment_hash, custom_records);
             }
@@ -1759,6 +1777,7 @@ where
         state.check_for_tlc_update(TlcUpdateAction::AddTlcPeer {
             amount: add_tlc.amount,
         })?;
+        state.check_tlc_expiry(add_tlc.expiry)?;
         let tlc_info = state.create_inbounding_tlc(add_tlc.clone())?;
         state.check_insert_tlc(&tlc_info)?;
         state.tlc_state.add_received_tlc(tlc_info);
@@ -1855,7 +1874,9 @@ where
             signature: None,
         });
 
-        state.step_shutting_down(flags).await?;
+        state
+            .step_shutting_down(flags | ShuttingDownFlags::THEIR_SHUTDOWN_SENT)
+            .await?;
         Ok(())
     }
 
@@ -3608,7 +3629,7 @@ where
                     &open_channel, &pubkey
                 );
 
-                let counterpart_pubkeys = (&open_channel).into();
+                let counterpart_pubkeys: ChannelBasePublicKeys = (&open_channel).into();
                 let public = open_channel.is_public();
                 let is_one_way = open_channel.is_one_way();
                 let OpenChannel {
@@ -3672,6 +3693,19 @@ where
                     max_tlc_number_in_flight,
                     *remote_max_tlc_number_in_flight,
                 )?;
+
+                if !is_tlc_key_derivation_safe(
+                    &counterpart_pubkeys.tlc_base_key,
+                    first_per_commitment_point,
+                ) || !is_tlc_key_derivation_safe(
+                    &counterpart_pubkeys.tlc_base_key,
+                    second_per_commitment_point,
+                ) {
+                    return Err(Box::new(ProcessingChannelError::InvalidParameter(
+                        "peer tlc_basepoint and per_commitment_point derive to invalid key"
+                            .to_string(),
+                    )));
+                }
 
                 let mut state = ChannelActorState::new_inbound_channel(
                     *channel_id,
@@ -7280,6 +7314,18 @@ impl ChannelActorState {
             accept_channel.max_tlc_number_in_flight,
         )?;
 
+        if !is_tlc_key_derivation_safe(
+            &accept_channel.tlc_basepoint,
+            &accept_channel.first_per_commitment_point,
+        ) || !is_tlc_key_derivation_safe(
+            &accept_channel.tlc_basepoint,
+            &accept_channel.second_per_commitment_point,
+        ) {
+            return Err(ProcessingChannelError::InvalidParameter(
+                "peer tlc_basepoint and per_commitment_point derive to invalid key".to_string(),
+            ));
+        }
+
         self.update_state(ChannelState::NegotiatingFunding(
             NegotiatingFundingFlags::INIT_SENT,
         ));
@@ -7659,8 +7705,6 @@ impl ChannelActorState {
             }
         };
 
-        self.clean_up_failed_tlcs();
-
         #[cfg(debug_assertions)]
         {
             debug!(
@@ -7672,6 +7716,8 @@ impl ChannelActorState {
 
         let (commitment_tx, settlement_data) =
             self.verify_and_complete_tx(commitment_signed.funding_tx_partial_signature)?;
+
+        self.clean_up_failed_tlcs();
 
         // Notify outside observers.
         self.network()
@@ -9536,7 +9582,7 @@ impl ChannelActorState {
 
     /// Perform the next step in shutting down the channel.
     async fn step_shutting_down(&mut self, flags: ShuttingDownFlags) -> ProcessingChannelResult {
-        let mut flags = flags | ShuttingDownFlags::THEIR_SHUTDOWN_SENT;
+        let mut flags = flags;
 
         // Only automatically reply shutdown if only their shutdown message is sent.
         // If we are in a state other than only their shutdown is sent,

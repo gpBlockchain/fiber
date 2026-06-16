@@ -1,8 +1,12 @@
 #![cfg(not(target_arch = "wasm32"))]
-use crate::fiber::channel::ChannelActorStateStore;
-use crate::fiber::config::{DEFAULT_FINAL_TLC_EXPIRY_DELTA, DEFAULT_TLC_EXPIRY_DELTA};
+use crate::fiber::channel::{ChannelActorStateStore, ChannelCommand, ChannelCommandWithId};
+use crate::fiber::config::{
+    DEFAULT_FINAL_TLC_EXPIRY_DELTA, DEFAULT_TLC_EXPIRY_DELTA, MIN_TLC_EXPIRY_DELTA,
+};
 use crate::fiber::graph::*;
-use crate::fiber::network::{NetworkActorCommand, NetworkActorMessage, SendOnionPacketCommand};
+use crate::fiber::network::{
+    DebugEvent, NetworkActorCommand, NetworkActorMessage, SendOnionPacketCommand,
+};
 use crate::fiber::payment::SendPaymentCommand;
 use crate::fiber::types::{TrampolineHopPayload, TrampolineOnionPacket};
 use crate::fiber::{FeatureVector, PaymentStatus, Privkey, Pubkey};
@@ -10,19 +14,126 @@ use crate::gen_rand_fiber_public_key;
 use crate::invoice::{Currency, InvoiceBuilder, InvoiceStore, PreimageStore};
 use crate::tests::test_utils::*;
 use crate::{
-    create_channel_with_nodes, gen_rand_sha256_hash, ChannelParameters, HUGE_CKB_AMOUNT,
+    create_channel_with_nodes, gen_rand_fiber_private_key, gen_rand_sha256_hash,
+    now_timestamp_as_millis_u64, ChannelParameters, NetworkServiceEvent, HUGE_CKB_AMOUNT,
     MIN_RESERVED_CKB,
 };
 use fiber_types::Hash256;
 use fiber_types::{
-    CurrentPaymentHopData, HashAlgorithm, PeeledPaymentOnionPacket, PrevTlcInfo, TlcErrorCode,
+    AddTlcCommand, AppliedFlags, CommitmentNumbers, CurrentPaymentHopData, HashAlgorithm,
+    InboundTlcStatus, PaymentHopData, PeeledPaymentOnionPacket, PrevTlcInfo, TLCId, TlcErrorCode,
+    TlcInfo, TlcStatus,
 };
-use ractor::RpcReplyPort;
+use ractor::{call, RpcReplyPort};
 use rand::Rng;
 use secp256k1::SECP256K1;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{debug, error};
+
+async fn send_manual_trampoline_final_keysend_tlc(
+    node_a: &NetworkNode,
+    node_b: &NetworkNode,
+    channel_id: Hash256,
+    actual_amount: u128,
+    final_amount: u128,
+    add_tlc_expiry: u64,
+    final_tlc_expiry_delta: u64,
+) -> Hash256 {
+    let payment_preimage = gen_rand_sha256_hash();
+    let hash_algorithm = HashAlgorithm::Sha256;
+    let payment_hash: Hash256 = hash_algorithm.hash(payment_preimage).into();
+
+    let trampoline_onion = TrampolineOnionPacket::create(
+        Privkey::from_slice(&[2u8; 32]),
+        vec![node_b.get_public_key()],
+        vec![TrampolineHopPayload::Final {
+            final_amount,
+            final_tlc_expiry_delta,
+            payment_preimage: Some(payment_preimage),
+            custom_records: None,
+        }],
+        Some(payment_hash.as_ref().to_vec()),
+        SECP256K1,
+    )
+    .expect("create trampoline onion")
+    .into_bytes();
+
+    let mut final_hop = PaymentHopData {
+        amount: actual_amount,
+        expiry: add_tlc_expiry,
+        hash_algorithm,
+        ..Default::default()
+    };
+    final_hop.set_trampoline_onion(trampoline_onion);
+
+    let packet = PeeledPaymentOnionPacket::create(
+        gen_rand_fiber_private_key(),
+        vec![
+            PaymentHopData {
+                amount: actual_amount,
+                expiry: add_tlc_expiry,
+                hash_algorithm,
+                next_hop: Some(node_b.get_public_key()),
+                ..Default::default()
+            },
+            final_hop,
+        ],
+        Some(payment_hash.as_ref().to_vec()),
+        SECP256K1,
+    )
+    .expect("create payment onion packet");
+
+    call!(node_a.network_actor, |rpc_reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+            ChannelCommandWithId {
+                channel_id,
+                command: ChannelCommand::AddTlc(
+                    AddTlcCommand {
+                        amount: actual_amount,
+                        payment_hash,
+                        attempt_id: None,
+                        expiry: add_tlc_expiry,
+                        hash_algorithm,
+                        onion_packet: packet.next.clone(),
+                        shared_secret: packet.shared_secret,
+                        is_trampoline_hop: false,
+                        previous_tlc: None,
+                    },
+                    rpc_reply,
+                ),
+            },
+        ))
+    })
+    .expect("node_a alive")
+    .expect("source add tlc should be accepted");
+
+    payment_hash
+}
+
+async fn expect_add_tlc_failed(
+    node: &mut NetworkNode,
+    payment_hash: Hash256,
+    expected_error: TlcErrorCode,
+) {
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(5),
+        node.expect_event(|event| match event {
+            NetworkServiceEvent::DebugEvent(DebugEvent::AddTlcFailed(_, hash, err)) => {
+                assert_eq!(hash, &payment_hash);
+                assert_eq!(err.error_code, expected_error);
+                true
+            }
+            _ => false,
+        }),
+    )
+    .await;
+
+    assert!(
+        rejected.is_ok(),
+        "malicious trampoline final TLC was accepted: {payment_hash:?}"
+    );
+}
 
 #[tokio::test]
 async fn test_trampoline_routing_basic() {
@@ -1958,6 +2069,68 @@ async fn test_trampoline_forwarding_rejects_missing_previous_tlc() {
 }
 
 #[tokio::test]
+async fn test_trampoline_final_keysend_rejects_inner_amount_above_actual_tlc() {
+    init_tracing();
+
+    let (nodes, channels) = create_n_nodes_network_with_visibility(
+        &[((0, 1), (MIN_RESERVED_CKB + 100000, HUGE_CKB_AMOUNT), true)],
+        2,
+    )
+    .await;
+    let [node_a, mut node_b] = nodes.try_into().expect("2 nodes");
+
+    let actual_amount = 1000;
+    let payment_hash = send_manual_trampoline_final_keysend_tlc(
+        &node_a,
+        &node_b,
+        channels[0],
+        actual_amount,
+        actual_amount + 1,
+        now_timestamp_as_millis_u64() + DEFAULT_FINAL_TLC_EXPIRY_DELTA,
+        DEFAULT_FINAL_TLC_EXPIRY_DELTA,
+    )
+    .await;
+
+    expect_add_tlc_failed(
+        &mut node_b,
+        payment_hash,
+        TlcErrorCode::FinalIncorrectTlcAmount,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_trampoline_final_keysend_rejects_expiry_shorter_than_inner_delta() {
+    init_tracing();
+
+    let (nodes, channels) = create_n_nodes_network_with_visibility(
+        &[((0, 1), (MIN_RESERVED_CKB + 100000, HUGE_CKB_AMOUNT), true)],
+        2,
+    )
+    .await;
+    let [node_a, mut node_b] = nodes.try_into().expect("2 nodes");
+
+    let amount = 1000;
+    let payment_hash = send_manual_trampoline_final_keysend_tlc(
+        &node_a,
+        &node_b,
+        channels[0],
+        amount,
+        amount,
+        now_timestamp_as_millis_u64() + MIN_TLC_EXPIRY_DELTA + 5_000,
+        DEFAULT_FINAL_TLC_EXPIRY_DELTA,
+    )
+    .await;
+
+    expect_add_tlc_failed(
+        &mut node_b,
+        payment_hash,
+        TlcErrorCode::FinalIncorrectExpiryDelta,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_trampoline_forwarding_fee_insufficient_manual_packet() {
     init_tracing();
     // A -- B. We test B.
@@ -2157,6 +2330,224 @@ async fn test_trampoline_forwarding_fee_insufficient_equal_amount() {
         }
         Ok(_) => panic!("Should have failed with FeeInsufficient"),
     }
+}
+
+#[tokio::test]
+async fn test_trampoline_forwarding_rejects_outgoing_expiry_beyond_upstream_budget() {
+    init_tracing();
+
+    // A -- B -- C. We test B's trampoline forwarding boundary.
+    let (nodes, channels) = create_n_nodes_network_with_visibility(
+        &[
+            ((0, 1), (MIN_RESERVED_CKB + 100000, HUGE_CKB_AMOUNT), true),
+            ((1, 2), (MIN_RESERVED_CKB + 100000, HUGE_CKB_AMOUNT), true),
+        ],
+        3,
+    )
+    .await;
+    let [_node_a, node_b, node_c] = nodes.try_into().expect("3 nodes");
+    let channel_ab = channels[0];
+
+    node_b
+        .with_network_graph_mut(|graph| graph.set_add_rand_expiry_delta(false))
+        .await;
+    wait_until_graph_channel_has_update(&node_b, &node_b, &node_c).await;
+
+    let payment_hash = gen_rand_sha256_hash();
+    let amount_to_forward = 1000;
+    let forwarding_fee = 100;
+    let incoming_amount = amount_to_forward + forwarding_fee;
+    let upstream_expiry =
+        now_timestamp_as_millis_u64() + DEFAULT_TLC_EXPIRY_DELTA + MIN_TLC_EXPIRY_DELTA;
+
+    let mut node_b_state = node_b.get_channel_actor_state(channel_ab);
+    node_b_state.tlc_state.add_received_tlc(TlcInfo {
+        status: TlcStatus::Inbound(InboundTlcStatus::Committed),
+        tlc_id: TLCId::Received(1),
+        amount: incoming_amount,
+        payment_hash,
+        total_amount: None,
+        payment_secret: None,
+        attempt_id: None,
+        expiry: upstream_expiry,
+        hash_algorithm: HashAlgorithm::Sha256,
+        onion_packet: None,
+        shared_secret: [0u8; 32],
+        is_trampoline_hop: false,
+        created_at: CommitmentNumbers::new(),
+        removed_reason: None,
+        forwarding_tlc: None,
+        removed_confirmed_at: None,
+        applied_flags: AppliedFlags::empty(),
+    });
+    node_b.update_channel_actor_state(node_b_state, None).await;
+
+    let forward_payload = TrampolineHopPayload::Forward {
+        next_node_id: node_c.pubkey,
+        amount_to_forward,
+        build_max_fee_amount: forwarding_fee,
+        tlc_expiry_delta: DEFAULT_FINAL_TLC_EXPIRY_DELTA,
+        tlc_expiry_limit: DEFAULT_FINAL_TLC_EXPIRY_DELTA,
+        max_parts: None,
+        hash_algorithm: HashAlgorithm::Sha256,
+    };
+    let payloads = vec![
+        forward_payload,
+        TrampolineHopPayload::Final {
+            final_amount: amount_to_forward,
+            final_tlc_expiry_delta: DEFAULT_FINAL_TLC_EXPIRY_DELTA,
+            payment_preimage: None,
+            custom_records: None,
+        },
+    ];
+    let trampoline_onion_bytes = TrampolineOnionPacket::create(
+        Privkey::from_slice(&[2u8; 32]),
+        vec![node_b.pubkey, node_c.pubkey],
+        payloads,
+        Some(payment_hash.as_ref().to_vec()),
+        SECP256K1,
+    )
+    .expect("create onion")
+    .into_bytes();
+
+    let mut current_hop_data = CurrentPaymentHopData {
+        amount: incoming_amount,
+        expiry: upstream_expiry,
+        payment_preimage: None,
+        hash_algorithm: HashAlgorithm::Sha256,
+        funding_tx_hash: Default::default(),
+        custom_records: None,
+    };
+    current_hop_data.set_trampoline_onion(trampoline_onion_bytes);
+
+    let peeled_packet = PeeledPaymentOnionPacket {
+        current: current_hop_data,
+        shared_secret: [0u8; 32],
+        next: None,
+    };
+
+    let (sender, receiver) = oneshot::channel();
+    let command = NetworkActorCommand::SendPaymentOnionPacket(
+        SendOnionPacketCommand {
+            peeled_onion_packet: peeled_packet,
+            previous_tlc: Some(PrevTlcInfo::new_with_shared_secret(
+                channel_ab,
+                1,
+                forwarding_fee,
+                [0u8; 32],
+            )),
+            payment_hash,
+            attempt_id: None,
+        },
+        RpcReplyPort::from(sender),
+    );
+
+    node_b
+        .network_actor
+        .send_message(NetworkActorMessage::Command(command))
+        .expect("send command");
+
+    let res = receiver.await.expect("recv result");
+    match res {
+        Err(tlc_err) => assert_eq!(tlc_err.error_code, TlcErrorCode::IncorrectTlcExpiry),
+        Ok(_) => panic!("Should have failed with IncorrectTlcExpiry"),
+    }
+}
+
+#[tokio::test]
+async fn test_trampoline_final_rejects_expiry_below_inner_delta() {
+    init_tracing();
+
+    let (node_a, mut node_b, channel_id) =
+        create_nodes_with_established_channel(HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT, true).await;
+
+    let amount = 1000;
+    let hash_algorithm = HashAlgorithm::Sha256;
+    let payment_preimage = gen_rand_sha256_hash();
+    let payment_hash: Hash256 = hash_algorithm.hash(payment_preimage).into();
+    let add_tlc_expiry = now_timestamp_as_millis_u64() + DEFAULT_TLC_EXPIRY_DELTA;
+
+    let trampoline_onion_bytes = TrampolineOnionPacket::create(
+        Privkey::from_slice(&[2u8; 32]),
+        vec![node_b.pubkey],
+        vec![TrampolineHopPayload::Final {
+            final_amount: amount,
+            final_tlc_expiry_delta: DEFAULT_FINAL_TLC_EXPIRY_DELTA,
+            payment_preimage: Some(payment_preimage),
+            custom_records: None,
+        }],
+        Some(payment_hash.as_ref().to_vec()),
+        SECP256K1,
+    )
+    .expect("create trampoline onion")
+    .into_bytes();
+
+    let mut final_hop = PaymentHopData {
+        amount,
+        expiry: add_tlc_expiry,
+        hash_algorithm,
+        ..Default::default()
+    };
+    final_hop.set_trampoline_onion(trampoline_onion_bytes);
+    let hops_infos = vec![
+        PaymentHopData {
+            amount,
+            expiry: add_tlc_expiry,
+            next_hop: Some(node_b.pubkey),
+            hash_algorithm,
+            ..Default::default()
+        },
+        final_hop,
+    ];
+    let packet = PeeledPaymentOnionPacket::create(
+        Privkey::from_slice(&[3u8; 32]),
+        hops_infos,
+        Some(payment_hash.as_ref().to_vec()),
+        SECP256K1,
+    )
+    .expect("create payment onion");
+
+    let message = |rpc_reply| -> NetworkActorMessage {
+        NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+            ChannelCommandWithId {
+                channel_id,
+                command: ChannelCommand::AddTlc(
+                    AddTlcCommand {
+                        amount,
+                        payment_hash,
+                        attempt_id: None,
+                        expiry: add_tlc_expiry,
+                        hash_algorithm,
+                        onion_packet: packet.next.clone(),
+                        shared_secret: packet.shared_secret,
+                        is_trampoline_hop: false,
+                        previous_tlc: None,
+                    },
+                    rpc_reply,
+                ),
+            },
+        ))
+    };
+
+    let res = call!(node_a.network_actor, message).expect("node_a alive");
+    assert!(res.is_ok());
+
+    let node_b_pubkey = node_b.pubkey;
+    node_b
+        .expect_event(|event| match event {
+            NetworkServiceEvent::DebugEvent(DebugEvent::AddTlcFailed(
+                pubkey,
+                failed_payment_hash,
+                err,
+            )) => {
+                assert_eq!(pubkey, &node_b_pubkey);
+                assert_eq!(failed_payment_hash, &payment_hash);
+                assert_eq!(err.error_code, TlcErrorCode::FinalIncorrectExpiryDelta);
+                true
+            }
+            _ => false,
+        })
+        .await;
 }
 
 #[tokio::test]

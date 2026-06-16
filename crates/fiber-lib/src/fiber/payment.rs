@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::network::{SendOnionPacketCommand, SendPaymentResponse, ASSUME_NETWORK_MYSELF_ALIVE};
-use super::types::BroadcastMessageWithTimestamp;
+use super::types::{validate_payment_custom_records_size, BroadcastMessageWithTimestamp};
 use crate::fiber::channel::{ChannelActorStateStore, ProcessingChannelError};
 use crate::fiber::config::{
     DEFAULT_FINAL_TLC_EXPIRY_DELTA, MAX_PAYMENT_TLC_EXPIRY_LIMIT, MIN_TLC_EXPIRY_DELTA,
@@ -15,7 +15,6 @@ use crate::fiber::graph::{
 };
 use crate::fiber::network::{
     NetworkActorStateStore, DEFAULT_CHAIN_ACTOR_TIMEOUT, DEFAULT_PAYMENT_TRY_LIMIT,
-    MAX_CUSTOM_RECORDS_SIZE,
 };
 use crate::fiber::{
     KeyPair, NetworkActorCommand, NetworkActorEvent, NetworkActorMessage,
@@ -48,7 +47,41 @@ use tracing::{debug, error, instrument, warn};
 // This is a safety guard against excessive route construction work.
 const MAX_TRAMPOLINE_HOPS_LIMIT: u16 = 5;
 const DEFAULT_MAX_FEE_RATE: u64 = 5;
-const MAX_FEE_RATE_DENOMINATOR: u128 = 1000;
+pub(crate) const MAX_FEE_RATE_DENOMINATOR: u128 = 1000;
+
+fn check_trampoline_outgoing_tlc_expiry(
+    session: &mut PaymentSession,
+    hops: &[PaymentHopData],
+) -> Result<(), Error> {
+    let Some(max_expiry) = session
+        .request
+        .trampoline_context
+        .as_ref()
+        .and_then(|context| context.max_outgoing_tlc_expiry)
+    else {
+        return Ok(());
+    };
+
+    let Some(first_hop) = hops.first() else {
+        session.last_error_code = Some(TlcErrorCode::IncorrectTlcExpiry);
+        return Err(Error::SendPaymentError(
+            "Trampoline forwarding requires at least one outgoing hop".to_string(),
+        ));
+    };
+
+    if first_hop.expiry > max_expiry {
+        session.last_error_code = Some(TlcErrorCode::IncorrectTlcExpiry);
+        error!(
+            "trampoline outgoing tlc expiry {} exceeds upstream budget {}",
+            first_hop.expiry, max_expiry
+        );
+        return Err(Error::SendPaymentError(
+            "Trampoline outgoing TLC expiry exceeds upstream expiry budget".to_string(),
+        ));
+    }
+
+    Ok(())
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SendPaymentDataBuilder {
@@ -268,14 +301,7 @@ impl SendPaymentDataBuilder {
         }
 
         if let Some(custom_records) = &self.custom_records {
-            if custom_records.data.values().map(|v| v.len()).sum::<usize>()
-                > MAX_CUSTOM_RECORDS_SIZE
-            {
-                return Err(format!(
-                    "the sum size of custom_records's value can not more than {} bytes",
-                    MAX_CUSTOM_RECORDS_SIZE
-                ));
-            }
+            validate_payment_custom_records_size(custom_records)?;
         }
 
         if let Some(max_parts) = self.max_parts {
@@ -1172,6 +1198,7 @@ where
                     Error::BuildPaymentRouteError(format!("Failed to build route, {}", e))
                 })?;
 
+            check_trampoline_outgoing_tlc_expiry(session, &hops)?;
             attempt.update_route(hops);
         }
 
@@ -1291,6 +1318,8 @@ where
                         self.apply_trampoline_forwarding_fee(session, source, &hops, &mut max_fee)
                             .await?;
                     }
+
+                    check_trampoline_outgoing_tlc_expiry(session, &hops)?;
 
                     let new_attempt_id = if session.is_dry_run() {
                         0
@@ -1448,6 +1477,8 @@ where
         session: &mut PaymentSession,
         attempt: &mut Attempt,
     ) -> Result<(), Error> {
+        check_trampoline_outgoing_tlc_expiry(session, &attempt.route_hops)?;
+
         assert_ne!(attempt.route_hops[0].funding_tx_hash, Hash256::default());
 
         let peeled_onion_packet = match PeeledPaymentOnionPacket::create_with_session_key_fn(
