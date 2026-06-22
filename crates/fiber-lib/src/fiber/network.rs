@@ -63,8 +63,8 @@ use super::types::{
     BroadcastMessageWithTimestamp, FiberMessage, ForwardTlcResult, GossipMessage, Init, OpenChannel,
 };
 use super::{
-    FiberConfig, InFlightCkbTxActor, InFlightCkbTxActorArguments, InFlightCkbTxKind,
-    ASSUME_NETWORK_ACTOR_ALIVE,
+    FiberConfig, InFlightCkbTxActor, InFlightCkbTxActorArguments, InFlightCkbTxActorMessage,
+    InFlightCkbTxKind, ASSUME_NETWORK_ACTOR_ALIVE,
 };
 use crate::ckb::client::CkbChainClient;
 use crate::ckb::config::UdtCfgInfosExt;
@@ -173,6 +173,11 @@ const MAX_GRAPH_MISSING_BROADCAST_MESSAGE_TIMESTAMP_DRIFT: Duration =
 const FUNDING_RETRY_MAX_TOTAL_ATTEMPTS: u32 = 5;
 const FUNDING_RETRY_BASE_MILLIS: u64 = 2000;
 const FUNDING_RETRY_MAX_MILLIS: u64 = 60_000;
+
+/// Debounce interval for payment retry scans triggered by ChannelReady
+/// (e.g. after reestablish). Prevents resource exhaustion when a peer
+/// rapidly reconnects/reestablishes.
+const CHANNEL_READY_RETRY_DEBOUNCE_MS: u64 = 60_000;
 
 fn funding_retry_delay(retry_count: u32) -> Duration {
     let shift = retry_count.min(63);
@@ -1458,22 +1463,66 @@ where
                     ))
                     .expect(ASSUME_NETWORK_MYSELF_ALIVE);
 
-                // Retry payment attempts whose first hop uses this channel
-                for attempt in self
-                    .store
-                    .get_pending_attempts_by_channel_outpoint(&channel_outpoint)
-                {
-                    debug!(
-                        "Retrying payment attempt {:?} for channel {:?} reestablished",
-                        attempt.payment_hash, channel_outpoint
-                    );
-                    if let Err(err) = myself.send_message(NetworkActorMessage::new_event(
-                        NetworkActorEvent::RetrySendPayment(attempt.payment_hash, Some(attempt.id)),
-                    )) {
+                // Retry payment attempts whose first hop uses this channel.
+                // Debounce to prevent resource exhaustion from repeated
+                // reestablish events. Uses trailing-edge: when suppressed,
+                // schedules a deferred scan so the trailing ChannelReady
+                // (e.g. from a real reconnect) is never lost.
+                let now = now_timestamp_as_millis_u64();
+                let should_scan = state
+                    .last_channel_ready_scan
+                    .get(&channel_outpoint)
+                    .is_none_or(|last| {
+                        now.saturating_sub(*last) >= CHANNEL_READY_RETRY_DEBOUNCE_MS
+                    });
+                if should_scan {
+                    state
+                        .last_channel_ready_scan
+                        .insert(channel_outpoint.clone(), now);
+                    for attempt in self
+                        .store
+                        .get_pending_attempts_by_channel_outpoint(&channel_outpoint)
+                    {
                         debug!(
-                            "Failed to register payment retry for {:?}: {:?}",
-                            attempt.payment_hash, err
+                            "Retrying payment attempt {:?} for channel {:?} reestablished",
+                            attempt.payment_hash, channel_outpoint
                         );
+                        if let Err(err) = myself.send_message(NetworkActorMessage::new_event(
+                            NetworkActorEvent::RetrySendPayment(
+                                attempt.payment_hash,
+                                Some(attempt.id),
+                            ),
+                        )) {
+                            debug!(
+                                "Failed to register payment retry for {:?}: {:?}",
+                                attempt.payment_hash, err
+                            );
+                        }
+                    }
+                } else {
+                    // Trailing edge: schedule a deferred scan at cooldown expiry
+                    // so the last ChannelReady in a burst isn't lost.
+                    let elapsed = state
+                        .last_channel_ready_scan
+                        .get(&channel_outpoint)
+                        .map(|last| now.saturating_sub(*last))
+                        .unwrap_or(0);
+                    let remaining = CHANNEL_READY_RETRY_DEBOUNCE_MS.saturating_sub(elapsed);
+                    if remaining > 0 {
+                        let ch_outpoint = channel_outpoint.clone();
+                        let ch_id = channel_id;
+                        let pk = pubkey;
+                        debug!(
+                            "Debounced ChannelReady retry scan for {:?}, scheduling deferred scan in {}ms",
+                            ch_outpoint, remaining
+                        );
+                        myself.send_after(Duration::from_millis(remaining), move || {
+                            NetworkActorMessage::new_event(NetworkActorEvent::ChannelReady(
+                                ch_id,
+                                pk,
+                                ch_outpoint,
+                            ))
+                        });
                     }
                 }
 
@@ -1505,11 +1554,13 @@ where
                 tx_index,
                 timestamp,
             ) => {
+                state.inflight_tracers.remove(&outpoint.tx_hash().into());
                 state
                     .on_funding_transaction_confirmed(outpoint, block_hash, tx_index, timestamp)
                     .await;
             }
             NetworkActorEvent::FundingTransactionFailed(outpoint) => {
+                state.inflight_tracers.remove(&outpoint.tx_hash().into());
                 error!("Funding transaction failed: {:?}", outpoint);
                 state.abort_funding(Either::Right(outpoint)).await;
             }
@@ -1525,6 +1576,7 @@ where
                 force,
                 close_by_us,
             ) => {
+                state.inflight_tracers.remove(&tx_hash.clone().into());
                 state
                     .on_closing_transaction_confirmed(
                         &pubkey,
@@ -1536,6 +1588,7 @@ where
                     .await;
             }
             NetworkActorEvent::ClosingTransactionFailed(pubkey, channel_id, tx_hash) => {
+                state.inflight_tracers.remove(&tx_hash.clone().into());
                 error!(
                     "Closing transaction failed for channel {:?}, tx hash: {:?}, peer pubkey: {:?}",
                     &channel_id, &tx_hash, &pubkey
@@ -1615,6 +1668,7 @@ where
                             StopReason::Abandon => "Channel was abandoned".to_string(),
                             StopReason::AbortFunding => "Funding transaction aborted".to_string(),
                             StopReason::AbortFundingWithDetail(detail) => detail.clone(),
+                            StopReason::FundingFailed => "Funding transaction failed".to_string(),
                             StopReason::PeerDisConnected => {
                                 "Peer disconnected during channel opening".to_string()
                             }
@@ -3942,6 +3996,11 @@ pub struct NetworkActorState<S, C> {
     // until the peer accepts the channel and we build the unsigned funding tx.
     pending_external_funding_replies:
         HashMap<Hash256, RpcReplyPort<Result<OpenChannelWithExternalFundingResponse, String>>>,
+
+    last_channel_ready_scan: HashMap<OutPoint, u64>,
+    // Active in-flight CKB tx tracers by tx_hash. Stores actor refs so
+    // send_tx can upgrade a trace-only actor with the actual transaction.
+    inflight_tracers: HashMap<Hash256, ActorRef<InFlightCkbTxActorMessage>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4607,6 +4666,10 @@ where
         tx_hash: Hash256,
         tx_kind: InFlightCkbTxKind,
     ) -> crate::Result<()> {
+        if self.inflight_tracers.contains_key(&tx_hash) {
+            debug!("Skipping duplicate tracer for tx {:?}", tx_hash);
+            return Ok(());
+        }
         let handler = InFlightCkbTxActor {
             chain_actor: self.chain_actor.clone(),
             chain_client: self.chain_client.clone(),
@@ -4616,13 +4679,14 @@ where
             confirmations: CKB_TX_TRACING_CONFIRMATIONS,
         };
 
-        Actor::spawn_linked(
+        let (actor_ref, _) = Actor::spawn_linked(
             None,
             handler,
             InFlightCkbTxActorArguments { transaction: None },
             self.network.get_cell(),
         )
         .await?;
+        self.inflight_tracers.insert(tx_hash, actor_ref);
 
         Ok(())
     }
@@ -4632,7 +4696,17 @@ where
         tx: TransactionView,
         tx_kind: InFlightCkbTxKind,
     ) -> crate::Result<()> {
-        let tx_hash = tx.hash().into();
+        let tx_hash: Hash256 = tx.hash().into();
+        if let Some(existing) = self.inflight_tracers.get(&tx_hash) {
+            // A trace-only actor already exists for this tx_hash.
+            // Upgrade it with the actual transaction for broadcasting.
+            debug!(
+                "Upgrading existing tracer for tx {:?} with transaction payload",
+                tx_hash
+            );
+            existing.send_message(InFlightCkbTxActorMessage::SendTx(tx))?;
+            return Ok(());
+        }
         debug!(
             "Spawning InFlightCkbTxActor: tx_hash={:?}, tx_kind={:?}, confirmations={}, inputs={}, outputs={}",
             tx_hash,
@@ -4651,7 +4725,7 @@ where
             confirmations: CKB_TX_TRACING_CONFIRMATIONS,
         };
 
-        Actor::spawn_linked(
+        let (actor_ref, _) = Actor::spawn_linked(
             None,
             handler,
             InFlightCkbTxActorArguments {
@@ -4660,6 +4734,7 @@ where
             self.network.get_cell(),
         )
         .await?;
+        self.inflight_tracers.insert(tx_hash, actor_ref);
 
         Ok(())
     }
@@ -4683,7 +4758,7 @@ where
         self.send_message_to_channel_actor(
             channel_id,
             None,
-            ChannelActorMessage::Event(ChannelEvent::Stop(StopReason::AbortFunding)),
+            ChannelActorMessage::Event(ChannelEvent::Stop(StopReason::FundingFailed)),
         )
         .await;
     }
@@ -5494,6 +5569,7 @@ where
             .find(|(_, id)| *id == &channel_id)
         {
             self.pending_channels.remove(outpoint);
+            self.last_channel_ready_scan.remove(outpoint);
         }
         self.outpoint_channel_map.retain(|_, id| *id != channel_id);
     }
@@ -6182,6 +6258,8 @@ where
             },
             inflight_payments: Default::default(),
             pending_external_funding_replies: Default::default(),
+            last_channel_ready_scan: Default::default(),
+            inflight_tracers: Default::default(),
         };
 
         let node_announcement = state.get_or_create_new_node_announcement_message();
