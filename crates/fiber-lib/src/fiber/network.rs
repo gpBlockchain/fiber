@@ -968,6 +968,14 @@ fn fiber_channel_kind(message: &FiberChannelMessage) -> String {
     message.to_string()
 }
 
+fn fiber_message_kind(message: &FiberMessage) -> String {
+    match message {
+        FiberMessage::Init(_) => "Init".to_string(),
+        FiberMessage::ChannelInitialization(_) => "OpenChannel".to_string(),
+        FiberMessage::ChannelNormalOperation(msg) => fiber_channel_kind(msg),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CapturedInboundFiberMessage {
     pub peer: Pubkey,
@@ -2015,6 +2023,23 @@ where
             FiberMessage::ChannelInitialization(open_channel) => {
                 state.check_feature_compatibility(&peer_pubkey)?;
                 let temp_channel_id = open_channel.channel_id;
+                if let Some(intercept) = state.fiber_intercept_for(temp_channel_id).cloned() {
+                    if intercept.should_drop_inbound("OpenChannel") {
+                        debug!(
+                            "dropping inbound OpenChannel for channel {temp_channel_id:?} (fiber message intercept)"
+                        );
+                        return Ok(());
+                    }
+                    if intercept.should_capture_inbound("OpenChannel") {
+                        state.captured_inbound_fiber_messages.push_back(
+                            CapturedInboundFiberMessage {
+                                peer: peer_pubkey,
+                                message: FiberMessage::ChannelInitialization(open_channel),
+                            },
+                        );
+                        return Ok(());
+                    }
+                }
                 let peer_pubkey_for_logging = peer_pubkey;
                 match state
                     .on_open_channel_msg(peer_pubkey, open_channel.clone())
@@ -2171,6 +2196,7 @@ where
                     debug!("Channel accepted: {:?} -> {:?}", old, new);
                     state.channels.insert(new, channel);
                     state.peer_channel_index.replace_channel(pubkey, old, new);
+                    state.remap_fiber_intercept(old, new);
 
                     state.move_channel_open_record_to_final_id(&old, new);
 
@@ -2639,6 +2665,7 @@ where
                             old_channel_id,
                             new_channel_id,
                         );
+                        state.remap_fiber_intercept(old_channel_id, new_channel_id);
                     }
                 }
 
@@ -2824,25 +2851,27 @@ where
                         .push_back(message_with_target);
                     return Ok(());
                 }
-                if let FiberMessage::ChannelNormalOperation(channel_message) =
-                    &message_with_target.message
-                {
-                    if let Some(intercept) = state
-                        .fiber_intercept_for(channel_message.get_channel_id())
-                        .cloned()
-                    {
-                        let kind = fiber_channel_kind(channel_message);
+                let intercept_key = match &message_with_target.message {
+                    FiberMessage::ChannelNormalOperation(channel_message) => Some((
+                        channel_message.get_channel_id(),
+                        fiber_channel_kind(channel_message),
+                    )),
+                    FiberMessage::ChannelInitialization(open_channel) => {
+                        Some((open_channel.channel_id, "OpenChannel".to_string()))
+                    }
+                    FiberMessage::Init(_) => None,
+                };
+                if let Some((channel_id, kind)) = intercept_key {
+                    if let Some(intercept) = state.fiber_intercept_for(channel_id).cloned() {
                         if intercept.should_drop_outbound(&kind) {
                             debug!(
-                                "dropping outbound {kind} for channel {:?} (fiber message intercept)",
-                                channel_message.get_channel_id()
+                                "dropping outbound {kind} for channel {channel_id:?} (fiber message intercept)"
                             );
                             return Ok(());
                         }
                         if intercept.should_hold_outbound(&kind) {
                             debug!(
-                                "holding outbound {kind} for channel {:?} (fiber message intercept)",
-                                channel_message.get_channel_id()
+                                "holding outbound {kind} for channel {channel_id:?} (fiber message intercept)"
                             );
                             state
                                 .held_outbound_fiber_messages
@@ -3079,9 +3108,9 @@ where
 
                 if num_outbound_peers >= state.min_outbound_peers {
                     debug!(
-                                "Already connected to {} outbound peers, wants a minimal of {} peers, skipping connecting to more peers",
-                                num_outbound_peers, state.min_outbound_peers
-                            );
+                        "Already connected to {} outbound peers, wants a minimal of {} peers, skipping connecting to more peers",
+                        num_outbound_peers, state.min_outbound_peers
+                    );
                     return Ok(());
                 }
 
@@ -3119,9 +3148,9 @@ where
                     debug!("Peer to connect: {:?}, {:?}", pubkey, addresses);
                     if let Some(peer) = state.peer_session_map.get(&pubkey) {
                         debug!(
-                                    "Randomly selected peer {:?} already connected with session id {:?}, skipping connection",
-                                    pubkey, peer.session_id
-                                );
+                            "Randomly selected peer {:?} already connected with session id {:?}, skipping connection",
+                            pubkey, peer.session_id
+                        );
                         continue;
                     }
                     if state.requested_disconnect_peers.contains(&pubkey) {
@@ -3655,9 +3684,7 @@ where
                 if empty {
                     state.fiber_message_intercepts.remove(&channel_id);
                 } else {
-                    state
-                        .fiber_message_intercepts
-                        .insert(channel_id, intercept);
+                    state.fiber_message_intercepts.insert(channel_id, intercept);
                 }
                 let _ = reply.send(Ok(()));
             }
@@ -4714,7 +4741,9 @@ where
             self.store.insert_channel_actor_state(actor_state.clone());
             if let Some(ref store_actor) = state.store_actor {
                 if let Err(err) = store_actor.cast(StoreActorMessage::RequestBackup) {
-                    error!("Failed to request store backup after on-chain settlement finalization: {err}");
+                    error!(
+                        "Failed to request store backup after on-chain settlement finalization: {err}"
+                    );
                 }
             }
         }
@@ -4779,9 +4808,7 @@ where
         if !hold_still_owned {
             trace!(
                 "Ignoring stale hold timeout after ownership handoff: payment_hash={:?} channel_id={:?} tlc_id={:?}",
-                payment_hash,
-                channel_id,
-                tlc_id,
+                payment_hash, channel_id, tlc_id,
             );
             return;
         }
@@ -6178,9 +6205,7 @@ where
     ) -> Result<FundingTx, FundingError> {
         trace!(
             "Forwarding Fund request to ckb chain actor: local_amount={}, remote_amount={}, fee_rate={}",
-            request.local_amount,
-            request.remote_amount,
-            request.funding_fee_rate,
+            request.local_amount, request.remote_amount, request.funding_fee_rate,
         );
         call_t!(
             self.chain_actor.clone(),
@@ -6332,6 +6357,16 @@ where
         self.fiber_message_intercepts
             .get(&channel_id)
             .or_else(|| self.fiber_message_intercepts.get(&Hash256::default()))
+    }
+
+    fn remap_fiber_intercept(&mut self, old: Hash256, new: Hash256) {
+        if old == Hash256::default() {
+            return;
+        }
+        if let Some(mut intercept) = self.fiber_message_intercepts.remove(&old) {
+            intercept.channel_id = new;
+            self.fiber_message_intercepts.insert(new, intercept);
+        }
     }
 
     fn retry_pending_payments_for_channel(
@@ -7554,10 +7589,7 @@ where
         let mut to_deliver = Vec::new();
         let limit = command.count.unwrap_or(u64::MAX);
         while let Some(captured) = self.captured_inbound_fiber_messages.pop_front() {
-            let kind = match &captured.message {
-                FiberMessage::ChannelNormalOperation(msg) => fiber_channel_kind(msg),
-                other => format!("{other:?}"),
-            };
+            let kind = fiber_message_kind(&captured.message);
             let kind_ok = command.kinds.is_empty()
                 || FiberMessageIntercept::kind_matches(&command.kinds, &kind);
             if kind_ok && (to_deliver.len() as u64) < limit {
@@ -7569,16 +7601,23 @@ where
         self.captured_inbound_fiber_messages = leftover;
         let delivered = to_deliver.len() as u64;
         for captured in to_deliver {
-            let FiberMessage::ChannelNormalOperation(msg) = captured.message else {
-                continue;
-            };
-            let channel_id = msg.get_channel_id();
-            self.send_message_to_channel_actor(
-                channel_id,
-                Some(captured.peer),
-                ChannelActorMessage::PeerMessage(msg),
-            )
-            .await;
+            match captured.message {
+                FiberMessage::ChannelNormalOperation(msg) => {
+                    let channel_id = msg.get_channel_id();
+                    self.send_message_to_channel_actor(
+                        channel_id,
+                        Some(captured.peer),
+                        ChannelActorMessage::PeerMessage(msg),
+                    )
+                    .await;
+                }
+                FiberMessage::ChannelInitialization(open_channel) => {
+                    self.on_open_channel_msg(captured.peer, open_channel)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
+                FiberMessage::Init(_) => {}
+            }
         }
         Ok(delivered)
     }
@@ -7591,10 +7630,7 @@ where
         let mut to_send = Vec::new();
         let limit = command.count.unwrap_or(u64::MAX);
         while let Some(held) = self.held_outbound_fiber_messages.pop_front() {
-            let kind = match &held.message {
-                FiberMessage::ChannelNormalOperation(msg) => fiber_channel_kind(msg),
-                other => format!("{other:?}"),
-            };
+            let kind = fiber_message_kind(&held.message);
             let kind_ok = command.kinds.is_empty()
                 || FiberMessageIntercept::kind_matches(&command.kinds, &kind);
             if kind_ok && (to_send.len() as u64) < limit {

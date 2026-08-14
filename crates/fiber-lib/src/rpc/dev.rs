@@ -836,8 +836,11 @@ fn captured_fiber_message_from(captured: CapturedInboundFiberMessage) -> Capture
         FiberMessage::ChannelNormalOperation(other) => {
             kind = other.to_string();
         }
-        other => {
-            kind = format!("{other:?}");
+        FiberMessage::ChannelInitialization(_) => {
+            kind = "OpenChannel".to_string();
+        }
+        FiberMessage::Init(_) => {
+            kind = "Init".to_string();
         }
     }
     CapturedFiberMessage {
