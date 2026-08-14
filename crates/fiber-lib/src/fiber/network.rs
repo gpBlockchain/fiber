@@ -17,9 +17,7 @@ use secp256k1::SECP256K1;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::borrow::Cow;
-#[cfg(test)]
-use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Display};
 #[cfg(test)]
 use std::num::NonZeroUsize;
@@ -865,6 +863,244 @@ impl TestFiberMessageHold {
     }
 }
 
+/// Debug-only intercept used to drive a malicious or faulty peer from outside the node.
+#[derive(Debug, Clone, Default)]
+pub struct FiberMessageIntercept {
+    pub channel_id: Hash256,
+    pub suppress_outbound_revoke_and_ack: bool,
+    pub capture_inbound: bool,
+    pub inbound_capture_kinds: Vec<String>,
+    pub inbound_drop_kinds: Vec<String>,
+    pub outbound_drop_kinds: Vec<String>,
+    pub outbound_hold_kinds: Vec<String>,
+}
+
+impl FiberMessageIntercept {
+    fn kind_matches(patterns: &[String], kind: &str) -> bool {
+        patterns.iter().any(|pattern| kind_name_eq(pattern, kind))
+    }
+
+    fn should_drop_inbound(&self, kind: &str) -> bool {
+        Self::kind_matches(&self.inbound_drop_kinds, kind)
+    }
+
+    fn should_capture_inbound(&self, kind: &str) -> bool {
+        if Self::kind_matches(&self.inbound_capture_kinds, kind) {
+            return true;
+        }
+        self.capture_inbound && self.inbound_capture_kinds.is_empty()
+    }
+
+    fn should_drop_outbound(&self, kind: &str) -> bool {
+        (self.suppress_outbound_revoke_and_ack && kind_name_eq(kind, "RevokeAndAck"))
+            || Self::kind_matches(&self.outbound_drop_kinds, kind)
+    }
+
+    fn should_hold_outbound(&self, kind: &str) -> bool {
+        Self::kind_matches(&self.outbound_hold_kinds, kind)
+    }
+}
+
+fn kind_name_eq(left: &str, right: &str) -> bool {
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter(|ch| *ch != '_' && *ch != '-')
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    normalize(left) == normalize(right)
+}
+
+fn fiber_channel_kind(message: &FiberChannelMessage) -> String {
+    message.to_string()
+}
+
+#[derive(Debug, Clone)]
+pub struct CapturedInboundFiberMessage {
+    pub peer: Pubkey,
+    pub message: FiberMessage,
+}
+
+#[derive(Debug, Clone)]
+pub enum RawChannelMessageKind {
+    CommitmentSigned,
+    Shutdown,
+    AddTlc,
+    RemoveTlc,
+    ReestablishChannel,
+    TxAbort,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendRawChannelMessageResult {
+    pub funding_tx_partial_signature: Option<musig2::PartialSignature>,
+    pub next_commitment_nonce: Option<musig2::PubNonce>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendRawChannelMessageCommand {
+    pub channel_id: Hash256,
+    pub kind: RawChannelMessageKind,
+    pub nonce_commitment_number: Option<u64>,
+    pub close_script: Option<Script>,
+    pub fee_rate: Option<u64>,
+    pub amount: Option<u128>,
+    pub payment_hash: Option<Hash256>,
+    pub expiry: Option<u64>,
+    pub tlc_id: Option<u64>,
+    pub remove_fail_error_code: Option<String>,
+    pub local_commitment_number: Option<u64>,
+    pub remote_commitment_number: Option<u64>,
+    pub abort_message: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeliverCapturedFiberMessagesCommand {
+    pub count: Option<u64>,
+    pub kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReleaseHeldOutboundFiberMessagesCommand {
+    pub count: Option<u64>,
+    pub kinds: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelMusig2Public {
+    pub local_funding_pubkey: Pubkey,
+    pub remote_funding_pubkey: Pubkey,
+    pub local_commitment_number: u64,
+    pub remote_commitment_number: u64,
+    pub local_pubnonce: musig2::PubNonce,
+    pub last_committed_remote_nonce: musig2::PubNonce,
+    pub next_commitment_nonce: musig2::PubNonce,
+    pub own_commitment_message: [u8; 32],
+    pub peer_commitment_message: [u8; 32],
+    pub funding_outpoint: OutPoint,
+    pub local_first: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildShutdownTxMessageCommand {
+    pub channel_id: Hash256,
+    pub local_close_script: Script,
+    pub remote_close_script: Script,
+    pub local_fee_rate: u64,
+    pub remote_fee_rate: u64,
+}
+
+fn channel_musig2_public_from_state(
+    state: &ChannelActorState,
+) -> Result<ChannelMusig2Public, String> {
+    use crate::utils::tx::compute_tx_message;
+    use fiber_types::Musig2Context;
+
+    let local_funding_pubkey = state.local_channel_public_keys.funding_pubkey;
+    let remote_funding_pubkey = state
+        .remote_channel_public_keys
+        .as_ref()
+        .ok_or_else(|| "missing remote channel public keys".to_string())?
+        .funding_pubkey;
+    let local_commitment_number = state.get_local_commitment_number();
+    let local_pubnonce = state
+        .signer
+        .derive_musig2_nonce(local_commitment_number, Musig2Context::Commitment)
+        .public_nonce();
+    let last_committed_remote_nonce = state
+        .last_committed_remote_nonce
+        .clone()
+        .ok_or_else(|| "missing last committed remote nonce".to_string())?;
+    let own_commitment_message = compute_tx_message(
+        &state
+            .build_commitment_tx_and_settlement_data(true)
+            .map_err(|e| e.to_string())?
+            .0,
+    );
+    let peer_commitment_message = compute_tx_message(
+        &state
+            .build_commitment_tx_and_settlement_data(false)
+            .map_err(|e| e.to_string())?
+            .0,
+    );
+    let funding_outpoint = state
+        .get_funding_transaction_outpoint()
+        .ok_or_else(|| "missing funding outpoint".to_string())?;
+    Ok(ChannelMusig2Public {
+        local_funding_pubkey,
+        remote_funding_pubkey,
+        local_commitment_number,
+        remote_commitment_number: state.get_remote_commitment_number(),
+        local_pubnonce,
+        last_committed_remote_nonce,
+        next_commitment_nonce: state.get_next_commitment_nonce(),
+        own_commitment_message,
+        peer_commitment_message,
+        funding_outpoint,
+        local_first: local_funding_pubkey <= remote_funding_pubkey,
+    })
+}
+
+fn sign_commitment_signed(
+    state: &ChannelActorState,
+    nonce_commitment_number: Option<u64>,
+) -> Result<(musig2::PartialSignature, musig2::PubNonce), String> {
+    use crate::utils::tx::compute_tx_message;
+    use fiber_types::Musig2Context;
+    use musig2::{sign_partial, AggNonce, KeyAggContext};
+
+    let next_commitment_nonce = state.get_next_commitment_nonce();
+    let Some(nonce_cn) = nonce_commitment_number else {
+        let (partial, _, _) = state
+            .build_and_sign_commitment_tx()
+            .map_err(|e| e.to_string())?;
+        return Ok((partial, next_commitment_nonce));
+    };
+
+    let local_funding_pubkey = state.local_channel_public_keys.funding_pubkey;
+    let remote_funding_pubkey = state
+        .remote_channel_public_keys
+        .as_ref()
+        .ok_or_else(|| "missing remote channel public keys".to_string())?
+        .funding_pubkey;
+    let local_first = local_funding_pubkey <= remote_funding_pubkey;
+    let key_agg_ctx = KeyAggContext::new(if local_first {
+        [local_funding_pubkey, remote_funding_pubkey]
+    } else {
+        [remote_funding_pubkey, local_funding_pubkey]
+    })
+    .map_err(|e| e.to_string())?;
+    let secnonce = state
+        .signer
+        .derive_musig2_nonce(nonce_cn, Musig2Context::Commitment);
+    let local_pubnonce = secnonce.public_nonce();
+    let remote_nonce = state
+        .last_committed_remote_nonce
+        .clone()
+        .ok_or_else(|| "missing last committed remote nonce".to_string())?;
+    let agg_nonce = if local_first {
+        AggNonce::sum([local_pubnonce, remote_nonce])
+    } else {
+        AggNonce::sum([remote_nonce, local_pubnonce])
+    };
+    let msg = compute_tx_message(
+        &state
+            .build_commitment_tx_and_settlement_data(true)
+            .map_err(|e| e.to_string())?
+            .0,
+    );
+    let partial: musig2::PartialSignature = sign_partial(
+        &key_agg_ctx,
+        state.signer.funding_key.clone(),
+        secnonce,
+        &agg_nonce,
+        msg,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((partial, next_commitment_nonce))
+}
+
 /// The struct here is used both internally and as an API to the outside world.
 /// If we want to send a reply to the caller, we need to wrap the message with
 /// a RpcReplyPort. Since outsider users have no knowledge of RpcReplyPort, we
@@ -960,6 +1196,26 @@ pub enum NetworkActorCommand {
     ReleaseTestHeldFiberMessages(RpcReplyPort<Result<(), String>>),
     #[cfg(test)]
     GetTestHeldFiberMessageCount(RpcReplyPort<usize>),
+    SetFiberMessageIntercept(FiberMessageIntercept, RpcReplyPort<Result<(), String>>),
+    TakeCapturedFiberMessages(RpcReplyPort<Vec<CapturedInboundFiberMessage>>),
+    DeliverCapturedFiberMessages(
+        DeliverCapturedFiberMessagesCommand,
+        RpcReplyPort<Result<u64, String>>,
+    ),
+    TakeHeldOutboundFiberMessages(RpcReplyPort<Vec<FiberMessageWithTarget>>),
+    ReleaseHeldOutboundFiberMessages(
+        ReleaseHeldOutboundFiberMessagesCommand,
+        RpcReplyPort<Result<u64, String>>,
+    ),
+    SendRawChannelMessage(
+        SendRawChannelMessageCommand,
+        RpcReplyPort<Result<SendRawChannelMessageResult, String>>,
+    ),
+    GetChannelMusig2Public(Hash256, RpcReplyPort<Result<ChannelMusig2Public, String>>),
+    BuildShutdownTxMessage(
+        BuildShutdownTxMessageCommand,
+        RpcReplyPort<Result<[u8; 32], String>>,
+    ),
     // Check peer send us Init message in an expected time, otherwise disconnect with the peer.
     CheckPeerInit(Pubkey, SessionId),
     // Pace persisted channel reestablishment without blocking the NetworkActor. The channel ids
@@ -1719,6 +1975,24 @@ where
                     }
                     return Ok(());
                 }
+                if let Some(intercept) = state.fiber_intercept_for(channel_id).cloned() {
+                    let kind = fiber_channel_kind(&msg);
+                    if intercept.should_drop_inbound(&kind) {
+                        debug!(
+                            "dropping inbound {kind} for channel {channel_id:?} (fiber message intercept)"
+                        );
+                        return Ok(());
+                    }
+                    if intercept.should_capture_inbound(&kind) {
+                        state.captured_inbound_fiber_messages.push_back(
+                            CapturedInboundFiberMessage {
+                                peer: peer_pubkey,
+                                message: FiberMessage::ChannelNormalOperation(msg),
+                            },
+                        );
+                        return Ok(());
+                    }
+                }
                 state
                     .send_message_to_channel_actor(
                         channel_id,
@@ -2281,8 +2555,39 @@ where
                         .push_back(message_with_target);
                     return Ok(());
                 }
-                let FiberMessageWithTarget { target, message } = message_with_target;
-                state.send_fiber_message_to_pubkey(&target, message).await?;
+                if let FiberMessage::ChannelNormalOperation(channel_message) =
+                    &message_with_target.message
+                {
+                    if let Some(intercept) = state
+                        .fiber_intercept_for(channel_message.get_channel_id())
+                        .cloned()
+                    {
+                        let kind = fiber_channel_kind(channel_message);
+                        if intercept.should_drop_outbound(&kind) {
+                            debug!(
+                                "dropping outbound {kind} for channel {:?} (fiber message intercept)",
+                                channel_message.get_channel_id()
+                            );
+                            return Ok(());
+                        }
+                        if intercept.should_hold_outbound(&kind) {
+                            debug!(
+                                "holding outbound {kind} for channel {:?} (fiber message intercept)",
+                                channel_message.get_channel_id()
+                            );
+                            state
+                                .held_outbound_fiber_messages
+                                .push_back(message_with_target);
+                            return Ok(());
+                        }
+                    }
+                }
+                state
+                    .send_fiber_message_to_pubkey(
+                        &message_with_target.target,
+                        message_with_target.message,
+                    )
+                    .await?;
             }
             #[cfg(test)]
             NetworkActorCommand::SetTestFiberMessageHold(hold, reply) => {
@@ -2850,6 +3155,55 @@ where
             NetworkActorCommand::InstallTestChannelActor(channel_id, actor, reply) => {
                 state.channels.insert(channel_id, actor);
                 let _ = reply.send(());
+            }
+            NetworkActorCommand::SetFiberMessageIntercept(intercept, reply) => {
+                let channel_id = intercept.channel_id;
+                let empty = intercept.inbound_capture_kinds.is_empty()
+                    && intercept.inbound_drop_kinds.is_empty()
+                    && intercept.outbound_drop_kinds.is_empty()
+                    && intercept.outbound_hold_kinds.is_empty()
+                    && !intercept.capture_inbound
+                    && !intercept.suppress_outbound_revoke_and_ack;
+                if empty {
+                    state.fiber_message_intercepts.remove(&channel_id);
+                } else {
+                    state
+                        .fiber_message_intercepts
+                        .insert(channel_id, intercept);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            NetworkActorCommand::TakeCapturedFiberMessages(reply) => {
+                let messages = state.captured_inbound_fiber_messages.drain(..).collect();
+                let _ = reply.send(messages);
+            }
+            NetworkActorCommand::DeliverCapturedFiberMessages(command, reply) => {
+                let result = state.deliver_captured_fiber_messages(command).await;
+                let _ = reply.send(result);
+            }
+            NetworkActorCommand::TakeHeldOutboundFiberMessages(reply) => {
+                let messages = state.held_outbound_fiber_messages.drain(..).collect();
+                let _ = reply.send(messages);
+            }
+            NetworkActorCommand::ReleaseHeldOutboundFiberMessages(command, reply) => {
+                let result = state.release_held_outbound_fiber_messages(command).await;
+                let _ = reply.send(result);
+            }
+            NetworkActorCommand::SendRawChannelMessage(command, reply) => {
+                let result = state.send_raw_channel_message(command).await;
+                let _ = reply.send(result);
+            }
+            NetworkActorCommand::GetChannelMusig2Public(channel_id, reply) => {
+                let result = state
+                    .store
+                    .get_channel_actor_state(&channel_id)
+                    .ok_or_else(|| format!("channel {channel_id:?} not found"))
+                    .and_then(|channel| channel_musig2_public_from_state(&channel));
+                let _ = reply.send(result);
+            }
+            NetworkActorCommand::BuildShutdownTxMessage(command, reply) => {
+                let result = state.build_shutdown_tx_message(command).await;
+                let _ = reply.send(result);
             }
             NetworkActorCommand::SettleTlcSet(payment_hash, channel_tlc_ids) => {
                 self.settle_tlc_set(myself, state, payment_hash, channel_tlc_ids);
@@ -5123,6 +5477,9 @@ pub struct NetworkActorState<S, C> {
     test_fiber_message_hold: Option<TestFiberMessageHold>,
     #[cfg(test)]
     test_held_fiber_messages: VecDeque<FiberMessageWithTarget>,
+    fiber_message_intercepts: HashMap<Hash256, FiberMessageIntercept>,
+    captured_inbound_fiber_messages: VecDeque<CapturedInboundFiberMessage>,
+    held_outbound_fiber_messages: VecDeque<FiberMessageWithTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -5165,6 +5522,12 @@ where
         + 'static,
     C: CkbChainClient + Clone + Send + Sync + 'static,
 {
+    fn fiber_intercept_for(&self, channel_id: Hash256) -> Option<&FiberMessageIntercept> {
+        self.fiber_message_intercepts
+            .get(&channel_id)
+            .or_else(|| self.fiber_message_intercepts.get(&Hash256::default()))
+    }
+
     fn retry_pending_payments_for_channel(
         &self,
         myself: &ActorRef<NetworkActorMessage>,
@@ -6170,6 +6533,234 @@ where
             Some(session) => self.send_fiber_message_to_session(session, message).await,
             None => Err(Error::PeerNotFound(*pubkey)),
         }
+    }
+
+    async fn send_raw_channel_message(
+        &self,
+        command: SendRawChannelMessageCommand,
+    ) -> Result<SendRawChannelMessageResult, String> {
+        use crate::fiber::channel::DEFAULT_COMMITMENT_FEE_RATE;
+        use crate::fiber::types::{CommitmentSigned, Shutdown};
+        use ckb_types::core::FeeRate;
+
+        let channel = self
+            .store
+            .get_channel_actor_state(&command.channel_id)
+            .ok_or_else(|| format!("channel {:?} not found", command.channel_id))?;
+        let peer = channel.get_remote_pubkey();
+        let empty_result = SendRawChannelMessageResult {
+            funding_tx_partial_signature: None,
+            next_commitment_nonce: None,
+        };
+        let (message, result) = match command.kind {
+            RawChannelMessageKind::CommitmentSigned => {
+                let (partial, next) =
+                    sign_commitment_signed(&channel, command.nonce_commitment_number)?;
+                (
+                    FiberMessage::commitment_signed(CommitmentSigned {
+                        channel_id: command.channel_id,
+                        funding_tx_partial_signature: partial,
+                        next_commitment_nonce: next.clone(),
+                    }),
+                    SendRawChannelMessageResult {
+                        funding_tx_partial_signature: Some(partial),
+                        next_commitment_nonce: Some(next),
+                    },
+                )
+            }
+            RawChannelMessageKind::Shutdown => {
+                let close_script = command
+                    .close_script
+                    .unwrap_or_else(|| channel.get_local_shutdown_script());
+                let fee_rate = command.fee_rate.unwrap_or(DEFAULT_COMMITMENT_FEE_RATE);
+                (
+                    FiberMessage::shutdown(Shutdown {
+                        channel_id: command.channel_id,
+                        close_script,
+                        fee_rate: FeeRate::from_u64(fee_rate),
+                    }),
+                    empty_result,
+                )
+            }
+            RawChannelMessageKind::AddTlc => {
+                use crate::fiber::types::AddTlc;
+                use crate::now_timestamp_as_millis_u64;
+                use fiber_types::HashAlgorithm;
+
+                let tlc_id = command
+                    .tlc_id
+                    .unwrap_or_else(|| channel.get_next_offering_tlc_id().into());
+                let expiry = command
+                    .expiry
+                    .unwrap_or_else(|| now_timestamp_as_millis_u64().saturating_add(86_400_000));
+                (
+                    FiberMessage::add_tlc(AddTlc {
+                        channel_id: command.channel_id,
+                        tlc_id,
+                        amount: command.amount.unwrap_or(1),
+                        payment_hash: command.payment_hash.unwrap_or_default(),
+                        expiry,
+                        hash_algorithm: HashAlgorithm::default(),
+                        onion_packet: None,
+                    }),
+                    empty_result,
+                )
+            }
+            RawChannelMessageKind::RemoveTlc => {
+                use crate::fiber::types::RemoveTlc;
+                use fiber_types::{TlcErr, TlcErrPacket, TlcErrorCode, NO_SHARED_SECRET};
+                use std::str::FromStr;
+
+                let tlc_id = command
+                    .tlc_id
+                    .ok_or_else(|| "tlc_id is required for RemoveTlc".to_string())?;
+                let error_code = command
+                    .remove_fail_error_code
+                    .as_deref()
+                    .unwrap_or("TemporaryChannelFailure");
+                let err = TlcErrorCode::from_str(error_code)
+                    .map_err(|_| format!("invalid remove_fail_error_code: {error_code}"))?;
+                (
+                    FiberMessage::remove_tlc(RemoveTlc {
+                        channel_id: command.channel_id,
+                        tlc_id,
+                        reason: fiber_types::RemoveTlcReason::RemoveTlcFail(TlcErrPacket::new(
+                            TlcErr::new(err),
+                            &NO_SHARED_SECRET,
+                        )),
+                    }),
+                    empty_result,
+                )
+            }
+            RawChannelMessageKind::ReestablishChannel => {
+                use crate::fiber::types::ReestablishChannel;
+
+                (
+                    FiberMessage::reestablish_channel(ReestablishChannel {
+                        channel_id: command.channel_id,
+                        local_commitment_number: command
+                            .local_commitment_number
+                            .unwrap_or_else(|| channel.get_local_commitment_number()),
+                        remote_commitment_number: command
+                            .remote_commitment_number
+                            .unwrap_or_else(|| channel.get_remote_commitment_number()),
+                    }),
+                    empty_result,
+                )
+            }
+            RawChannelMessageKind::TxAbort => {
+                use crate::fiber::types::TxAbort;
+
+                (
+                    FiberMessage::tx_abort(TxAbort {
+                        channel_id: command.channel_id,
+                        message: command
+                            .abort_message
+                            .unwrap_or_else(|| b"p2p-test".to_vec()),
+                    }),
+                    empty_result,
+                )
+            }
+        };
+        self.send_fiber_message_to_pubkey(&peer, message)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    async fn deliver_captured_fiber_messages(
+        &mut self,
+        command: DeliverCapturedFiberMessagesCommand,
+    ) -> Result<u64, String> {
+        let mut leftover = VecDeque::new();
+        let mut to_deliver = Vec::new();
+        let limit = command.count.unwrap_or(u64::MAX);
+        while let Some(captured) = self.captured_inbound_fiber_messages.pop_front() {
+            let kind = match &captured.message {
+                FiberMessage::ChannelNormalOperation(msg) => fiber_channel_kind(msg),
+                other => format!("{other:?}"),
+            };
+            let kind_ok = command.kinds.is_empty()
+                || FiberMessageIntercept::kind_matches(&command.kinds, &kind);
+            if kind_ok && (to_deliver.len() as u64) < limit {
+                to_deliver.push(captured);
+            } else {
+                leftover.push_back(captured);
+            }
+        }
+        self.captured_inbound_fiber_messages = leftover;
+        let delivered = to_deliver.len() as u64;
+        for captured in to_deliver {
+            let FiberMessage::ChannelNormalOperation(msg) = captured.message else {
+                continue;
+            };
+            let channel_id = msg.get_channel_id();
+            self.send_message_to_channel_actor(
+                channel_id,
+                Some(captured.peer),
+                ChannelActorMessage::PeerMessage(msg),
+            )
+            .await;
+        }
+        Ok(delivered)
+    }
+
+    async fn release_held_outbound_fiber_messages(
+        &mut self,
+        command: ReleaseHeldOutboundFiberMessagesCommand,
+    ) -> Result<u64, String> {
+        let mut leftover = VecDeque::new();
+        let mut to_send = Vec::new();
+        let limit = command.count.unwrap_or(u64::MAX);
+        while let Some(held) = self.held_outbound_fiber_messages.pop_front() {
+            let kind = match &held.message {
+                FiberMessage::ChannelNormalOperation(msg) => fiber_channel_kind(msg),
+                other => format!("{other:?}"),
+            };
+            let kind_ok = command.kinds.is_empty()
+                || FiberMessageIntercept::kind_matches(&command.kinds, &kind);
+            if kind_ok && (to_send.len() as u64) < limit {
+                to_send.push(held);
+            } else {
+                leftover.push_back(held);
+            }
+        }
+        self.held_outbound_fiber_messages = leftover;
+        let released = to_send.len() as u64;
+        for held in to_send {
+            self.send_fiber_message_to_pubkey(&held.target, held.message)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(released)
+    }
+
+    async fn build_shutdown_tx_message(
+        &self,
+        command: BuildShutdownTxMessageCommand,
+    ) -> Result<[u8; 32], String> {
+        use crate::utils::tx::compute_tx_message;
+        use fiber_types::ShutdownInfo;
+
+        let mut channel = self
+            .store
+            .get_channel_actor_state(&command.channel_id)
+            .ok_or_else(|| format!("channel {:?} not found", command.channel_id))?;
+        channel.local_shutdown_info = Some(ShutdownInfo {
+            close_script: command.local_close_script,
+            fee_rate: command.local_fee_rate,
+            signature: None,
+        });
+        channel.remote_shutdown_info = Some(ShutdownInfo {
+            close_script: command.remote_close_script,
+            fee_rate: command.remote_fee_rate,
+            signature: None,
+        });
+        let tx = channel
+            .build_shutdown_tx()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(compute_tx_message(&tx))
     }
 
     fn queue_retryable_remove_tlc(
@@ -7515,6 +8106,9 @@ where
             test_fiber_message_hold: None,
             #[cfg(test)]
             test_held_fiber_messages: Default::default(),
+            fiber_message_intercepts: Default::default(),
+            captured_inbound_fiber_messages: Default::default(),
+            held_outbound_fiber_messages: Default::default(),
         };
 
         if let Some(node_announcement) = state.get_or_create_new_node_announcement_message() {

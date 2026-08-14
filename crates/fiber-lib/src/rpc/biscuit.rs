@@ -117,6 +117,23 @@ fn build_rules() -> HashMap<&'static str, AuthRule> {
     b.rule("check_channel_shutdown", r#"allow if write("dev");"#);
     b.rule("sign_external_funding_tx", r#"allow if write("dev");"#);
     b.rule("submit_commitment_transaction", r#"allow if write("dev");"#);
+    b.rule("set_fiber_message_intercept", r#"allow if write("dev");"#);
+    b.rule("take_captured_fiber_messages", r#"allow if write("dev");"#);
+    b.rule("send_raw_channel_message", r#"allow if write("dev");"#);
+    b.rule("get_channel_musig2_public", r#"allow if write("dev");"#);
+    b.rule("build_shutdown_tx_message", r#"allow if write("dev");"#);
+    b.rule(
+        "deliver_captured_fiber_messages",
+        r#"allow if write("dev");"#,
+    );
+    b.rule(
+        "take_held_outbound_fiber_messages",
+        r#"allow if write("dev");"#,
+    );
+    b.rule(
+        "release_held_outbound_fiber_messages",
+        r#"allow if write("dev");"#,
+    );
     // prof
     b.rule("pprof", r#"allow if write("pprof");"#);
     // graph
@@ -424,6 +441,14 @@ mod tests {
             "check_channel_shutdown",
             "sign_external_funding_tx",
             "submit_commitment_transaction",
+            "set_fiber_message_intercept",
+            "take_captured_fiber_messages",
+            "send_raw_channel_message",
+            "get_channel_musig2_public",
+            "build_shutdown_tx_message",
+            "deliver_captured_fiber_messages",
+            "take_held_outbound_fiber_messages",
+            "release_held_outbound_fiber_messages",
         ];
 
         for method in dev_methods {

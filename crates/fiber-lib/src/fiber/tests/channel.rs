@@ -3,7 +3,9 @@ use crate::ckb::tests::test_utils::{
 };
 use crate::ckb::{CkbChainMessage, FundingContext, FundingTx, GetShutdownTxResponse};
 use crate::fiber::channel::{
-    funding_timeout_check_delay, merge_external_funding_witnesses, AddTlcResponse, ChannelActor,
+    funding_timeout_check_delay, merge_external_funding_witnesses,
+    test_only_clear_secnonce_tracker, test_only_set_funding_sign_log,
+    test_only_set_secnonce_tracking, test_only_take_funding_sign_log, AddTlcResponse, ChannelActor,
     ChannelActorMessage, ChannelActorState, ChannelActorStateStore, ChannelOpenRecordStore,
     ProcessingChannelResult, ReloadParams, ReplayOrderHint, UpdateCommand,
     DEFAULT_COMMITMENT_FEE_RATE, DEFAULT_FEE_RATE, DEFAULT_MAX_TLC_VALUE_IN_FLIGHT,
@@ -7410,6 +7412,203 @@ async fn test_shutdown_channel_with_large_size_shutdown_script_should_fail() {
         .err()
         .unwrap()
         .contains("overflows shutdown fee"));
+}
+
+/// FBR-2026-0062 **full protocol evidence PoC** (defensive, no key recovery).
+///
+/// Protocol steps (empty channel, no backup/stale restore):
+/// 1. Peer A sends empty `CommitmentSigned`
+/// 2. Victim B: `verify_and_complete_tx` → funding partial on commitment digest @ cn=N
+/// 3. Cooperative shutdown → B: `ClosingSigned` → funding partial on shutdown digest @ cn=N
+///
+/// Evidence collected in-process (same funding key, same secnonce, two digests, two partials).
+/// That is the complete cryptographic precondition for MuSig2 nonce-reuse key recovery;
+/// we intentionally do **not** implement key extraction or fund theft.
+#[tokio::test]
+async fn test_fbr_2026_0062_full_protocol_evidence_empty_cs_then_closing_signed() {
+    init_tracing();
+
+    // Multi-actor: no reuse panics; collect sign evidence instead.
+    test_only_set_secnonce_tracking(false);
+    test_only_set_funding_sign_log(true);
+
+    let (mut node_a, node_b, channel_id, _) =
+        NetworkNode::new_2_nodes_with_established_channel(HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT, true)
+            .await;
+
+    let state_b0 = node_b.get_channel_actor_state(channel_id);
+    assert!(
+        !state_b0.any_tlc_pending(),
+        "precondition: empty channel (no in-flight TLCs)"
+    );
+    let victim_funding_pk = state_b0.test_only_funding_pubkey_bytes();
+    let cn_before = state_b0.get_local_commitment_number();
+    let nonce_before = state_b0.test_only_local_funding_secnonce_bytes();
+
+    // Drop open-channel noise from the evidence log; keep only post-open events.
+    let _ = test_only_take_funding_sign_log();
+    test_only_set_funding_sign_log(true);
+
+    // --- Step 1: empty CommitmentSigned from A ---
+    node_a
+        .network_actor
+        .send_message(NetworkActorMessage::Command(
+            NetworkActorCommand::ControlFiberChannel(ChannelCommandWithId {
+                channel_id,
+                command: ChannelCommand::CommitmentSigned(None),
+            }),
+        ))
+        .expect("node_a alive");
+
+    node_a
+        .expect_to_process_event(|event| match event {
+            NetworkServiceEvent::RevokeAndAckReceived(pubkey, id, _, _) => {
+                assert_eq!(pubkey, &node_b.pubkey);
+                assert_eq!(id, &channel_id);
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+
+    let state_b1 = node_b.get_channel_actor_state(channel_id);
+    assert_eq!(
+        state_b1.get_local_commitment_number(),
+        cn_before,
+        "empty CS must not advance victim local_cn"
+    );
+    assert_eq!(
+        state_b1.test_only_local_funding_secnonce_bytes(),
+        nonce_before
+    );
+    let m_commitment = crate::utils::tx::compute_tx_message(
+        &state_b1
+            .latest_commitment_transaction
+            .clone()
+            .expect("B stores completed commitment after peer CS")
+            .into_view(),
+    );
+
+    // --- Step 2: cooperative shutdown → real ClosingSigned ---
+    let shutdown = |rpc_reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::ControlFiberChannel(
+            ChannelCommandWithId {
+                channel_id,
+                command: ChannelCommand::Shutdown(
+                    ShutdownCommand {
+                        close_script: None,
+                        fee_rate: Some(FeeRate::from_u64(DEFAULT_COMMITMENT_FEE_RATE)),
+                        force: false,
+                    },
+                    rpc_reply,
+                ),
+            },
+        ))
+    };
+    call!(node_a.network_actor, shutdown)
+        .expect("node_a alive")
+        .expect("shutdown accepted");
+
+    // Wait for B to enter ShuttingDown / Closed (ClosingSigned is signed on that path).
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(s) = node_b.get_channel_actor_state_unchecked(channel_id) {
+                if matches!(
+                    s.state,
+                    ChannelState::ShuttingDown(_) | ChannelState::Closed(_)
+                ) {
+                    break;
+                }
+            }
+            if let Some(s) = node_a.get_channel_actor_state_unchecked(channel_id) {
+                if matches!(s.state, ChannelState::Closed(_)) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timeout waiting for shutdown path");
+
+    // Grace for ClosingSigned sign to be recorded after state transition.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let evidence = test_only_take_funding_sign_log();
+    test_only_set_funding_sign_log(false);
+    test_only_set_secnonce_tracking(true);
+    test_only_clear_secnonce_tracker();
+
+    let victim_events: Vec<_> = evidence
+        .into_iter()
+        .filter(|e| e.funding_pubkey == victim_funding_pk)
+        .collect();
+
+    assert!(
+        victim_events.len() >= 2,
+        "expected >=2 funding partials from victim B, got {}",
+        victim_events.len()
+    );
+
+    // Find a pair: same secnonce, different message digests.
+    let mut pair_idx: Option<(usize, usize)> = None;
+    'outer: for i in 0..victim_events.len() {
+        for j in (i + 1)..victim_events.len() {
+            if victim_events[i].secnonce == victim_events[j].secnonce
+                && victim_events[i].message != victim_events[j].message
+            {
+                pair_idx = Some((i, j));
+                break 'outer;
+            }
+        }
+    }
+
+    let (i, j) = pair_idx.expect(
+        "FBR-2026-0062 evidence incomplete: need two funding partials from victim with \
+         identical secnonce and different message digests (empty CS + ClosingSigned)",
+    );
+    let e1 = &victim_events[i];
+    let e2 = &victim_events[j];
+
+    assert_eq!(
+        e1.secnonce, nonce_before,
+        "reused secnonce must match cn-before funding nonce"
+    );
+    assert_ne!(e1.message, e2.message);
+    assert_ne!(
+        e1.partial_sig, e2.partial_sig,
+        "different messages under same secnonce yield different partials"
+    );
+
+    // One of the messages should be the completed commitment digest from empty CS.
+    let messages = [e1.message.as_slice(), e2.message.as_slice()];
+    assert!(
+        messages.contains(&m_commitment.as_slice()),
+        "one signed message must be the post-CS commitment digest"
+    );
+
+    // Evidence dump for auditors (partials are already protocol-visible material).
+    eprintln!(
+        "FBR-2026-0062 full protocol evidence:\n\
+         - victim_funding_pubkey={:02x?}\n\
+         - local_cn={}\n\
+         - secnonce_prefix={:02x?}\n\
+         - msg1_len={} msg1_prefix={:02x?}\n\
+         - msg2_len={} msg2_prefix={:02x?}\n\
+         - partial1={}\n\
+         - partial2={}\n\
+         - conclusion: same funding key + same MuSig2 secnonce signed two distinct digests \
+           (cryptographic precondition for nonce-reuse key recovery; recovery not implemented)",
+        &victim_funding_pk,
+        cn_before,
+        &e1.secnonce[..8],
+        e1.message.len(),
+        &e1.message[..e1.message.len().min(8)],
+        e2.message.len(),
+        &e2.message[..e2.message.len().min(8)],
+        String::from_utf8_lossy(&e1.partial_sig),
+        String::from_utf8_lossy(&e2.partial_sig),
+    );
 }
 
 #[tokio::test]

@@ -36,6 +36,14 @@ You may refer to the e2e test cases in the `tests/bruno/e2e` directory for examp
         * [Method `submit_commitment_transaction`](#dev-submit_commitment_transaction)
         * [Method `check_channel_shutdown`](#dev-check_channel_shutdown)
         * [Method `sign_external_funding_tx`](#dev-sign_external_funding_tx)
+        * [Method `set_fiber_message_intercept`](#dev-set_fiber_message_intercept)
+        * [Method `take_captured_fiber_messages`](#dev-take_captured_fiber_messages)
+        * [Method `deliver_captured_fiber_messages`](#dev-deliver_captured_fiber_messages)
+        * [Method `take_held_outbound_fiber_messages`](#dev-take_held_outbound_fiber_messages)
+        * [Method `release_held_outbound_fiber_messages`](#dev-release_held_outbound_fiber_messages)
+        * [Method `send_raw_channel_message`](#dev-send_raw_channel_message)
+        * [Method `get_channel_musig2_public`](#dev-get_channel_musig2_public)
+        * [Method `build_shutdown_tx_message`](#dev-build_shutdown_tx_message)
     * [Module Graph](#module-graph)
         * [Method `graph_nodes`](#graph-graph_nodes)
         * [Method `graph_channels`](#graph-graph_channels)
@@ -70,6 +78,7 @@ You may refer to the e2e test cases in the `tests/bruno/e2e` directory for examp
 * [RPC Types](#rpc-types)
 
     * [Type `Attribute`](#type-attribute)
+    * [Type `CapturedFiberMessage`](#type-capturedfibermessage)
     * [Type `CchInvoice`](#type-cchinvoice)
     * [Type `CchOrderStatus`](#type-cchorderstatus)
     * [Type `Channel`](#type-channel)
@@ -94,6 +103,7 @@ You may refer to the e2e test cases in the `tests/bruno/e2e` directory for examp
     * [Type `PeerInfo`](#type-peerinfo)
     * [Type `Privkey`](#type-privkey)
     * [Type `Pubkey`](#type-pubkey)
+    * [Type `RawChannelMessageKind`](#type-rawchannelmessagekind)
     * [Type `RemoveTlcReason`](#type-removetlcreason)
     * [Type `RevocationData`](#type-revocationdata)
     * [Type `RouterHop`](#type-routerhop)
@@ -582,6 +592,171 @@ Sign an external funding transaction with a provided private key.
 ##### Returns
 
 * `signed_funding_tx` - <em>`ckb_jsonrpc_types::Transaction`</em>, The signed funding transaction that can be submitted via `submit_signed_funding_tx`.
+
+---
+
+
+
+<a id="dev-set_fiber_message_intercept"></a>
+#### Method `set_fiber_message_intercept`
+
+Intercept Fiber channel messages on this node so a test client can act as a
+ malicious peer: drop outbound `RevokeAndAck` and capture inbound messages
+ without delivering them to the honest channel actor.
+
+##### Params
+
+* `channel_id` - <em>[Hash256](#type-hash256)</em>, The channel whose messages should be intercepted
+* `suppress_outbound_revoke_and_ack` - <em>`bool`</em>, If true, outbound `RevokeAndAck` messages for this channel are dropped
+* `capture_inbound` - <em>`bool`</em>, If true, inbound channel messages for this channel are queued for
+ `take_captured_fiber_messages` and are not delivered to the channel actor
+
+##### Returns
+
+* None
+
+---
+
+
+
+<a id="dev-take_captured_fiber_messages"></a>
+#### Method `take_captured_fiber_messages`
+
+Drain inbound Fiber messages captured by `set_fiber_message_intercept`.
+ The intercept stays active.
+
+##### Params
+* None
+
+##### Returns
+
+* `messages` - <em>Vec<[CapturedFiberMessage](#type-capturedfibermessage)></em>, Messages captured since the previous take (FIFO). The intercept stays active.
+
+---
+
+
+
+<a id="dev-send_raw_channel_message"></a>
+#### Method `send_raw_channel_message`
+
+Send a `CommitmentSigned` or `Shutdown` without running the honest channel-actor
+ send path (no automatic `RevokeAndAck`, no local commitment-number advance).
+
+##### Params
+
+* `channel_id` - <em>[Hash256](#type-hash256)</em>, The channel to send on
+* `kind` - <em>[RawChannelMessageKind](#type-rawchannelmessagekind)</em>, Which wire message to send
+* `nonce_commitment_number` - <em>`Option<u64>`</em>, Optional commitment number used to derive the musig2 nonce when sending
+ `CommitmentSigned`. Defaults to this node's current local commitment number.
+ Pass `local_cn + 1` to craft the second empty CS of the no-RAA attack.
+* `close_script` - <em>`Option<ckb_jsonrpc_types::Script>`</em>, Close script for `Shutdown`. Defaults to this node's local shutdown script.
+* `fee_rate` - <em>`Option<u64>`</em>, Fee rate for `Shutdown`. Defaults to the node commitment fee rate.
+
+##### Returns
+
+* `funding_tx_partial_signature` - <em>`Option<String>`</em>, Partial signature included in a sent `CommitmentSigned`, if any
+* `next_commitment_nonce` - <em>`Option<String>`</em>, `next_commitment_nonce` included in a sent `CommitmentSigned`, if any
+
+---
+
+
+
+<a id="dev-get_channel_musig2_public"></a>
+#### Method `get_channel_musig2_public`
+
+Return the public musig2 session of a channel from this node's own state.
+
+##### Params
+
+* `channel_id` - <em>[Hash256](#type-hash256)</em>, The channel ID
+
+##### Returns
+
+* `local_funding_pubkey` - <em>`crate::serde_utils::Pubkey`</em>, This node's funding pubkey (hex without 0x prefix)
+* `remote_funding_pubkey` - <em>`crate::serde_utils::Pubkey`</em>, Counterparty funding pubkey (hex without 0x prefix)
+* `local_commitment_number` - <em>`u64`</em>, This node's local commitment number
+* `remote_commitment_number` - <em>`u64`</em>, Counterparty commitment number as this node currently tracks it
+* `local_pubnonce` - <em>`String`</em>, This node's current commitment pubnonce (`0x`-prefixed hex)
+* `last_committed_remote_nonce` - <em>`String`</em>, Last pubnonce the counterparty committed (`0x`-prefixed hex)
+* `next_commitment_nonce` - <em>`String`</em>, Next commitment pubnonce this node would advertise (`0x`-prefixed hex)
+* `own_commitment_message` - <em>[Hash256](#type-hash256)</em>, Sighash of this node's own commitment tx (the message signed in our `CommitmentSigned`)
+* `peer_commitment_message` - <em>[Hash256](#type-hash256)</em>, Sighash of the counterparty commitment tx (the message we counter-sign while verifying)
+* `funding_outpoint` - <em>`ckb_jsonrpc_types::OutPoint`</em>, Funding cell outpoint
+* `local_first` - <em>`bool`</em>, Whether this node's funding pubkey is first in musig2 key aggregation
+
+---
+
+
+
+<a id="dev-build_shutdown_tx_message"></a>
+#### Method `build_shutdown_tx_message`
+
+Rebuild the shutdown-transaction sighash from publicly observed close scripts.
+
+##### Params
+
+* `channel_id` - <em>[Hash256](#type-hash256)</em>, The channel ID
+* `local_close_script` - <em>`ckb_jsonrpc_types::Script`</em>, This node's close script (as used in our `Shutdown`)
+* `remote_close_script` - <em>`ckb_jsonrpc_types::Script`</em>, Counterparty close script (as observed in their `Shutdown`)
+* `local_fee_rate` - <em>`u64`</em>, Fee rate from our `Shutdown`
+* `remote_fee_rate` - <em>`u64`</em>, Fee rate from the counterparty `Shutdown` (auto-accept uses 0)
+
+##### Returns
+
+* `message` - <em>[Hash256](#type-hash256)</em>, Sighash of the shutdown transaction
+
+---
+
+
+
+<a id="dev-deliver_captured_fiber_messages"></a>
+#### Method `deliver_captured_fiber_messages`
+
+Deliver previously captured inbound messages to the honest channel actor
+ (delay / later-release). Consumes the delivered messages from the capture queue.
+
+##### Params
+
+* `count` - <em>`Option<u64>`</em>, Max number of matching messages to deliver. Omit to deliver all matching.
+* `kinds` - <em>`Vec<String>`</em>, If set, only these kinds are delivered (FIFO among matches).
+
+##### Returns
+
+* `delivered` - <em>`u64`</em>, How many messages were delivered
+
+---
+
+
+
+<a id="dev-take_held_outbound_fiber_messages"></a>
+#### Method `take_held_outbound_fiber_messages`
+
+Drain outbound messages held by `outbound_hold_kinds` without sending them.
+
+##### Params
+* None
+
+##### Returns
+
+* `messages` - <em>Vec<[CapturedFiberMessage](#type-capturedfibermessage)></em>, Held outbound messages since the previous take or release.
+
+---
+
+
+
+<a id="dev-release_held_outbound_fiber_messages"></a>
+#### Method `release_held_outbound_fiber_messages`
+
+Send previously held outbound messages to the peer.
+
+##### Params
+
+* `count` - <em>`Option<u64>`</em>, Max number of matching messages to send. Omit to send all matching.
+* `kinds` - <em>`Vec<String>`</em>, If set, only these kinds are released (FIFO among matches).
+
+##### Returns
+
+* `released` - <em>`u64`</em>, How many messages were sent
 
 ---
 
@@ -1252,6 +1427,25 @@ The attributes of the invoice.
 * `payment_secret` - <em>`String`</em>, The payment secret of the invoice
 ---
 
+<a id="#type-capturedfibermessage"></a>
+### Type `CapturedFiberMessage`
+
+One inbound Fiber channel message captured by the intercept.
+
+
+#### Fields
+
+* `peer_pubkey` - <em>`crate::serde_utils::Pubkey`</em>, Peer that sent the message (identity pubkey, hex without 0x prefix)
+* `channel_id` - <em>`Option<Hash256>`</em>, Channel this message belongs to, if it is a channel message
+* `kind` - <em>`String`</em>, Fiber channel message kind, e.g. `CommitmentSigned`, `ClosingSigned`, `Shutdown`, `RevokeAndAck`
+* `payload` - <em>`String`</em>, Molecule-encoded Fiber message, `0x`-prefixed hex
+* `funding_tx_partial_signature` - <em>`Option<String>`</em>, Partial signature from `CommitmentSigned.funding_tx_partial_signature`, if any
+* `closing_partial_signature` - <em>`Option<String>`</em>, Partial signature from `ClosingSigned.partial_signature`, if any
+* `next_commitment_nonce` - <em>`Option<String>`</em>, `next_commitment_nonce` from `CommitmentSigned`, if any
+* `close_script` - <em>`Option<ckb_jsonrpc_types::Script>`</em>, Close script from an inbound `Shutdown`, if any
+* `fee_rate` - <em>`Option<u64>`</em>, Fee rate from an inbound `Shutdown`, if any
+---
+
 <a id="#type-cchinvoice"></a>
 ### Type `CchInvoice`
 
@@ -1672,6 +1866,22 @@ A compressed public key (33 bytes), serialized as hex without `0x` prefix.
 
 
 
+---
+
+<a id="#type-rawchannelmessagekind"></a>
+### Type `RawChannelMessageKind`
+
+Kind of raw channel message to send, bypassing the honest channel actor.
+
+
+#### Enum with values of
+
+* `commitment_signed` - Build and send a `CommitmentSigned` from this node's channel state
+* `shutdown` - Send a `Shutdown` from this node
+* `add_tlc` - Send an `AddTlc` without running the honest add/commit path
+* `remove_tlc` - Send a `RemoveTlc` (fail) without running the honest remove/commit path
+* `reestablish_channel` - Send a `ReestablishChannel`, optionally with forged commitment numbers
+* `tx_abort` - Send a `TxAbort`
 ---
 
 <a id="#type-removetlcreason"></a>

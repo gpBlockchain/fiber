@@ -83,7 +83,6 @@ pub use fiber_types::{
     CURRENT_COMMIT_DIFF_VERSION,
 };
 use molecule::prelude::{Builder, Entity};
-#[cfg(test)]
 use musig2::BinaryEncoding;
 use musig2::{
     aggregate_partial_signatures,
@@ -99,16 +98,13 @@ use ractor::{
 };
 use secp256k1::{XOnlyPublicKey, SECP256K1};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::backtrace::Backtrace;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::iter;
-#[cfg(test)]
-use std::{
-    backtrace::Backtrace,
-    sync::{LazyLock, Mutex},
-};
 use std::{
     fmt::{self, Debug, Display},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
 };
 use strum::AsRefStr;
 use tentacle::secio::PeerId;
@@ -7633,6 +7629,9 @@ impl ChannelActorState {
         if self.local_shutdown_info.is_some() && self.remote_shutdown_info.is_some() {
             let shutdown_tx = self.build_shutdown_tx().await?;
             let sign_ctx = self.get_funding_sign_context();
+            let channel_id = self.get_id();
+            let local_commitment_number = self.get_local_commitment_number();
+            let remote_pubkey = self.get_remote_pubkey();
 
             let (Some(local_shutdown_info), Some(remote_shutdown_info)) = (
                 self.core.local_shutdown_info.as_mut(),
@@ -7648,16 +7647,21 @@ impl ChannelActorState {
             let local_shutdown_signature = match local_shutdown_info.signature {
                 Some(signature) => signature,
                 None => {
+                    info!(
+                        channel_id = %channel_id,
+                        local_commitment_number,
+                        "signing ClosingSigned with funding MuSig2 context (same nonce derivation as commitment)"
+                    );
                     let signature = sign_ctx.sign(&compute_tx_message(&shutdown_tx))?;
                     local_shutdown_info.signature = Some(signature);
 
                     self.network()
                         .send_message(NetworkActorMessage::new_command(
                             NetworkActorCommand::SendFiberMessage(FiberMessageWithTarget::new(
-                                self.get_remote_pubkey(),
+                                remote_pubkey,
                                 FiberMessage::closing_signed(ClosingSigned {
                                     partial_signature: signature,
-                                    channel_id: self.get_id(),
+                                    channel_id,
                                 }),
                             )),
                         ))
@@ -9524,7 +9528,9 @@ impl ChannelActorState {
                 && self.should_local_go_first_in_musig2()
     }
 
-    async fn build_shutdown_tx(&self) -> Result<TransactionView, ProcessingChannelError> {
+    pub(crate) async fn build_shutdown_tx(
+        &self,
+    ) -> Result<TransactionView, ProcessingChannelError> {
         let (Some(local_shutdown_info), Some(remote_shutdown_info), Some(channel_outpoint)) = (
             self.local_shutdown_info.as_ref(),
             self.remote_shutdown_info.as_ref(),
@@ -9668,7 +9674,7 @@ impl ChannelActorState {
     // The function returns a tuple, the first element is the commitment transaction itself,
     // and the second element is the settlement data which can be used to construct the witness
     // to unlock the commitment transaction.
-    fn build_commitment_tx_and_settlement_data(
+    pub(crate) fn build_commitment_tx_and_settlement_data(
         &self,
         for_remote: bool,
     ) -> Result<(TransactionView, SettlementData), ProcessingChannelError> {
@@ -9887,7 +9893,7 @@ impl ChannelActorState {
         key_agg_ctx.aggregated_pubkey::<Point>().serialize_xonly()
     }
 
-    fn build_and_sign_commitment_tx(
+    pub(crate) fn build_and_sign_commitment_tx(
         &self,
     ) -> Result<(PartialSignature, TransactionView, SettlementData), ProcessingChannelError> {
         let (commitment_tx, settlement_data) =
@@ -9925,6 +9931,11 @@ impl ChannelActorState {
             self.build_commitment_tx_and_settlement_data(false)?;
 
         let message = compute_tx_message(&commitment_tx);
+        info!(
+            channel_id = %self.get_id(),
+            local_commitment_number = self.get_local_commitment_number(),
+            "verifying peer CommitmentSigned and completing with local funding MuSig2 sign"
+        );
         self.get_funding_verify_context()
             .verify(funding_tx_partial_signature, &message)?;
 
@@ -10329,6 +10340,14 @@ struct Musig2VerifyContext {
 
 impl Musig2VerifyContext {
     fn verify(&self, signature: PartialSignature, message: &[u8]) -> Result<(), VerifyError> {
+        // Observe peer funding pubnonce usage (same pubnonce + different message = peer reuse).
+        check_funding_musig2_nonce_reuse(
+            "peer",
+            "verify_partial",
+            self.pubkey.serialize().as_slice(),
+            &self.pubnonce,
+            message,
+        );
         verify_partial(
             &self.common_ctx.key_agg_ctx,
             signature,
@@ -10346,36 +10365,270 @@ struct Musig2SignContext {
     secnonce: SecNonce,
 }
 
+/// Map (signer_pubkey || pubnonce) → first message digest for that nonce session.
+/// Same key + different digest ⇒ MuSig2 nonce reuse (FBR-2026-0062 class).
+/// Key includes funding pubkey so in-process multi-node tests do not cross-contaminate.
+static FUNDING_MUSIG2_NONCE_USAGE: LazyLock<Mutex<HashMap<[u8; 32], [u8; 32]>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn funding_message_digest(message: &[u8]) -> [u8; 32] {
+    if message.len() == 32 {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(message);
+        out
+    } else {
+        ckb_hash::blake2b_256(message)
+    }
+}
+
+fn funding_nonce_usage_key(funding_pubkey: &[u8], pubnonce: &PubNonce) -> [u8; 32] {
+    let pn = pubnonce.to_bytes();
+    let mut buf = Vec::with_capacity(funding_pubkey.len() + pn.len());
+    buf.extend_from_slice(funding_pubkey);
+    buf.extend_from_slice(&pn);
+    ckb_hash::blake2b_256(&buf)
+}
+
+/// Log and record funding MuSig2 pubnonce usage. Emits `warn` on reuse.
+///
+/// - `role = "local"`: our funding key + secnonce/pubnonce when we sign
+/// - `role = "peer"`: counterparty funding key + their pubnonce when we verify
+fn check_funding_musig2_nonce_reuse(
+    role: &'static str,
+    path: &'static str,
+    funding_pubkey: &[u8],
+    pubnonce: &PubNonce,
+    message: &[u8],
+) {
+    let usage_key = funding_nonce_usage_key(funding_pubkey, pubnonce);
+    let pn = pubnonce.to_bytes();
+    let msg_digest = funding_message_digest(message);
+    let mut map = match FUNDING_MUSIG2_NONCE_USAGE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Bound memory for long-running nodes.
+    if map.len() > 4096 {
+        map.clear();
+    }
+    match map.insert(usage_key, msg_digest) {
+        Some(prev) if prev != msg_digest => {
+            warn!(
+                role,
+                path,
+                funding_pubkey = %hex::encode(funding_pubkey),
+                pubnonce = %hex::encode(pn),
+                previous_msg_digest = %hex::encode(prev),
+                current_msg_digest = %hex::encode(msg_digest),
+                "FBR-2026-0062 MuSig2 funding nonce reuse detected: same pubnonce used for two different messages"
+            );
+        }
+        None => {
+            info!(
+                role,
+                path,
+                funding_pubkey_prefix = %hex::encode(&funding_pubkey[..funding_pubkey.len().min(8)]),
+                pubnonce_prefix = %hex::encode(&pn[..8]),
+                msg_digest = %hex::encode(msg_digest),
+                "funding MuSig2 nonce session first use"
+            );
+        }
+        Some(_) => {
+            // Same message re-sign (e.g. CommitDiff replay) — not reuse.
+            debug!(
+                role,
+                path,
+                pubnonce_prefix = %hex::encode(&pn[..8]),
+                "funding MuSig2 nonce re-sign of identical message"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 static SECNONCES: LazyLock<Mutex<HashMap<[u8; 64], Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::default()));
 
+/// When false, secnonce reuse panics are disabled (multi-actor integration).
+#[cfg(test)]
+static SECNONCE_TRACKING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// When true, every funding-context partial sign is recorded for evidence collection.
+#[cfg(test)]
+static FUNDING_SIGN_LOG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One funding-key MuSig2 partial signature produced in-process (test evidence only).
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct FundingSignEvidence {
+    /// Compressed funding pubkey of the signer (33 bytes as hex-friendly Vec).
+    pub funding_pubkey: Vec<u8>,
+    pub secnonce: [u8; 64],
+    pub message: Vec<u8>,
+    /// Serialized partial signature (MaybeScalar).
+    pub partial_sig: Vec<u8>,
+}
+
+#[cfg(test)]
+static FUNDING_SIGN_LOG: LazyLock<Mutex<Vec<FundingSignEvidence>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Test-only detector: panics if the same MuSig2 secnonce signs two different messages.
+#[cfg(test)]
+fn track_secnonce_message(secnonce: &SecNonce, message: &[u8]) {
+    track_secnonce_bytes_message(&secnonce.to_bytes(), message);
+}
+
+/// Test-only: track by raw secnonce bytes (for unit tests).
+#[cfg(test)]
+pub(crate) fn track_secnonce_bytes_message(secnonce_bytes: &[u8; 64], message: &[u8]) {
+    use std::sync::atomic::Ordering;
+    if !SECNONCE_TRACKING_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut secnonces = match SECNONCES.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(old) = secnonces.insert(*secnonce_bytes, message.to_vec()) {
+        if old.as_slice() != message {
+            panic!(
+                "Musig2 secnonce is reused for different messages: {:?} and {:?} backtrace: {}",
+                old,
+                message,
+                Backtrace::capture()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_funding_sign_evidence(
+    seckey: &Privkey,
+    secnonce: &SecNonce,
+    message: &[u8],
+    partial: &PartialSignature,
+) {
+    use std::sync::atomic::Ordering;
+    if !FUNDING_SIGN_LOG_ENABLED.load(Ordering::SeqCst) {
+        return;
+    }
+    let funding_pubkey = seckey.pubkey().serialize().to_vec();
+    let partial_sig = {
+        // MaybeScalar / PartialSignature binary form via Debug fallback if needed.
+        format!("{:?}", partial).into_bytes()
+    };
+    let entry = FundingSignEvidence {
+        funding_pubkey,
+        secnonce: secnonce.to_bytes(),
+        message: message.to_vec(),
+        partial_sig,
+    };
+    let mut log = match FUNDING_SIGN_LOG.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    log.push(entry);
+}
+
+/// Test-only: clear the global secnonce tracker (isolate cases).
+#[cfg(test)]
+pub(crate) fn test_only_clear_secnonce_tracker() {
+    let mut secnonces = match SECNONCES.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    secnonces.clear();
+}
+
+/// Enable/disable global secnonce panic tracking (default: enabled for unit tests).
+#[cfg(test)]
+pub(crate) fn test_only_set_secnonce_tracking(enabled: bool) {
+    use std::sync::atomic::Ordering;
+    SECNONCE_TRACKING_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+/// Enable/disable funding-sign evidence log (integration PoC collection).
+#[cfg(test)]
+pub(crate) fn test_only_set_funding_sign_log(enabled: bool) {
+    use std::sync::atomic::Ordering;
+    FUNDING_SIGN_LOG_ENABLED.store(enabled, Ordering::SeqCst);
+    if enabled {
+        let mut log = match FUNDING_SIGN_LOG.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        log.clear();
+    }
+}
+
+/// Drain collected funding-sign evidence (clears the log).
+#[cfg(test)]
+pub(crate) fn test_only_take_funding_sign_log() -> Vec<FundingSignEvidence> {
+    let mut log = match FUNDING_SIGN_LOG.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    std::mem::take(&mut *log)
+}
+
+/// Test-only: message previously signed under this secnonce, if any.
+#[cfg(test)]
+pub(crate) fn test_only_tracked_message_for_secnonce(secnonce_bytes: &[u8; 64]) -> Option<Vec<u8>> {
+    let secnonces = match SECNONCES.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    secnonces.get(secnonce_bytes).cloned()
+}
+
+#[cfg(test)]
+impl ChannelActorState {
+    /// Funding MuSig2 secnonce for the current `local_commitment_number` (Commitment context).
+    pub fn test_only_local_funding_secnonce_bytes(&self) -> [u8; 64] {
+        self.signer
+            .derive_musig2_nonce(
+                self.get_local_commitment_number(),
+                Musig2Context::Commitment,
+            )
+            .to_bytes()
+    }
+
+    /// Compressed funding pubkey bytes for correlating sign evidence.
+    pub fn test_only_funding_pubkey_bytes(&self) -> Vec<u8> {
+        self.signer.funding_key.pubkey().serialize().to_vec()
+    }
+
+    /// Current local commitment number (test helper alias).
+    pub fn test_only_local_commitment_number(&self) -> u64 {
+        self.get_local_commitment_number()
+    }
+}
+
 impl Musig2SignContext {
     fn sign(&self, message: &[u8]) -> Result<PartialSignature, SigningError> {
+        check_funding_musig2_nonce_reuse(
+            "local",
+            "sign",
+            self.seckey.pubkey().serialize().as_slice(),
+            &self.secnonce.public_nonce(),
+            message,
+        );
         #[cfg(test)]
-        {
-            // Check if the secnonce is reused for different messages.
-            let mut secnonces = SECNONCES.lock().unwrap();
-            if let Some(old) = secnonces.insert(self.secnonce.to_bytes(), message.to_vec()) {
-                if old.as_slice() != message {
-                    panic!(
-                        "Musig2 secnonce {:?} is reused for different messages: {:?} and {:?} backtrace: {}",
-                        self.secnonce.public_nonce(),
-                        old,
-                        message,
-                        Backtrace::capture()
-                    );
-                }
-            }
-        }
+        track_secnonce_message(&self.secnonce, message);
 
-        sign_partial(
+        let partial = sign_partial(
             &self.common_ctx.key_agg_ctx,
             self.seckey.clone(),
             self.secnonce.clone(),
             &self.common_ctx.agg_nonce,
             message,
-        )
+        )?;
+        #[cfg(test)]
+        record_funding_sign_evidence(&self.seckey, &self.secnonce, message, &partial);
+        Ok(partial)
     }
 
     fn sign_and_aggregate(
@@ -10383,6 +10636,18 @@ impl Musig2SignContext {
         message: &[u8],
         remote_signature: PartialSignature,
     ) -> Result<CompactSignature, RoundFinalizeError> {
+        // Receiving CommitmentSigned (verify_and_complete_tx) uses this path; ClosingSigned uses
+        // `sign`. Same local_cn ⇒ same pubnonce ⇒ reuse is logged if messages differ.
+        check_funding_musig2_nonce_reuse(
+            "local",
+            "sign_and_aggregate",
+            self.seckey.pubkey().serialize().as_slice(),
+            &self.secnonce.public_nonce(),
+            message,
+        );
+        #[cfg(test)]
+        track_secnonce_message(&self.secnonce, message);
+
         let local_signature = sign_partial(
             &self.common_ctx.key_agg_ctx,
             self.seckey.clone(),
@@ -10390,6 +10655,8 @@ impl Musig2SignContext {
             &self.common_ctx.agg_nonce,
             message,
         )?;
+        #[cfg(test)]
+        record_funding_sign_evidence(&self.seckey, &self.secnonce, message, &local_signature);
         Ok(self.common_ctx.aggregate_partial_signatures_for_msg(
             local_signature,
             remote_signature,
@@ -10689,5 +10956,168 @@ mod tests {
             state.check_tlc_limits(20, false),
             Err(ProcessingChannelError::TlcValueInflightExceedLimit)
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // FBR-2026-0062 defensive PoC (nonce reuse — no key extraction)
+    //
+    // Attack-relevant property under test:
+    //   get_funding_sign_context() derives secnonce only from (local_cn, COMMITMENT).
+    //   Receiving CommitmentSigned signs M_local via sign_and_aggregate;
+    //   cooperative ClosingSigned signs M_close via sign.
+    //   On an empty channel both can happen at the same local_cn with different digests.
+    // -------------------------------------------------------------------------
+
+    fn clear_secnonce_tracker() {
+        SECNONCES.lock().unwrap().clear();
+    }
+
+    /// Pair of funding sign contexts (local = victim, remote = attacker) at fixed cn.
+    /// Mirrors `get_funding_sign_context()`: secnonce = f(cn, COMMITMENT) only.
+    fn funding_sign_pair_at_cn(commitment_number: u64) -> (Musig2SignContext, Musig2SignContext) {
+        let local = InMemorySigner::generate_from_seed(b"fbr-2026-0062-local");
+        let remote = InMemorySigner::generate_from_seed(b"fbr-2026-0062-remote");
+        let key_agg_ctx =
+            KeyAggContext::new([local.funding_key.pubkey(), remote.funding_key.pubkey()])
+                .expect("valid pubkeys");
+        let local_sec = local.derive_musig2_nonce(commitment_number, Musig2Context::Commitment);
+        let remote_sec = remote.derive_musig2_nonce(commitment_number, Musig2Context::Commitment);
+        let agg_nonce = AggNonce::sum([local_sec.public_nonce(), remote_sec.public_nonce()]);
+        let common = Musig2CommonContext {
+            local_first: true,
+            key_agg_ctx,
+            agg_nonce,
+        };
+        (
+            Musig2SignContext {
+                common_ctx: Musig2CommonContext {
+                    local_first: common.local_first,
+                    key_agg_ctx: KeyAggContext::new([
+                        local.funding_key.pubkey(),
+                        remote.funding_key.pubkey(),
+                    ])
+                    .expect("valid pubkeys"),
+                    agg_nonce: AggNonce::sum([local_sec.public_nonce(), remote_sec.public_nonce()]),
+                },
+                seckey: local.funding_key.clone(),
+                secnonce: local_sec,
+            },
+            Musig2SignContext {
+                common_ctx: Musig2CommonContext {
+                    local_first: true,
+                    key_agg_ctx: KeyAggContext::new([
+                        local.funding_key.pubkey(),
+                        remote.funding_key.pubkey(),
+                    ])
+                    .expect("valid pubkeys"),
+                    agg_nonce: AggNonce::sum([
+                        local
+                            .derive_musig2_nonce(commitment_number, Musig2Context::Commitment)
+                            .public_nonce(),
+                        remote
+                            .derive_musig2_nonce(commitment_number, Musig2Context::Commitment)
+                            .public_nonce(),
+                    ]),
+                },
+                seckey: remote.funding_key.clone(),
+                secnonce: remote.derive_musig2_nonce(commitment_number, Musig2Context::Commitment),
+            },
+        )
+    }
+
+    fn funding_sign_context_at_cn(commitment_number: u64) -> Musig2SignContext {
+        funding_sign_pair_at_cn(commitment_number).0
+    }
+
+    #[test]
+    fn fbr_2026_0062_musig2_commitment_nonce_depends_only_on_cn() {
+        let signer = InMemorySigner::generate_from_seed(b"fbr-2026-0062-nonce-dep");
+        let cn = 7u64;
+        let n1 = signer.derive_musig2_nonce(cn, Musig2Context::Commitment);
+        let n2 = signer.derive_musig2_nonce(cn, Musig2Context::Commitment);
+        let n_other_cn = signer.derive_musig2_nonce(cn + 1, Musig2Context::Commitment);
+        let n_revoke = signer.derive_musig2_nonce(cn, Musig2Context::Revoke);
+
+        assert_eq!(
+            n1.to_bytes(),
+            n2.to_bytes(),
+            "same cn + Commitment context must be deterministic"
+        );
+        assert_ne!(
+            n1.to_bytes(),
+            n_other_cn.to_bytes(),
+            "different cn must change the secnonce"
+        );
+        assert_ne!(
+            n1.to_bytes(),
+            n_revoke.to_bytes(),
+            "Revoke context must not share Commitment secnonce"
+        );
+    }
+
+    #[test]
+    fn fbr_2026_0062_funding_sign_context_nonce_ignores_message() {
+        // Protocol digests (commitment tx vs shutdown tx) are never mixed into
+        // derive_musig2_nonce — only local_cn and Musig2Context matter.
+        let cn = 5u64;
+        let ctx_a = funding_sign_context_at_cn(cn);
+        let ctx_b = funding_sign_context_at_cn(cn);
+        assert_eq!(
+            ctx_a.secnonce.to_bytes(),
+            ctx_b.secnonce.to_bytes(),
+            "funding sign context at the same cn always reuses one secnonce"
+        );
+    }
+
+    /// Defensive PoC: receive-CS path (`sign_and_aggregate` on M_local) then
+    /// ClosingSigned path (`sign` on M_shutdown) at the same cn reuses secnonce.
+    ///
+    /// Does **not** implement private-key recovery — only proves reuse.
+    #[test]
+    #[should_panic(expected = "Musig2 secnonce")]
+    fn fbr_2026_0062_commitment_then_shutdown_digests_reuse_secnonce() {
+        clear_secnonce_tracker();
+        let (victim_ctx, attacker_ctx) = funding_sign_pair_at_cn(5);
+
+        // Stand-ins for compute_tx_message(commitment(for_remote=false))
+        // and compute_tx_message(shutdown_tx).
+        let m_local_commitment = [0xAAu8; 32];
+        let m_shutdown = [0xBBu8; 32];
+
+        // Path 1: peer CS → verify_and_complete_tx → sign_and_aggregate(M_local)
+        let attacker_partial = attacker_ctx
+            .sign(&m_local_commitment)
+            .expect("attacker partial for local commitment");
+        // Clear tracker so only victim's reuse is measured (attacker used a different secnonce).
+        clear_secnonce_tracker();
+        victim_ctx
+            .sign_and_aggregate(&m_local_commitment, attacker_partial)
+            .expect("victim aggregates commitment at cn=N");
+
+        // Path 2: ClosingSigned → sign(M_shutdown) with the same victim secnonce
+        let _ = victim_ctx.sign(&m_shutdown);
+    }
+
+    /// Same reuse via two `sign` calls (explicit CS then close, or two funding signs).
+    #[test]
+    #[should_panic(expected = "Musig2 secnonce")]
+    fn fbr_2026_0062_two_sign_calls_different_messages_same_cn_panics() {
+        clear_secnonce_tracker();
+        let ctx = funding_sign_context_at_cn(9);
+        let m_commit = [0x11u8; 32];
+        let m_close = [0x22u8; 32];
+        ctx.sign(&m_commit).expect("first sign ok");
+        let _ = ctx.sign(&m_close);
+    }
+
+    /// Same message may be re-signed (CommitDiff replay); tracker must allow it.
+    #[test]
+    fn fbr_2026_0062_same_message_resign_is_allowed() {
+        clear_secnonce_tracker();
+        let ctx = funding_sign_context_at_cn(3);
+        let m = [0xCDu8; 32];
+        ctx.sign(&m).expect("first");
+        ctx.sign(&m)
+            .expect("identical message re-sign is not nonce reuse");
     }
 }

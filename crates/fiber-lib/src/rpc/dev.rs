@@ -2,6 +2,12 @@
 // use crate::watchtower::WatchtowerStore;
 use crate::fiber::{
     channel::{ChannelCommand, ChannelCommandWithId, RemoveTlcCommand},
+    network::{
+        BuildShutdownTxMessageCommand, CapturedInboundFiberMessage,
+        DeliverCapturedFiberMessagesCommand, FiberMessageIntercept, RawChannelMessageKind,
+        ReleaseHeldOutboundFiberMessagesCommand, SendRawChannelMessageCommand,
+    },
+    types::{FiberChannelMessage, FiberMessage},
     NetworkActorCommand, NetworkActorMessage,
 };
 use crate::rpc::utils::rpc_error;
@@ -16,6 +22,7 @@ use fiber_types::{
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
+use musig2::BinaryEncoding;
 
 use ractor::call;
 use std::str::FromStr;
@@ -30,9 +37,15 @@ use crate::{
 };
 
 pub use fiber_json_types::{
-    AddTlcParams, AddTlcResult, CheckChannelShutdownParams, CommitmentSignedParams,
-    RemoveTlcParams, RemoveTlcReason, SignExternalFundingTxParams, SignExternalFundingTxResult,
+    AddTlcParams, AddTlcResult, BuildShutdownTxMessageParams, BuildShutdownTxMessageResult,
+    CapturedFiberMessage, CheckChannelShutdownParams, CommitmentSignedParams,
+    DeliverCapturedFiberMessagesParams, DeliverCapturedFiberMessagesResult,
+    GetChannelMusig2PublicParams, GetChannelMusig2PublicResult,
+    ReleaseHeldOutboundFiberMessagesParams, ReleaseHeldOutboundFiberMessagesResult,
+    RemoveTlcParams, RemoveTlcReason, SendRawChannelMessageParams, SendRawChannelMessageResult,
+    SetFiberMessageInterceptParams, SignExternalFundingTxParams, SignExternalFundingTxResult,
     SubmitCommitmentTransactionParams, SubmitCommitmentTransactionResult,
+    TakeCapturedFiberMessagesResult,
 };
 
 /// RPC module for development purposes, this module is not intended to be used in production.
@@ -79,6 +92,65 @@ trait DevRpc {
         &self,
         params: SignExternalFundingTxParams,
     ) -> Result<SignExternalFundingTxResult, ErrorObjectOwned>;
+
+    /// Intercept Fiber channel messages on this node so a test client can act as a
+    /// malicious peer: drop outbound `RevokeAndAck` and capture inbound messages
+    /// without delivering them to the honest channel actor.
+    #[method(name = "set_fiber_message_intercept")]
+    async fn set_fiber_message_intercept(
+        &self,
+        params: SetFiberMessageInterceptParams,
+    ) -> Result<(), ErrorObjectOwned>;
+
+    /// Drain inbound Fiber messages captured by `set_fiber_message_intercept`.
+    /// The intercept stays active.
+    #[method(name = "take_captured_fiber_messages")]
+    async fn take_captured_fiber_messages(
+        &self,
+    ) -> Result<TakeCapturedFiberMessagesResult, ErrorObjectOwned>;
+
+    /// Deliver previously captured inbound messages to the honest channel actor
+    /// (delay / later-release). Consumes the delivered messages from the capture queue.
+    #[method(name = "deliver_captured_fiber_messages")]
+    async fn deliver_captured_fiber_messages(
+        &self,
+        params: DeliverCapturedFiberMessagesParams,
+    ) -> Result<DeliverCapturedFiberMessagesResult, ErrorObjectOwned>;
+
+    /// Drain outbound messages held by `outbound_hold_kinds` without sending them.
+    #[method(name = "take_held_outbound_fiber_messages")]
+    async fn take_held_outbound_fiber_messages(
+        &self,
+    ) -> Result<TakeCapturedFiberMessagesResult, ErrorObjectOwned>;
+
+    /// Send previously held outbound messages to the peer.
+    #[method(name = "release_held_outbound_fiber_messages")]
+    async fn release_held_outbound_fiber_messages(
+        &self,
+        params: ReleaseHeldOutboundFiberMessagesParams,
+    ) -> Result<ReleaseHeldOutboundFiberMessagesResult, ErrorObjectOwned>;
+
+    /// Send a `CommitmentSigned` or `Shutdown` without running the honest channel-actor
+    /// send path (no automatic `RevokeAndAck`, no local commitment-number advance).
+    #[method(name = "send_raw_channel_message")]
+    async fn send_raw_channel_message(
+        &self,
+        params: SendRawChannelMessageParams,
+    ) -> Result<SendRawChannelMessageResult, ErrorObjectOwned>;
+
+    /// Return the public musig2 session of a channel from this node's own state.
+    #[method(name = "get_channel_musig2_public")]
+    async fn get_channel_musig2_public(
+        &self,
+        params: GetChannelMusig2PublicParams,
+    ) -> Result<GetChannelMusig2PublicResult, ErrorObjectOwned>;
+
+    /// Rebuild the shutdown-transaction sighash from publicly observed close scripts.
+    #[method(name = "build_shutdown_tx_message")]
+    async fn build_shutdown_tx_message(
+        &self,
+        params: BuildShutdownTxMessageParams,
+    ) -> Result<BuildShutdownTxMessageResult, ErrorObjectOwned>;
 }
 
 pub struct DevRpcServerImpl {
@@ -145,6 +217,60 @@ impl DevRpcServer for DevRpcServerImpl {
         params: SignExternalFundingTxParams,
     ) -> Result<SignExternalFundingTxResult, ErrorObjectOwned> {
         self.sign_external_funding_tx(params).await
+    }
+
+    async fn set_fiber_message_intercept(
+        &self,
+        params: SetFiberMessageInterceptParams,
+    ) -> Result<(), ErrorObjectOwned> {
+        self.set_fiber_message_intercept(params).await
+    }
+
+    async fn take_captured_fiber_messages(
+        &self,
+    ) -> Result<TakeCapturedFiberMessagesResult, ErrorObjectOwned> {
+        self.take_captured_fiber_messages().await
+    }
+
+    async fn deliver_captured_fiber_messages(
+        &self,
+        params: DeliverCapturedFiberMessagesParams,
+    ) -> Result<DeliverCapturedFiberMessagesResult, ErrorObjectOwned> {
+        self.deliver_captured_fiber_messages(params).await
+    }
+
+    async fn take_held_outbound_fiber_messages(
+        &self,
+    ) -> Result<TakeCapturedFiberMessagesResult, ErrorObjectOwned> {
+        self.take_held_outbound_fiber_messages().await
+    }
+
+    async fn release_held_outbound_fiber_messages(
+        &self,
+        params: ReleaseHeldOutboundFiberMessagesParams,
+    ) -> Result<ReleaseHeldOutboundFiberMessagesResult, ErrorObjectOwned> {
+        self.release_held_outbound_fiber_messages(params).await
+    }
+
+    async fn send_raw_channel_message(
+        &self,
+        params: SendRawChannelMessageParams,
+    ) -> Result<SendRawChannelMessageResult, ErrorObjectOwned> {
+        self.send_raw_channel_message(params).await
+    }
+
+    async fn get_channel_musig2_public(
+        &self,
+        params: GetChannelMusig2PublicParams,
+    ) -> Result<GetChannelMusig2PublicResult, ErrorObjectOwned> {
+        self.get_channel_musig2_public(params).await
+    }
+
+    async fn build_shutdown_tx_message(
+        &self,
+        params: BuildShutdownTxMessageParams,
+    ) -> Result<BuildShutdownTxMessageResult, ErrorObjectOwned> {
+        self.build_shutdown_tx_message(params).await
     }
 }
 impl DevRpcServerImpl {
@@ -438,5 +564,295 @@ impl DevRpcServerImpl {
         let signed_funding_tx = ckb_jsonrpc_types::Transaction::from(signed_tx.data());
 
         Ok(SignExternalFundingTxResult { signed_funding_tx })
+    }
+
+    pub async fn set_fiber_message_intercept(
+        &self,
+        params: SetFiberMessageInterceptParams,
+    ) -> Result<(), ErrorObjectOwned> {
+        let intercept = FiberMessageIntercept {
+            channel_id: params.channel_id.into(),
+            suppress_outbound_revoke_and_ack: params.suppress_outbound_revoke_and_ack,
+            capture_inbound: params.capture_inbound,
+            inbound_capture_kinds: params.inbound_capture_kinds.clone(),
+            inbound_drop_kinds: params.inbound_drop_kinds.clone(),
+            outbound_drop_kinds: params.outbound_drop_kinds.clone(),
+            outbound_hold_kinds: params.outbound_hold_kinds.clone(),
+        };
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::SetFiberMessageIntercept(
+                intercept, rpc_reply,
+            ))
+        };
+        handle_actor_call!(self.network_actor, message, params)
+    }
+
+    pub async fn take_captured_fiber_messages(
+        &self,
+    ) -> Result<TakeCapturedFiberMessagesResult, ErrorObjectOwned> {
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::TakeCapturedFiberMessages(rpc_reply))
+        };
+        match call!(self.network_actor, message) {
+            Ok(captured) => Ok(TakeCapturedFiberMessagesResult {
+                messages: captured
+                    .into_iter()
+                    .map(captured_fiber_message_from)
+                    .collect(),
+            }),
+            Err(e) => Err(rpc_error(e.to_string())),
+        }
+    }
+
+    pub async fn deliver_captured_fiber_messages(
+        &self,
+        params: DeliverCapturedFiberMessagesParams,
+    ) -> Result<DeliverCapturedFiberMessagesResult, ErrorObjectOwned> {
+        let command = DeliverCapturedFiberMessagesCommand {
+            count: params.count,
+            kinds: params.kinds,
+        };
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::DeliverCapturedFiberMessages(
+                command, rpc_reply,
+            ))
+        };
+        match call!(self.network_actor, message) {
+            Ok(Ok(delivered)) => Ok(DeliverCapturedFiberMessagesResult { delivered }),
+            Ok(Err(e)) => Err(rpc_error(e)),
+            Err(e) => Err(rpc_error(e.to_string())),
+        }
+    }
+
+    pub async fn take_held_outbound_fiber_messages(
+        &self,
+    ) -> Result<TakeCapturedFiberMessagesResult, ErrorObjectOwned> {
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::TakeHeldOutboundFiberMessages(
+                rpc_reply,
+            ))
+        };
+        match call!(self.network_actor, message) {
+            Ok(held) => Ok(TakeCapturedFiberMessagesResult {
+                messages: held
+                    .into_iter()
+                    .map(|message| {
+                        captured_fiber_message_from(CapturedInboundFiberMessage {
+                            peer: message.target,
+                            message: message.message,
+                        })
+                    })
+                    .collect(),
+            }),
+            Err(e) => Err(rpc_error(e.to_string())),
+        }
+    }
+
+    pub async fn release_held_outbound_fiber_messages(
+        &self,
+        params: ReleaseHeldOutboundFiberMessagesParams,
+    ) -> Result<ReleaseHeldOutboundFiberMessagesResult, ErrorObjectOwned> {
+        let command = ReleaseHeldOutboundFiberMessagesCommand {
+            count: params.count,
+            kinds: params.kinds,
+        };
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::ReleaseHeldOutboundFiberMessages(
+                command, rpc_reply,
+            ))
+        };
+        match call!(self.network_actor, message) {
+            Ok(Ok(released)) => Ok(ReleaseHeldOutboundFiberMessagesResult { released }),
+            Ok(Err(e)) => Err(rpc_error(e)),
+            Err(e) => Err(rpc_error(e.to_string())),
+        }
+    }
+
+    pub async fn send_raw_channel_message(
+        &self,
+        params: SendRawChannelMessageParams,
+    ) -> Result<SendRawChannelMessageResult, ErrorObjectOwned> {
+        let kind = match params.kind {
+            fiber_json_types::RawChannelMessageKind::CommitmentSigned => {
+                RawChannelMessageKind::CommitmentSigned
+            }
+            fiber_json_types::RawChannelMessageKind::Shutdown => RawChannelMessageKind::Shutdown,
+            fiber_json_types::RawChannelMessageKind::AddTlc => RawChannelMessageKind::AddTlc,
+            fiber_json_types::RawChannelMessageKind::RemoveTlc => RawChannelMessageKind::RemoveTlc,
+            fiber_json_types::RawChannelMessageKind::ReestablishChannel => {
+                RawChannelMessageKind::ReestablishChannel
+            }
+            fiber_json_types::RawChannelMessageKind::TxAbort => RawChannelMessageKind::TxAbort,
+        };
+        let abort_message = params.abort_message.as_deref().map(|value| {
+            let hex = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .unwrap_or(value);
+            hex::decode(hex).unwrap_or_else(|_| value.as_bytes().to_vec())
+        });
+        let command = SendRawChannelMessageCommand {
+            channel_id: params.channel_id.into(),
+            kind,
+            nonce_commitment_number: params.nonce_commitment_number,
+            close_script: params.close_script.map(Into::into),
+            fee_rate: params.fee_rate,
+            amount: params.amount,
+            payment_hash: params.payment_hash.map(Into::into),
+            expiry: params.expiry,
+            tlc_id: params.tlc_id,
+            remove_fail_error_code: params.remove_fail_error_code,
+            local_commitment_number: params.local_commitment_number,
+            remote_commitment_number: params.remote_commitment_number,
+            abort_message,
+        };
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::SendRawChannelMessage(
+                command, rpc_reply,
+            ))
+        };
+        match call!(self.network_actor, message) {
+            Ok(Ok(result)) => Ok(SendRawChannelMessageResult {
+                funding_tx_partial_signature: result
+                    .funding_tx_partial_signature
+                    .map(|s| hex_0x(&s.serialize())),
+                next_commitment_nonce: result
+                    .next_commitment_nonce
+                    .as_ref()
+                    .map(|n| hex_0x(&n.to_bytes())),
+            }),
+            Ok(Err(e)) => Err(rpc_error(e)),
+            Err(e) => Err(rpc_error(e.to_string())),
+        }
+    }
+
+    pub async fn get_channel_musig2_public(
+        &self,
+        params: GetChannelMusig2PublicParams,
+    ) -> Result<GetChannelMusig2PublicResult, ErrorObjectOwned> {
+        let channel_id = params.channel_id.into();
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::GetChannelMusig2Public(
+                channel_id, rpc_reply,
+            ))
+        };
+        match call!(self.network_actor, message) {
+            Ok(Ok(info)) => Ok(GetChannelMusig2PublicResult {
+                local_funding_pubkey: info.local_funding_pubkey.into(),
+                remote_funding_pubkey: info.remote_funding_pubkey.into(),
+                local_commitment_number: info.local_commitment_number,
+                remote_commitment_number: info.remote_commitment_number,
+                local_pubnonce: hex_0x(&info.local_pubnonce.to_bytes()),
+                last_committed_remote_nonce: hex_0x(&info.last_committed_remote_nonce.to_bytes()),
+                next_commitment_nonce: hex_0x(&info.next_commitment_nonce.to_bytes()),
+                own_commitment_message: JsonHash256(info.own_commitment_message),
+                peer_commitment_message: JsonHash256(info.peer_commitment_message),
+                funding_outpoint: info.funding_outpoint.into(),
+                local_first: info.local_first,
+            }),
+            Ok(Err(e)) => Err(rpc_error(e)),
+            Err(e) => Err(rpc_error(e.to_string())),
+        }
+    }
+
+    pub async fn build_shutdown_tx_message(
+        &self,
+        params: BuildShutdownTxMessageParams,
+    ) -> Result<BuildShutdownTxMessageResult, ErrorObjectOwned> {
+        let command = BuildShutdownTxMessageCommand {
+            channel_id: params.channel_id.into(),
+            local_close_script: params.local_close_script.into(),
+            remote_close_script: params.remote_close_script.into(),
+            local_fee_rate: params.local_fee_rate,
+            remote_fee_rate: params.remote_fee_rate,
+        };
+        let message = |rpc_reply| {
+            NetworkActorMessage::Command(NetworkActorCommand::BuildShutdownTxMessage(
+                command, rpc_reply,
+            ))
+        };
+        match call!(self.network_actor, message) {
+            Ok(Ok(message)) => Ok(BuildShutdownTxMessageResult {
+                message: JsonHash256(message),
+            }),
+            Ok(Err(e)) => Err(rpc_error(e)),
+            Err(e) => Err(rpc_error(e.to_string())),
+        }
+    }
+}
+
+fn hex_0x(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn captured_fiber_message_from(captured: CapturedInboundFiberMessage) -> CapturedFiberMessage {
+    let kind;
+    let mut funding_tx_partial_signature = None;
+    let mut closing_partial_signature = None;
+    let mut next_commitment_nonce = None;
+    let mut close_script = None;
+    let mut fee_rate = None;
+    let mut tlc_id = None;
+    let mut payment_hash = None;
+    let mut local_commitment_number = None;
+    let mut remote_commitment_number = None;
+    let channel_id = match &captured.message {
+        FiberMessage::ChannelNormalOperation(message) => {
+            Some(JsonHash256(message.get_channel_id().into()))
+        }
+        FiberMessage::ChannelInitialization(open) => Some(JsonHash256(open.channel_id.into())),
+        _ => None,
+    };
+    match &captured.message {
+        FiberMessage::ChannelNormalOperation(FiberChannelMessage::CommitmentSigned(cs)) => {
+            kind = "CommitmentSigned".to_string();
+            funding_tx_partial_signature =
+                Some(hex_0x(&cs.funding_tx_partial_signature.serialize()));
+            next_commitment_nonce = Some(hex_0x(&cs.next_commitment_nonce.to_bytes()));
+        }
+        FiberMessage::ChannelNormalOperation(FiberChannelMessage::ClosingSigned(cs)) => {
+            kind = "ClosingSigned".to_string();
+            closing_partial_signature = Some(hex_0x(&cs.partial_signature.serialize()));
+        }
+        FiberMessage::ChannelNormalOperation(FiberChannelMessage::Shutdown(shutdown)) => {
+            kind = "Shutdown".to_string();
+            close_script = Some(shutdown.close_script.clone().into());
+            fee_rate = Some(shutdown.fee_rate.as_u64());
+        }
+        FiberMessage::ChannelNormalOperation(FiberChannelMessage::AddTlc(add)) => {
+            kind = "AddTlc".to_string();
+            tlc_id = Some(add.tlc_id);
+            payment_hash = Some(JsonHash256(add.payment_hash.into()));
+        }
+        FiberMessage::ChannelNormalOperation(FiberChannelMessage::RemoveTlc(remove)) => {
+            kind = "RemoveTlc".to_string();
+            tlc_id = Some(remove.tlc_id);
+        }
+        FiberMessage::ChannelNormalOperation(FiberChannelMessage::ReestablishChannel(reest)) => {
+            kind = "ReestablishChannel".to_string();
+            local_commitment_number = Some(reest.local_commitment_number);
+            remote_commitment_number = Some(reest.remote_commitment_number);
+        }
+        FiberMessage::ChannelNormalOperation(other) => {
+            kind = other.to_string();
+        }
+        other => {
+            kind = format!("{other:?}");
+        }
+    }
+    CapturedFiberMessage {
+        peer_pubkey: captured.peer.into(),
+        channel_id,
+        kind,
+        payload: hex_0x(captured.message.clone().to_molecule_bytes().as_ref()),
+        funding_tx_partial_signature,
+        closing_partial_signature,
+        next_commitment_nonce,
+        close_script,
+        fee_rate,
+        tlc_id,
+        payment_hash,
+        local_commitment_number,
+        remote_commitment_number,
     }
 }
