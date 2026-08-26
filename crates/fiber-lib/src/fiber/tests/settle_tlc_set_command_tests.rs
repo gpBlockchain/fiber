@@ -1,6 +1,11 @@
 //! Tests for SettleTlcSetCommand
 
-use crate::fiber::channel::{ChannelActorState, ChannelActorStateStore, CommitDiff};
+use crate::fiber::channel::{
+    has_pending_tlc_for_payment_hash, ChannelActorState, ChannelActorStateStore, CommitDiff,
+};
+use crate::fiber::onchain_tlc_reconcile::{
+    LegacyOnChainTlcSettlement, OnChainTlcSettlement, StoredOnChainTlcSettlement,
+};
 use crate::fiber::settle_tlc_set_command::{SettleTlcSetCommand, TlcSettlement};
 use crate::fiber::types::{Hash256, HoldTlc, Pubkey, RemoveTlcReason};
 use crate::gen_rand_sha256_hash;
@@ -23,22 +28,24 @@ use std::collections::HashMap;
 const TEST_SHARED_SECRET: [u8; 32] = [42u8; 32];
 
 /// Mock store for testing that implements PreimageStore, InvoiceStore, and ChannelActorStateStore
-struct MockStore {
+pub(crate) struct MockStore {
     invoices: RefCell<HashMap<Hash256, CkbInvoice>>,
     invoice_statuses: RefCell<HashMap<Hash256, CkbInvoiceStatus>>,
     preimages: RefCell<HashMap<Hash256, Hash256>>,
     hold_tlcs: RefCell<HashMap<Hash256, Vec<HoldTlc>>>,
     channel_states: RefCell<HashMap<Hash256, ChannelActorState>>,
+    pub(crate) onchain_settlements: RefCell<HashMap<(Hash256, TLCId), StoredOnChainTlcSettlement>>,
 }
 
 impl MockStore {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             invoices: RefCell::new(HashMap::new()),
             invoice_statuses: RefCell::new(HashMap::new()),
             preimages: RefCell::new(HashMap::new()),
             hold_tlcs: RefCell::new(HashMap::new()),
             channel_states: RefCell::new(HashMap::new()),
+            onchain_settlements: RefCell::new(HashMap::new()),
         }
     }
 
@@ -64,7 +71,7 @@ impl MockStore {
         self
     }
 
-    fn with_preimage(self, payment_hash: Hash256, preimage: Hash256) -> Self {
+    pub(crate) fn with_preimage(self, payment_hash: Hash256, preimage: Hash256) -> Self {
         self.preimages.borrow_mut().insert(payment_hash, preimage);
         self
     }
@@ -72,6 +79,73 @@ impl MockStore {
     fn with_channel_state(self, state: ChannelActorState) -> Self {
         let channel_id = state.id;
         self.channel_states.borrow_mut().insert(channel_id, state);
+        self
+    }
+
+    pub(crate) fn with_onchain_settlement(
+        self,
+        channel_id: Hash256,
+        tlc_id: TLCId,
+        settlement: OnChainTlcSettlement,
+    ) -> Self {
+        self.onchain_settlements.borrow_mut().insert(
+            (channel_id, tlc_id),
+            StoredOnChainTlcSettlement::Exact(settlement),
+        );
+        self
+    }
+
+    pub(crate) fn with_onchain_settled(
+        self,
+        channel_id: Hash256,
+        tlc_id: TLCId,
+        payment_hash: Hash256,
+        hash_algorithm: HashAlgorithm,
+    ) -> Self {
+        self.with_onchain_settlement(
+            channel_id,
+            tlc_id,
+            OnChainTlcSettlement {
+                payment_hash,
+                hash_algorithm,
+                preimage: None,
+                tx_hash: gen_rand_sha256_hash(),
+                tlc_index: 0,
+            },
+        )
+    }
+
+    pub(crate) fn with_onchain_preimage(
+        self,
+        channel_id: Hash256,
+        tlc_id: TLCId,
+        payment_hash: Hash256,
+        hash_algorithm: HashAlgorithm,
+        preimage: Hash256,
+    ) -> Self {
+        self.with_onchain_settlement(
+            channel_id,
+            tlc_id,
+            OnChainTlcSettlement {
+                payment_hash,
+                hash_algorithm,
+                preimage: Some(preimage),
+                tx_hash: gen_rand_sha256_hash(),
+                tlc_index: 0,
+            },
+        )
+    }
+
+    pub(crate) fn with_legacy_onchain_settlement(
+        self,
+        channel_id: Hash256,
+        tlc_id: TLCId,
+        settlement: LegacyOnChainTlcSettlement,
+    ) -> Self {
+        self.onchain_settlements.borrow_mut().insert(
+            (channel_id, tlc_id),
+            StoredOnChainTlcSettlement::Legacy(settlement),
+        );
         self
     }
 }
@@ -147,11 +221,19 @@ impl ChannelActorStateStore for MockStore {
     }
 
     fn get_channel_states(&self, _pubkey: Option<Pubkey>) -> Vec<(Pubkey, Hash256, ChannelState)> {
-        vec![]
+        self.channel_states
+            .borrow()
+            .values()
+            .map(|state| (state.remote_pubkey, state.id, state.state))
+            .collect()
     }
 
     fn get_channel_state_by_outpoint(&self, _id: &OutPoint) -> Option<ChannelActorState> {
         None
+    }
+
+    fn get_all_channel_states(&self) -> Vec<ChannelActorState> {
+        vec![]
     }
 
     fn insert_payment_custom_records(
@@ -195,8 +277,16 @@ impl ChannelActorStateStore for MockStore {
         HashMap::new()
     }
 
-    fn is_tlc_settled(&self, _channel_id: &Hash256, _payment_hash: &Hash256) -> bool {
-        false
+    fn get_onchain_tlc_settlement(
+        &self,
+        channel_id: &Hash256,
+        tlc_id: TLCId,
+        _payment_hash: &Hash256,
+    ) -> Option<StoredOnChainTlcSettlement> {
+        self.onchain_settlements
+            .borrow()
+            .get(&(*channel_id, tlc_id))
+            .cloned()
     }
 
     fn store_pending_commit_diff(&self, _channel_id: &Hash256, _diff: &CommitDiff) {
@@ -226,7 +316,7 @@ fn create_test_invoice(payment_hash: Hash256, amount: Option<u128>, allow_mpp: b
     builder.build().expect("build invoice")
 }
 
-fn create_test_channel_state_with_tlc(
+pub(crate) fn create_test_channel_state_with_tlc(
     channel_id: Hash256,
     tlc_id: u64,
     amount: u128,
@@ -323,6 +413,7 @@ fn create_test_channel_state_with_tlc(
         ephemeral_config: Default::default(),
         funding_abort_detail: None,
         private_key: None,
+        needs_backup: false,
     }
 }
 
@@ -343,6 +434,42 @@ fn get_error_code(settlement: &TlcSettlement) -> Option<TlcErrorCode> {
         }
         _ => None,
     }
+}
+
+#[test]
+fn test_preimage_cleanup_detects_pending_same_hash_tlc_in_other_channel() {
+    let payment_hash = gen_rand_sha256_hash();
+    let current_channel_id = gen_rand_sha256_hash();
+    let other_channel_id = gen_rand_sha256_hash();
+    let mut current_state =
+        create_test_channel_state_with_tlc(current_channel_id, 0, 1000, payment_hash, None);
+    current_state.tlc_state.apply_remove_tlc(TLCId::Received(0));
+    let other_state =
+        create_test_channel_state_with_tlc(other_channel_id, 0, 1000, payment_hash, None);
+    let store = MockStore::new()
+        .with_channel_state(current_state.clone())
+        .with_channel_state(other_state);
+
+    assert!(
+        has_pending_tlc_for_payment_hash(&store, &current_state, payment_hash),
+        "preimage should stay while another channel has a same-hash tlc"
+    );
+}
+
+#[test]
+fn test_preimage_cleanup_ignores_stale_current_channel_state() {
+    let payment_hash = gen_rand_sha256_hash();
+    let current_channel_id = gen_rand_sha256_hash();
+    let persisted_current_state =
+        create_test_channel_state_with_tlc(current_channel_id, 0, 1000, payment_hash, None);
+    let mut current_state = persisted_current_state.clone();
+    current_state.tlc_state.apply_remove_tlc(TLCId::Received(0));
+    let store = MockStore::new().with_channel_state(persisted_current_state);
+
+    assert!(
+        !has_pending_tlc_for_payment_hash(&store, &current_state, payment_hash),
+        "stale persisted state for the channel currently applying removal must not keep preimage"
+    );
 }
 
 #[test]

@@ -29,17 +29,31 @@ TODO
 - [ ] Advanced channel liquidity management
 - [ ] Atomic multi-path payment
 
-## Build and run a testnet node
+## Quick Install (One-liner)
+
+```bash
+# Install to default location (~/.fiber)
+curl -sSfL https://raw.githubusercontent.com/nervosnetwork/fiber/main/tools/install/install.sh | bash
+
+# Install mainnet non-interactively with a trusted CKB RPC endpoint
+curl -sSfL https://raw.githubusercontent.com/nervosnetwork/fiber/main/tools/install/install.sh | INSTALL_DIR=/opt/fiber FNN_VERSION=0.9.0 NETWORK=mainnet CKB_RPC_URL=https://your-trusted-mainnet-ckb-rpc.example bash
+```
+
+Mainnet installations do not select a public CKB RPC endpoint automatically.
+The guided installer prompts for one; bootstrap or non-interactive installations require
+`CKB_RPC_URL` to be set explicitly.
+
+## Build from source and run a testnet node
 
 1. Build the project, if you are using the released binary, you can skip this step:
 
-```
+```bash
 cargo build --release
 ```
 
 2. Create a data folder for the node, then copy the built binary and testnet config file to it:
 
-```
+```bash
 mkdir /folder-to/my-fnn
 // if you are using the released binary, replace target/release/fnn with the path of released binary
 cp target/release/fnn /folder-to/my-fnn
@@ -49,7 +63,7 @@ cd /folder-to/my-fnn
 
 3. FNN has the built-in wallet functionality to sign funding transactions, let's create or import a private key first. The private key is stored in the data folder and named `ckb/key`. You may use the ckb-cli to generate a new key or export an existing key:
 
-```
+```bash
 mkdir ckb
 ckb-cli account export --lock-arg <lock_arg> --extended-privkey-path ./ckb/exported-key
 // ckb-cli exports master private key and chain code, FNN only needs the private key part
@@ -60,7 +74,7 @@ rm ./ckb/exported-key
 
 4. Start the node, by default it will output logs to the console, you may redirect it to a file. Before starting, you must set the `FIBER_SECRET_KEY_PASSWORD` environment variable to encrypt the wallet private key file (which was stored in plain text during the previous step). Additionally, you can configure logging verbosity with the `RUST_LOG` environment variable—use predefined levels like `info`, `debug`, or `trace`, or specify granular logging with patterns such as `info,fnn=debug` to enable debug logs only for the FNN module.
 
-```
+```bash
 FIBER_SECRET_KEY_PASSWORD='YOUR_PASSWORD' RUST_LOG='info' ./fnn -c config.yml -d .
 ```
 
@@ -76,29 +90,28 @@ FNN is still under development, the protocol and storage format may changed betw
 
 2. Stop the node and remove the storage of the node:
 
-```
+```bash
 rm -rf /folder-to/my-fnn/fiber/store
 ```
 
 3. Replace the fnn binary with the new version and start the node again.
 
 
-If you want to keep the channel state, you may try to migrate the storage format manually:
+If you want to keep the channel state, check whether your upgrade path supports
+in-place migration before replacing binaries. Since v0.9.0, supported storage
+migrations are integrated into the `fnn` startup process, and release bundles no
+longer include a standalone `fnn-migrate` binary.
 
 1. Stop the node.
 
 2. Backup the storage folder `/folder-to/my-fnn/fiber/store`.
 
-3. Run the fnn-migrate (it can be found in the release binary package) to migrate the storage format:
+3. Replace the `fnn` binary with the new version and start the node again.
 
-```
-./fnn-migrate -d /path/to/fiber-dir
-```
-
-The `-d` / `--dir` flag takes the Fiber data directory (same as `fnn -d`).
-The tool opens the RocksDB store at `<dir>/store` automatically.
-
-4. Replace the fnn binary with the new version and start the node again.
+If the new `fnn` reports that the database is too old for the built-in migration
+path, use the legacy `fnn-migrate` tool from the matching v0.8.x release first.
+For the v0.7.x to v0.8.0 legacy migration flow, see
+[v0.8.0 Migration Guide](./docs/notes/v0.8.0-migration-guide.md).
 
 ## Documentation
 

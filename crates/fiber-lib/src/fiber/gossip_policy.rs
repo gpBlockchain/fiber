@@ -420,17 +420,46 @@ impl ByteTokenBucket {
         }
 
         self.refill(now_ms);
+        let delay_ms = self.peek_delay(bytes);
+        self.available_bytes = self.available_bytes.saturating_sub(i128::from(bytes));
+        delay_ms
+    }
+
+    fn peek_delay(&self, bytes: u64) -> u64 {
         let bytes = i128::from(bytes);
         let deficit_bytes = (bytes.saturating_sub(self.available_bytes)).max(0) as u128;
-        let delay_ms = if deficit_bytes == 0 {
+        if deficit_bytes == 0 {
             0
         } else {
             deficit_bytes
                 .saturating_mul(1_000)
                 .div_ceil(u128::from(self.config.rate_bytes_per_sec)) as u64
+        }
+    }
+
+    fn peek_delay_after_refill(&self, bytes: u64, now_ms: u64) -> u64 {
+        if self.config.is_disabled() {
+            return 0;
+        }
+        let available = if now_ms > self.last_refill_ms {
+            let elapsed_ms = now_ms - self.last_refill_ms;
+            let refill_bytes = (u128::from(elapsed_ms) * u128::from(self.config.rate_bytes_per_sec)
+                / 1_000) as i128;
+            self.available_bytes
+                .saturating_add(refill_bytes)
+                .min(i128::from(self.config.burst_bytes))
+        } else {
+            self.available_bytes
         };
-        self.available_bytes = self.available_bytes.saturating_sub(bytes);
-        delay_ms
+        let bytes = i128::from(bytes);
+        let deficit_bytes = (bytes.saturating_sub(available)).max(0) as u128;
+        if deficit_bytes == 0 {
+            0
+        } else {
+            deficit_bytes
+                .saturating_mul(1_000)
+                .div_ceil(u128::from(self.config.rate_bytes_per_sec)) as u64
+        }
     }
 
     pub(crate) fn refund(&mut self, bytes: u64, now_ms: u64) {
@@ -473,7 +502,7 @@ pub(crate) struct DiscreteTokenBucket {
 }
 
 impl DiscreteTokenBucket {
-    fn new(interval_ms: u64, capacity: u32) -> Self {
+    pub(crate) fn new(interval_ms: u64, capacity: u32) -> Self {
         Self {
             interval_ms,
             capacity,
@@ -499,13 +528,17 @@ impl DiscreteTokenBucket {
             .saturating_add(u64::from(refill) * self.interval_ms);
     }
 
-    fn try_consume(&mut self, now_ms: u64) -> bool {
+    pub(crate) fn try_consume(&mut self, now_ms: u64) -> bool {
         self.refill(now_ms);
         if self.available == 0 {
             return false;
         }
         self.available -= 1;
         true
+    }
+
+    fn is_full(&self) -> bool {
+        self.available == self.capacity
     }
 }
 
@@ -549,7 +582,15 @@ impl ChannelUpdateLimiter {
         }
 
         if self.buckets.len() >= self.max_entries {
-            self.evict_oldest_entry();
+            self.prune_idle_entries(now_ms);
+        }
+
+        if self.buckets.len() >= self.max_entries {
+            warn!(
+                max_entries = self.max_entries,
+                "Rejecting channel update rate-limit key due to capacity limit"
+            );
+            return false;
         }
 
         let mut entry = ChannelUpdateLimiterEntry {
@@ -561,16 +602,11 @@ impl ChannelUpdateLimiter {
         allowed
     }
 
-    fn evict_oldest_entry(&mut self) {
-        let Some(oldest_key) = self
-            .buckets
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used_ms)
-            .map(|(key, _)| key.clone())
-        else {
-            return;
-        };
-        self.buckets.remove(&oldest_key);
+    fn prune_idle_entries(&mut self, now_ms: u64) {
+        self.buckets.retain(|_, entry| {
+            entry.bucket.refill(now_ms);
+            !entry.bucket.is_full()
+        });
     }
 
     #[cfg(test)]
@@ -665,8 +701,17 @@ impl GossipPolicyState {
         bytes: u64,
         now_ms: u64,
     ) -> u64 {
-        let mut cloned = self.clone();
-        cloned.reserve_outbound_message(peer, bytes, now_ms)
+        let global_delay = self.global_outbound.peek_delay_after_refill(bytes, now_ms);
+        let peer_delay = self
+            .peer_outbound
+            .get(peer)
+            .map(|bucket| bucket.peek_delay_after_refill(bytes, now_ms))
+            .unwrap_or(0);
+        global_delay.max(peer_delay)
+    }
+
+    pub(crate) fn remove_outbound_peer(&mut self, peer: &Pubkey) {
+        self.peer_outbound.remove(peer);
     }
 
     pub(crate) fn reserve_outbound_message(
@@ -723,6 +768,22 @@ impl GossipPolicyState {
 
     pub(crate) fn outbound_delay_queue_capacity(&self) -> usize {
         self.outbound_delay_queue_capacity
+    }
+
+    pub(crate) fn outbound_global_delayed_byte_capacity(&self) -> Option<u64> {
+        if self.global_outbound.is_disabled() {
+            None
+        } else {
+            Some(self.global_outbound.burst_bytes())
+        }
+    }
+
+    pub(crate) fn outbound_peer_delayed_byte_capacity(&self) -> Option<u64> {
+        if self.peer_outbound_config.is_disabled() {
+            None
+        } else {
+            Some(self.peer_outbound_config.burst_bytes)
+        }
     }
 }
 

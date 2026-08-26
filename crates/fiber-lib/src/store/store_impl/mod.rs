@@ -4,6 +4,7 @@ use ckb_types::packed::Script;
 use crate::store::store_trait::{FiberStore, PrefixIterOptions};
 use fiber_store::backend::{BatchWriter, StorageBackend, TakeWhileFn};
 use fiber_store::iterator::{IteratorDirection, KVPair};
+use fiber_store::StoreError;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,6 +12,9 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cch::{CchOrderStore, CchStoreError};
 use crate::fiber::gossip::GossipMessageStore;
+use crate::fiber::onchain_tlc_reconcile::StoredOnChainTlcSettlement;
+#[cfg(feature = "watchtower")]
+use crate::fiber::onchain_tlc_reconcile::{LegacyOnChainTlcSettlement, OnChainTlcSettlement};
 use crate::fiber::types::HoldTlc;
 #[cfg(feature = "watchtower")]
 use crate::watchtower::WatchtowerStore;
@@ -30,20 +34,20 @@ use fiber_store::migration::{
     MigrateConfirmFn, MigrateProgressFn, INIT_DB_VERSION, MIGRATION_VERSION_KEY,
 };
 use fiber_types::schema::*;
-#[cfg(not(target_arch = "wasm32"))]
-use fiber_types::CchOrder;
 use fiber_types::{
     Attempt, AttemptStatus, BroadcastMessage, BroadcastMessageID, ChannelOpenRecord, ChannelState,
     Cursor, Direction, Hash256, PaymentCustomRecords, PaymentSession, PaymentStatus,
-    PersistentNetworkActorState, Pubkey, TimedResult, CURSOR_SIZE,
+    PersistentNetworkActorState, Pubkey, TLCId, TimedResult, CURSOR_SIZE,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use fiber_types::{CchOrder, CchReceiveBtcOrderCreation, CchSendBtcOrderCreation};
 #[cfg(feature = "watchtower")]
 use fiber_types::{ChannelData, NodeId, Privkey, RevocationData, SettlementData};
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::info;
-#[cfg(not(any(target_arch = "wasm32", test)))]
+#[cfg(all(feature = "watchtower", not(any(target_arch = "wasm32", test))))]
 use tracing::warn;
 
 /// Wrapper around `fiber_store::Store` that embeds an optional watcher callback.
@@ -58,6 +62,10 @@ use tracing::warn;
 pub struct Store {
     inner: fiber_store::Store,
     watcher: Option<Arc<dyn Fn(StoreChange) + Send + Sync>>,
+    #[cfg(feature = "watchtower")]
+    watchtower_write_locks: Arc<parking_lot::Mutex<HashMap<NodeId, Arc<parking_lot::Mutex<()>>>>>,
+    #[cfg(feature = "watchtower")]
+    onchain_tlc_settlement_write_lock: Arc<parking_lot::Mutex<()>>,
 }
 
 #[cfg(feature = "watchtower")]
@@ -65,7 +73,6 @@ pub struct Store {
 enum WatchtowerPreimageCleanupTarget<'a> {
     Exact(&'a Hash256),
     ExactSet(&'a HashSet<Hash256>),
-    TlcPaymentHash(&'a [u8; 20]),
 }
 
 #[cfg(feature = "watchtower")]
@@ -74,9 +81,6 @@ impl WatchtowerPreimageCleanupTarget<'_> {
         match self {
             WatchtowerPreimageCleanupTarget::Exact(target) => payment_hash == target,
             WatchtowerPreimageCleanupTarget::ExactSet(targets) => targets.contains(payment_hash),
-            WatchtowerPreimageCleanupTarget::TlcPaymentHash(target) => {
-                payment_hash.as_ref()[..20] == target[..]
-            }
         }
     }
 }
@@ -100,6 +104,22 @@ impl Store {
         if let Some(ref watcher) = self.watcher {
             watcher(change);
         }
+    }
+
+    fn channel_owns_attempt(&self, channel_outpoint: &OutPoint, attempt: &Attempt) -> bool {
+        self.get_channel_state_by_outpoint(channel_outpoint)
+            .is_some_and(|channel_state| {
+                channel_state.owns_payment_attempt(attempt.payment_hash, attempt.id)
+            })
+    }
+
+    #[cfg(feature = "watchtower")]
+    fn watchtower_write_lock(&self, node_id: &NodeId) -> Arc<parking_lot::Mutex<()>> {
+        self.watchtower_write_locks
+            .lock()
+            .entry(node_id.clone())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -131,6 +151,14 @@ impl StorageBackend for Store {
     ) -> Vec<KVPair> {
         self.inner
             .collect_iterator(start, direction, take_while_fn, limit)
+    }
+
+    fn backup(&self, path: &Path) -> Result<(), StoreError> {
+        self.inner.backup(path)
+    }
+
+    fn restore(&self, restore_path: &Path, db_path: &Path) -> Result<(), StoreError> {
+        self.inner.restore(restore_path, db_path)
     }
 }
 
@@ -172,6 +200,10 @@ pub fn open_store_with_migration<P: AsRef<Path>>(
     Ok(Store {
         inner: db,
         watcher: None,
+        #[cfg(feature = "watchtower")]
+        watchtower_write_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        #[cfg(feature = "watchtower")]
+        onchain_tlc_settlement_write_lock: Arc::new(parking_lot::Mutex::new(())),
     })
 }
 
@@ -192,6 +224,10 @@ pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
     let store = Store {
         inner: db,
         watcher: None,
+        #[cfg(feature = "watchtower")]
+        watchtower_write_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        #[cfg(feature = "watchtower")]
+        onchain_tlc_settlement_write_lock: Arc::new(parking_lot::Mutex::new(())),
     };
     let mut errors = HashSet::new();
 
@@ -279,6 +315,22 @@ pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
             #[cfg(not(target_arch = "wasm32"))]
             CCH_ORDER_PREFIX => {
                 check_deserialization::<CchOrder>(&value, "CCH_ORDER_PREFIX", &mut errors);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX => {
+                check_deserialization::<CchReceiveBtcOrderCreation>(
+                    &value,
+                    "CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX",
+                    &mut errors,
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            CCH_SEND_BTC_ORDER_CREATION_PREFIX => {
+                check_deserialization::<CchSendBtcOrderCreation>(
+                    &value,
+                    "CCH_SEND_BTC_ORDER_CREATION_PREFIX",
+                    &mut errors,
+                );
             }
             #[cfg(feature = "watchtower")]
             WATCHTOWER_CHANNEL_PREFIX => {
@@ -392,6 +444,10 @@ pub enum KeyValue {
     HoldTlc((Hash256, Hash256, u64), u64),
     #[cfg(not(target_arch = "wasm32"))]
     CchOrder(Hash256, CchOrder),
+    #[cfg(not(target_arch = "wasm32"))]
+    CchReceiveBtcOrderCreation(Hash256, CchReceiveBtcOrderCreation),
+    #[cfg(not(target_arch = "wasm32"))]
+    CchSendBtcOrderCreation(Hash256, CchSendBtcOrderCreation),
     ChannelOpenRecord(Hash256, ChannelOpenRecord),
 }
 
@@ -412,6 +468,12 @@ pub enum StoreChange {
     PutPaymentSession {
         payment_hash: Hash256,
         payment_session: PaymentSession,
+        #[serde(default)]
+        payment_preimage: Option<Hash256>,
+    },
+    PutAttempt {
+        payment_hash: Hash256,
+        attempt_status: AttemptStatus,
     },
 }
 
@@ -513,6 +575,16 @@ impl StoreKeyValue for KeyValue {
             KeyValue::CchOrder(payment_hash, _data) => {
                 [&[CCH_ORDER_PREFIX], payment_hash.as_ref()].concat()
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            KeyValue::CchReceiveBtcOrderCreation(payment_hash, _data) => [
+                &[CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX],
+                payment_hash.as_ref(),
+            ]
+            .concat(),
+            #[cfg(not(target_arch = "wasm32"))]
+            KeyValue::CchSendBtcOrderCreation(payment_hash, _data) => {
+                [&[CCH_SEND_BTC_ORDER_CREATION_PREFIX], payment_hash.as_ref()].concat()
+            }
             KeyValue::ChannelOpenRecord(channel_id, _) => {
                 [&[CHANNEL_OPEN_RECORD_PREFIX], channel_id.as_ref()].concat()
             }
@@ -557,6 +629,14 @@ impl StoreKeyValue for KeyValue {
             KeyValue::HoldTlc(_, expired_at) => serialize_to_vec(expired_at, "HoldTlc"),
             #[cfg(not(target_arch = "wasm32"))]
             KeyValue::CchOrder(_, cch_order) => serialize_to_vec(cch_order, "CchOrder"),
+            #[cfg(not(target_arch = "wasm32"))]
+            KeyValue::CchReceiveBtcOrderCreation(_, creation) => {
+                serialize_to_vec(creation, "CchReceiveBtcOrderCreation")
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            KeyValue::CchSendBtcOrderCreation(_, creation) => {
+                serialize_to_vec(creation, "CchSendBtcOrderCreation")
+            }
             KeyValue::ChannelOpenRecord(_, record) => serialize_to_vec(record, "ChannelOpenRecord"),
         }
     }
@@ -564,6 +644,30 @@ impl StoreKeyValue for KeyValue {
 
 #[cfg(feature = "watchtower")]
 impl Store {
+    fn legacy_tlc_on_chain_settled_key(channel_id: &Hash256, payment_hash: &[u8; 20]) -> Vec<u8> {
+        [
+            &[WATCHTOWER_TLC_SETTLED_PREFIX],
+            channel_id.as_ref(),
+            payment_hash.as_ref(),
+        ]
+        .concat()
+    }
+
+    fn tlc_on_chain_settled_key(node_id: &NodeId, channel_id: &Hash256, tlc_id: TLCId) -> Vec<u8> {
+        let (direction, id) = match tlc_id {
+            TLCId::Offered(id) => (0u8, id),
+            TLCId::Received(id) => (1u8, id),
+        };
+        [
+            &[WATCHTOWER_TLC_SETTLED_PREFIX],
+            channel_id.as_ref(),
+            &[2u8, direction],
+            &id.to_be_bytes(),
+            node_id.as_ref(),
+        ]
+        .concat()
+    }
+
     fn watchtower_preimage_key(node_id: &NodeId, payment_hash: &Hash256) -> Vec<u8> {
         [
             &[WATCHTOWER_PREIMAGE_PREFIX],
@@ -607,7 +711,8 @@ impl Store {
     }
 
     fn watch_channels_for_node(&self, node_id: &NodeId) -> Vec<ChannelData> {
-        self.collect_by_prefix(&[WATCHTOWER_CHANNEL_PREFIX])
+        let prefix = [&[WATCHTOWER_CHANNEL_PREFIX], node_id.as_ref()].concat();
+        self.collect_by_prefix(&prefix)
             .into_iter()
             .filter_map(|kv| {
                 let (channel_node_id, _) = Self::parse_watchtower_channel_key(&kv.key)?;
@@ -619,25 +724,71 @@ impl Store {
 
     fn watch_channel_needs_preimage(
         &self,
+        node_id: &NodeId,
         channel_data: &ChannelData,
         payment_hash: &Hash256,
     ) -> bool {
-        if self.is_tlc_settled(&channel_data.channel_id, payment_hash) {
-            return false;
-        }
-
-        [
-            &channel_data.remote_settlement_data,
-            &channel_data.pending_remote_settlement_data,
-            &channel_data.local_settlement_data,
+        let snapshot_statuses = [
+            (&channel_data.remote_settlement_data, true),
+            (&channel_data.pending_remote_settlement_data, true),
+            (&channel_data.local_settlement_data, false),
         ]
         .into_iter()
-        .any(|settlement_data| {
-            settlement_data
+        .filter_map(|(settlement_data, for_remote)| {
+            let mut has_matching_tlc = false;
+            let mut has_exact_settlement = false;
+            let mut has_unsettled_tlc = false;
+            for tlc in settlement_data
                 .tlcs
                 .iter()
-                .any(|tlc| &tlc.payment_hash == payment_hash)
+                .filter(|tlc| &tlc.payment_hash == payment_hash)
+            {
+                has_matching_tlc = true;
+                let tlc_id = if for_remote {
+                    tlc.tlc_id
+                } else {
+                    tlc.tlc_id.flip()
+                };
+                let is_exactly_settled = self
+                    .get(Self::tlc_on_chain_settled_key(
+                        node_id,
+                        &channel_data.channel_id,
+                        tlc_id,
+                    ))
+                    .map(|value| {
+                        deserialize_from::<OnChainTlcSettlement>(
+                            value.as_ref(),
+                            "OnChainTlcSettlement",
+                        )
+                    })
+                    .is_some_and(|settlement| {
+                        settlement.payment_hash == tlc.payment_hash
+                            && settlement.hash_algorithm == tlc.hash_algorithm
+                    });
+                has_exact_settlement |= is_exactly_settled;
+                has_unsettled_tlc |= !is_exactly_settled;
+            }
+            has_matching_tlc.then_some((has_exact_settlement, has_unsettled_tlc))
         })
+        .collect::<Vec<_>>();
+
+        // ChannelData retains several candidate commitment snapshots. Once an exact settlement
+        // exists, only snapshots containing exact evidence can represent the active on-chain
+        // chain. Within those candidates every same-hash TLC must be settled before its shared
+        // preimage can be removed. Prefix-keyed legacy records intentionally provide no evidence
+        // here because they cannot identify a specific TLC.
+        if snapshot_statuses
+            .iter()
+            .any(|(has_exact_settlement, _)| *has_exact_settlement)
+        {
+            snapshot_statuses
+                .iter()
+                .any(|(has_exact_settlement, has_unsettled_tlc)| {
+                    *has_exact_settlement && *has_unsettled_tlc
+                })
+        } else {
+            !snapshot_statuses.is_empty()
+        }
     }
 
     fn watch_channel_payment_hashes(channel_data: &ChannelData) -> HashSet<Hash256> {
@@ -654,11 +805,17 @@ impl Store {
     fn watch_preimage_in_use(&self, node_id: &NodeId, payment_hash: &Hash256) -> bool {
         self.watch_channels_for_node(node_id)
             .iter()
-            .any(|channel_data| self.watch_channel_needs_preimage(channel_data, payment_hash))
+            .any(|channel_data| {
+                self.watch_channel_needs_preimage(node_id, channel_data, payment_hash)
+            })
     }
 
     fn watch_preimage_entries(&self, node_id: Option<&NodeId>) -> Vec<(NodeId, Hash256)> {
-        self.collect_by_prefix(&[WATCHTOWER_NODE_PAYMENTHASH_PREFIX])
+        let prefix = match node_id {
+            Some(node_id) => [&[WATCHTOWER_NODE_PAYMENTHASH_PREFIX], node_id.as_ref()].concat(),
+            None => vec![WATCHTOWER_NODE_PAYMENTHASH_PREFIX],
+        };
+        self.collect_by_prefix(&prefix)
             .into_iter()
             .filter_map(|kv| Self::parse_watchtower_scoped_payment_hash_key(&kv.key))
             .filter(|(preimage_node_id, _)| {
@@ -672,7 +829,59 @@ impl Store {
         node_id: Option<&NodeId>,
         target: WatchtowerPreimageCleanupTarget<'_>,
     ) {
-        let preimages = self.watch_preimage_entries(node_id);
+        match node_id {
+            Some(node_id) => {
+                self.cleanup_unused_watch_preimages_with_hook(node_id, target, || {});
+            }
+            None => {
+                let node_ids: HashSet<_> = self
+                    .watch_preimage_entries(None)
+                    .into_iter()
+                    .filter(|(_, payment_hash)| target.matches(payment_hash))
+                    .map(|(node_id, _)| node_id)
+                    .collect();
+                for node_id in node_ids {
+                    let lock = self.watchtower_write_lock(&node_id);
+                    let _guard = lock.lock();
+                    self.cleanup_unused_watch_preimages_locked(&node_id, target, || {});
+                }
+            }
+        }
+    }
+
+    fn cleanup_unused_watch_preimages_with_hook(
+        &self,
+        node_id: &NodeId,
+        target: WatchtowerPreimageCleanupTarget<'_>,
+        before_commit: impl FnOnce(),
+    ) {
+        let lock = self.watchtower_write_lock(node_id);
+        let _guard = lock.lock();
+        self.cleanup_unused_watch_preimages_locked(node_id, target, before_commit);
+    }
+
+    fn cleanup_unused_watch_preimages_locked(
+        &self,
+        node_id: &NodeId,
+        target: WatchtowerPreimageCleanupTarget<'_>,
+        before_commit: impl FnOnce(),
+    ) {
+        let preimages = match target {
+            WatchtowerPreimageCleanupTarget::Exact(payment_hash) => {
+                if self
+                    .get(Self::watchtower_node_payment_hash_key(
+                        node_id,
+                        payment_hash,
+                    ))
+                    .is_some()
+                {
+                    vec![(node_id.clone(), *payment_hash)]
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => self.watch_preimage_entries(Some(node_id)),
+        };
         if preimages.is_empty() {
             return;
         }
@@ -694,6 +903,7 @@ impl Store {
             }
         }
         if has_change {
+            before_commit();
             batch.commit();
         }
     }
@@ -861,6 +1071,14 @@ impl ChannelActorStateStore for Store {
             .and_then(|channel_id: Hash256| self.get_channel_actor_state(&channel_id))
     }
 
+    fn get_all_channel_states(&self) -> Vec<ChannelActorState> {
+        let prefix = &[CHANNEL_ACTOR_STATE_PREFIX];
+        self.collect_by_prefix(prefix)
+            .into_iter()
+            .map(|kv| deserialize_from(kv.value.as_ref(), "ChannelActorState"))
+            .collect()
+    }
+
     fn insert_payment_custom_records(
         &self,
         payment_hash: &Hash256,
@@ -926,14 +1144,27 @@ impl ChannelActorStateStore for Store {
             )
     }
 
-    fn is_tlc_settled(&self, channel_id: &Hash256, payment_hash: &Hash256) -> bool {
-        let key = [
-            &[WATCHTOWER_TLC_SETTLED_PREFIX],
-            channel_id.as_ref(),
-            &payment_hash.as_ref()[0..20],
-        ]
-        .concat();
-        self.get(key).is_some()
+    fn get_onchain_tlc_settlement(
+        &self,
+        channel_id: &Hash256,
+        tlc_id: TLCId,
+        payment_hash: &Hash256,
+    ) -> Option<StoredOnChainTlcSettlement> {
+        #[cfg(feature = "watchtower")]
+        {
+            WatchtowerStore::get_onchain_tlc_settlement(
+                self,
+                &NodeId::local(),
+                channel_id,
+                tlc_id,
+                payment_hash,
+            )
+        }
+        #[cfg(not(feature = "watchtower"))]
+        {
+            let _ = (channel_id, tlc_id, payment_hash);
+            None
+        }
     }
 
     fn store_pending_commit_diff(&self, channel_id: &Hash256, diff: &CommitDiff) {
@@ -1046,9 +1277,29 @@ impl InvoiceStore for Store {
 
 impl PreimageStore for Store {
     fn insert_preimage(&self, payment_hash: Hash256, preimage: Hash256) {
-        let mut batch = self.batch();
         let kv = KeyValue::Preimage(payment_hash, preimage);
-        batch.put(kv.key(), kv.value());
+        let key = kv.key();
+        if let Some(existing) = self
+            .get(&key)
+            .map(|v| deserialize_from::<Hash256>(v.as_ref(), "Preimage"))
+        {
+            if existing == preimage {
+                // Watchers are in-memory. Replaying the same persisted preimage after restart must
+                // still emit PutPreimage so CCH/payment tracking can recover success events.
+                self.notify(StoreChange::PutPreimage {
+                    payment_hash,
+                    payment_preimage: preimage,
+                });
+                return;
+            }
+            tracing::warn!(
+                "Overwriting preimage for payment hash {:?}: existing value differs",
+                payment_hash
+            );
+        }
+
+        let mut batch = self.batch();
+        batch.put(key, kv.value());
         batch.commit();
         self.notify(StoreChange::PutPreimage {
             payment_hash,
@@ -1084,6 +1335,12 @@ impl NetworkGraphStateStore for Store {
         self.get(prefix)
             .map(|v| deserialize_from(v.as_ref(), "PaymentSession"))
             .map(|session: PaymentSession| session.init_attempts(self))
+    }
+
+    fn get_persisted_payment_status(&self, payment_hash: Hash256) -> Option<PaymentStatus> {
+        let key = [&[PAYMENT_SESSION_PREFIX], payment_hash.as_ref()].concat();
+        self.get(key)
+            .map(|v| deserialize_from::<PaymentSession>(v.as_ref(), "PaymentSession").status)
     }
 
     fn get_all_payment_sessions(&self) -> Vec<PaymentSession> {
@@ -1139,6 +1396,9 @@ impl NetworkGraphStateStore for Store {
     fn insert_payment_session(&self, session: PaymentSession) {
         let payment_hash = session.payment_hash();
         let session_clone = session.clone();
+        let payment_preimage = (session.status == PaymentStatus::Success)
+            .then(|| session.attempts().find_map(|attempt| attempt.preimage))
+            .flatten();
         let mut batch = self.batch();
         let kv = KeyValue::PaymentSession(payment_hash, session);
         batch.put(kv.key(), kv.value());
@@ -1146,6 +1406,7 @@ impl NetworkGraphStateStore for Store {
         self.notify(StoreChange::PutPaymentSession {
             payment_hash,
             payment_session: session_clone,
+            payment_preimage,
         });
     }
 
@@ -1182,6 +1443,10 @@ impl NetworkGraphStateStore for Store {
         }
 
         batch.commit();
+        self.notify(StoreChange::PutAttempt {
+            payment_hash: attempt.payment_hash,
+            attempt_status: attempt.status,
+        });
     }
 
     fn get_attempts(&self, payment_hash: Hash256) -> Vec<Attempt> {
@@ -1287,15 +1552,15 @@ impl NetworkGraphStateStore for Store {
                         .ok()?,
                 );
 
-                // Only return attempts that are pending (Created or Retrying)
                 let attempt = self.get_attempt(payment_hash, attempt_id)?;
-                if matches!(
-                    attempt.status,
-                    AttemptStatus::Created | AttemptStatus::Retrying
-                ) {
-                    Some(attempt)
-                } else {
-                    None
+                match attempt.status {
+                    AttemptStatus::Retrying => Some(attempt),
+                    AttemptStatus::Created
+                        if !self.channel_owns_attempt(channel_outpoint, &attempt) =>
+                    {
+                        Some(attempt)
+                    }
+                    _ => None,
                 }
             })
             .collect()
@@ -1366,6 +1631,8 @@ impl WatchtowerStore for Store {
         remote_funding_pubkey: Pubkey,
         settlement_data: SettlementData,
     ) {
+        let lock = self.watchtower_write_lock(&node_id);
+        let _guard = lock.lock();
         let key = [
             &[WATCHTOWER_CHANNEL_PREFIX],
             node_id.as_ref(),
@@ -1412,15 +1679,18 @@ impl WatchtowerStore for Store {
             channel_id.as_ref(),
         ]
         .concat();
+        let lock = self.watchtower_write_lock(&node_id);
+        let _guard = lock.lock();
         let payment_hashes = self
             .get(key.clone())
             .map(|v| deserialize_from::<ChannelData>(v.as_ref(), "ChannelData"))
             .map(|channel_data| Self::watch_channel_payment_hashes(&channel_data))
             .unwrap_or_default();
         self.delete(key);
-        self.cleanup_unused_watch_preimages(
-            Some(&node_id),
+        self.cleanup_unused_watch_preimages_locked(
+            &node_id,
             WatchtowerPreimageCleanupTarget::ExactSet(&payment_hashes),
+            || {},
         );
     }
 
@@ -1431,6 +1701,8 @@ impl WatchtowerStore for Store {
         revocation_data: RevocationData,
         remote_settlement_data: SettlementData,
     ) {
+        let lock = self.watchtower_write_lock(&node_id);
+        let _guard = lock.lock();
         let key = [
             &[WATCHTOWER_CHANNEL_PREFIX],
             node_id.as_ref(),
@@ -1456,6 +1728,8 @@ impl WatchtowerStore for Store {
         channel_id: Hash256,
         pending_remote_settlement_data: SettlementData,
     ) {
+        let lock = self.watchtower_write_lock(&node_id);
+        let _guard = lock.lock();
         let key = [
             &[WATCHTOWER_CHANNEL_PREFIX],
             node_id.as_ref(),
@@ -1480,6 +1754,8 @@ impl WatchtowerStore for Store {
         channel_id: Hash256,
         local_settlement_data: SettlementData,
     ) {
+        let lock = self.watchtower_write_lock(&node_id);
+        let _guard = lock.lock();
         let key = [
             &[WATCHTOWER_CHANNEL_PREFIX],
             node_id.as_ref(),
@@ -1499,6 +1775,8 @@ impl WatchtowerStore for Store {
     }
 
     fn insert_watch_preimage(&self, node_id: NodeId, payment_hash: Hash256, preimage: Hash256) {
+        let lock = self.watchtower_write_lock(&node_id);
+        let _guard = lock.lock();
         let mut batch = self.batch();
         let kv = KeyValue::WatchtowerPreimage(payment_hash, node_id.clone(), preimage);
         batch.put(kv.key(), kv.value());
@@ -1519,32 +1797,72 @@ impl WatchtowerStore for Store {
             .map(|v| deserialize_from(v.as_ref(), "Preimage"))
     }
 
-    fn search_preimage(&self, node_id: &NodeId, payment_hash_prefix: &[u8]) -> Option<Hash256> {
-        let prefix = [&[WATCHTOWER_PREIMAGE_PREFIX], payment_hash_prefix].concat();
-        self.collect_by_prefix(prefix.as_slice())
-            .into_iter()
-            .find(|kv| {
-                let key = &kv.key;
-                let node_offset = 1 + 32;
-                key.len() >= node_offset && key[node_offset..] == node_id.as_ref()[..]
-            })
-            .map(|kv| deserialize_from(kv.value.as_ref(), "Preimage"))
+    fn insert_onchain_tlc_settlement(
+        &self,
+        node_id: &NodeId,
+        channel_id: &Hash256,
+        tlc_id: TLCId,
+        settlement: OnChainTlcSettlement,
+    ) {
+        let _guard = self.onchain_tlc_settlement_write_lock.lock();
+        let key = Self::tlc_on_chain_settled_key(node_id, channel_id, tlc_id);
+        if settlement.preimage.is_none() {
+            if let Some(existing) = self.get(&key) {
+                let existing: OnChainTlcSettlement =
+                    deserialize_from(existing.as_ref(), "OnChainTlcSettlement");
+                if existing.preimage.is_some() {
+                    return;
+                }
+            }
+        }
+
+        let mut batch = self.batch();
+        batch.put(key, serialize_to_vec(&settlement, "OnChainTlcSettlement"));
+        batch.commit();
+        drop(_guard);
+        if settlement.preimage.is_none() {
+            self.cleanup_unused_watch_preimages(
+                None,
+                WatchtowerPreimageCleanupTarget::Exact(&settlement.payment_hash),
+            );
+        }
     }
 
-    fn update_tlc_settled(&self, channel_id: &Hash256, payment_hash: [u8; 20]) {
-        let mut batch = self.batch();
-        let key = [
-            &[WATCHTOWER_TLC_SETTLED_PREFIX],
-            channel_id.as_ref(),
-            payment_hash.as_ref(),
-        ]
-        .concat();
-        batch.put(key, []);
-        batch.commit();
-        self.cleanup_unused_watch_preimages(
-            None,
-            WatchtowerPreimageCleanupTarget::TlcPaymentHash(&payment_hash),
-        );
+    fn get_onchain_tlc_settlement(
+        &self,
+        node_id: &NodeId,
+        channel_id: &Hash256,
+        tlc_id: TLCId,
+        payment_hash: &Hash256,
+    ) -> Option<StoredOnChainTlcSettlement> {
+        if let Some(value) = self.get(Store::tlc_on_chain_settled_key(node_id, channel_id, tlc_id))
+        {
+            return Some(StoredOnChainTlcSettlement::Exact(deserialize_from(
+                value.as_ref(),
+                "OnChainTlcSettlement",
+            )));
+        }
+
+        let payment_hash_prefix: [u8; 20] = payment_hash.as_ref()[0..20]
+            .try_into()
+            .expect("payment hash prefix");
+        let value = self.get(Store::legacy_tlc_on_chain_settled_key(
+            channel_id,
+            &payment_hash_prefix,
+        ))?;
+        if value.is_empty() {
+            return Some(StoredOnChainTlcSettlement::Legacy(
+                LegacyOnChainTlcSettlement {
+                    preimage: None,
+                    tx_hash: None,
+                    tlc_index: None,
+                },
+            ));
+        }
+        Some(StoredOnChainTlcSettlement::Legacy(deserialize_from(
+            value.as_ref(),
+            "LegacyOnChainTlcSettlement",
+        )))
     }
 }
 
@@ -1889,6 +2207,142 @@ impl CchOrderStore for Store {
         batch.delete(key);
         batch.commit();
     }
+
+    fn get_receive_btc_order_creation(
+        &self,
+        payment_hash: &Hash256,
+    ) -> Result<CchReceiveBtcOrderCreation, CchStoreError> {
+        let key = [
+            &[CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX],
+            payment_hash.as_ref(),
+        ]
+        .concat();
+        self.get(key)
+            .map(|value| deserialize_from(&value, "CchReceiveBtcOrderCreation"))
+            .ok_or(CchStoreError::NotFound(*payment_hash))
+    }
+
+    fn insert_receive_btc_order_creation(
+        &self,
+        creation: CchReceiveBtcOrderCreation,
+    ) -> Result<(), CchStoreError> {
+        let key = [
+            &[CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX],
+            creation.payment_hash.as_ref(),
+        ]
+        .concat();
+        if self.get(&key).is_some() {
+            return Err(CchStoreError::Duplicated(creation.payment_hash));
+        }
+        let mut batch = self.batch();
+        let kv = KeyValue::CchReceiveBtcOrderCreation(creation.payment_hash, creation);
+        batch.put(kv.key(), kv.value());
+        batch.commit();
+        Ok(())
+    }
+
+    fn get_receive_btc_order_creation_keys_iter(&self) -> impl IntoIterator<Item = Hash256> {
+        const PREFIX_LEN: usize = 1;
+        const PREFIX: [u8; PREFIX_LEN] = [CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX];
+        self.collect_by_prefix(&PREFIX).into_iter().map(|kv| {
+            Hash256::try_from(&kv.key[PREFIX_LEN..])
+                .expect("CchReceiveBtcOrderCreation key must be Hash256")
+        })
+    }
+
+    fn complete_receive_btc_order_creation(&self, order: CchOrder) -> Result<(), CchStoreError> {
+        let order_key = [&[CCH_ORDER_PREFIX], order.payment_hash.as_ref()].concat();
+        if self.get(&order_key).is_some() {
+            return Err(CchStoreError::Duplicated(order.payment_hash));
+        }
+
+        let creation_key = [
+            &[CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX],
+            order.payment_hash.as_ref(),
+        ]
+        .concat();
+        let mut batch = self.batch();
+        let kv = KeyValue::CchOrder(order.payment_hash, order);
+        batch.put(kv.key(), kv.value());
+        batch.delete(creation_key);
+        batch.commit();
+        Ok(())
+    }
+
+    fn delete_receive_btc_order_creation(&self, payment_hash: &Hash256) {
+        let key = [
+            &[CCH_RECEIVE_BTC_ORDER_CREATION_PREFIX],
+            payment_hash.as_ref(),
+        ]
+        .concat();
+        let mut batch = self.batch();
+        batch.delete(key);
+        batch.commit();
+    }
+
+    fn get_send_btc_order_creation(
+        &self,
+        payment_hash: &Hash256,
+    ) -> Result<CchSendBtcOrderCreation, CchStoreError> {
+        let key = [&[CCH_SEND_BTC_ORDER_CREATION_PREFIX], payment_hash.as_ref()].concat();
+        self.get(key)
+            .map(|value| deserialize_from(&value, "CchSendBtcOrderCreation"))
+            .ok_or(CchStoreError::NotFound(*payment_hash))
+    }
+
+    fn insert_send_btc_order_creation(
+        &self,
+        creation: CchSendBtcOrderCreation,
+    ) -> Result<(), CchStoreError> {
+        let key = [
+            &[CCH_SEND_BTC_ORDER_CREATION_PREFIX],
+            creation.payment_hash.as_ref(),
+        ]
+        .concat();
+        if self.get(&key).is_some() {
+            return Err(CchStoreError::Duplicated(creation.payment_hash));
+        }
+        let mut batch = self.batch();
+        let kv = KeyValue::CchSendBtcOrderCreation(creation.payment_hash, creation);
+        batch.put(kv.key(), kv.value());
+        batch.commit();
+        Ok(())
+    }
+
+    fn get_send_btc_order_creation_keys_iter(&self) -> impl IntoIterator<Item = Hash256> {
+        const PREFIX_LEN: usize = 1;
+        const PREFIX: [u8; PREFIX_LEN] = [CCH_SEND_BTC_ORDER_CREATION_PREFIX];
+        self.collect_by_prefix(&PREFIX).into_iter().map(|kv| {
+            Hash256::try_from(&kv.key[PREFIX_LEN..])
+                .expect("CchSendBtcOrderCreation key must be Hash256")
+        })
+    }
+
+    fn complete_send_btc_order_creation(&self, order: CchOrder) -> Result<(), CchStoreError> {
+        let order_key = [&[CCH_ORDER_PREFIX], order.payment_hash.as_ref()].concat();
+        if self.get(&order_key).is_some() {
+            return Err(CchStoreError::Duplicated(order.payment_hash));
+        }
+
+        let creation_key = [
+            &[CCH_SEND_BTC_ORDER_CREATION_PREFIX],
+            order.payment_hash.as_ref(),
+        ]
+        .concat();
+        let mut batch = self.batch();
+        let kv = KeyValue::CchOrder(order.payment_hash, order);
+        batch.put(kv.key(), kv.value());
+        batch.delete(creation_key);
+        batch.commit();
+        Ok(())
+    }
+
+    fn delete_send_btc_order_creation(&self, payment_hash: &Hash256) {
+        let key = [&[CCH_SEND_BTC_ORDER_CREATION_PREFIX], payment_hash.as_ref()].concat();
+        let mut batch = self.batch();
+        batch.delete(key);
+        batch.commit();
+    }
 }
 
 // All timestamps are saved in a 24-byte array, with BroadcastMessageID::ChannelAnnouncement(outpoint) as the key.
@@ -1924,4 +2378,109 @@ fn update_channel_timestamp(
         .unwrap_or([0u8; 24]);
     timestamps[offset..offset + 8].copy_from_slice(&timestamp.to_be_bytes());
     batch.put(timestamp_key, timestamps);
+}
+
+#[cfg(all(test, feature = "watchtower", not(target_arch = "wasm32")))]
+mod watchtower_preimage_gc_tests {
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::time::Duration;
+
+    use fiber_types::{Hash256, NodeId};
+    use tempfile::tempdir;
+
+    use crate::watchtower::WatchtowerStore;
+
+    use super::{open_store, WatchtowerPreimageCleanupTarget};
+
+    #[test]
+    fn concurrent_preimage_insert_is_not_deleted_by_stale_gc_decision() {
+        let path = tempdir().expect("temp directory");
+        let store = open_store(path.path()).expect("open store");
+        let node_id = NodeId::local();
+        let payment_hash = Hash256::from([1; 32]);
+        let old_preimage = Hash256::from([2; 32]);
+        let new_preimage = Hash256::from([3; 32]);
+        store.insert_watch_preimage(node_id.clone(), payment_hash, old_preimage);
+
+        let concurrent_store = store.clone();
+        let concurrent_node_id = node_id.clone();
+        let before_insert = Arc::new(Barrier::new(2));
+        let concurrent_before_insert = Arc::clone(&before_insert);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let insert = std::thread::spawn(move || {
+            concurrent_before_insert.wait();
+            concurrent_store.insert_watch_preimage(concurrent_node_id, payment_hash, new_preimage);
+            finished_tx.send(()).expect("signal insert finish");
+        });
+
+        store.cleanup_unused_watch_preimages_with_hook(
+            &node_id,
+            WatchtowerPreimageCleanupTarget::Exact(&payment_hash),
+            || {
+                before_insert.wait();
+                assert!(
+                    finished_rx
+                        .recv_timeout(Duration::from_millis(100))
+                        .is_err(),
+                    "concurrent insert must wait for the GC delete commit"
+                );
+            },
+        );
+        insert.join().expect("concurrent insert thread");
+
+        assert_eq!(
+            store.get_watch_preimage(&node_id, &payment_hash),
+            Some(new_preimage),
+            "GC must not delete a preimage committed after its liveness decision"
+        );
+    }
+
+    #[test]
+    fn one_node_preimage_gc_does_not_block_another_node_writer() {
+        let path = tempdir().expect("temp directory");
+        let store = open_store(path.path()).expect("open store");
+        let cleanup_node_id = NodeId::from_bytes(vec![1]);
+        let writer_node_id = NodeId::from_bytes(vec![2]);
+        let cleanup_payment_hash = Hash256::from([4; 32]);
+        let writer_payment_hash = Hash256::from([5; 32]);
+        let writer_preimage = Hash256::from([6; 32]);
+        store.insert_watch_preimage(
+            cleanup_node_id.clone(),
+            cleanup_payment_hash,
+            Hash256::from([7; 32]),
+        );
+
+        let concurrent_store = store.clone();
+        let concurrent_writer_node_id = writer_node_id.clone();
+        let before_insert = Arc::new(Barrier::new(2));
+        let concurrent_before_insert = Arc::clone(&before_insert);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let insert = std::thread::spawn(move || {
+            concurrent_before_insert.wait();
+            concurrent_store.insert_watch_preimage(
+                concurrent_writer_node_id,
+                writer_payment_hash,
+                writer_preimage,
+            );
+            finished_tx.send(()).expect("signal insert finish");
+        });
+
+        store.cleanup_unused_watch_preimages_with_hook(
+            &cleanup_node_id,
+            WatchtowerPreimageCleanupTarget::Exact(&cleanup_payment_hash),
+            || {
+                before_insert.wait();
+                finished_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("another node's writer must not wait for this node's GC");
+            },
+        );
+        insert.join().expect("concurrent insert thread");
+
+        assert_eq!(
+            store.get_watch_preimage(&writer_node_id, &writer_payment_hash),
+            Some(writer_preimage),
+            "another node's preimage write must complete independently"
+        );
+    }
 }

@@ -93,24 +93,126 @@ pub struct CchOrder {
     pub failure_reason: Option<String>,
 }
 
+/// Durable intent for creating the Lightning incoming invoice of a `receive_btc` order.
+///
+/// The intent is written before calling LND and atomically removed when the final
+/// [`CchOrder`] is persisted. Its payment hash is the idempotency key used to recover
+/// an invoice creation whose RPC result was lost or interrupted by a node restart.
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CchReceiveBtcOrderCreation {
+    /// Seconds since epoch when order creation was accepted.
+    #[serde_as(as = "U64Hex")]
+    pub created_at: u64,
+    /// Relative expiry time copied from the CCH configuration at acceptance time.
+    #[serde_as(as = "U64Hex")]
+    pub order_expiry_delta_seconds: u64,
+    /// Original signed Fiber invoice. Exact equality is used to reject conflicting retries.
+    pub fiber_pay_req: String,
+    /// Idempotency key shared by the Fiber invoice, LND invoice, and final CCH order.
+    pub payment_hash: Hash256,
+    /// Outgoing Fiber principal in satoshis.
+    #[serde_as(as = "U128Hex")]
+    pub amount_sats: u128,
+    /// CCH fee in satoshis.
+    #[serde_as(as = "U128Hex")]
+    pub fee_sats: u128,
+    /// Wrapped BTC type script validated when the operation was accepted.
+    pub wrapped_btc_type_script: ckb_jsonrpc_types::Script,
+    /// LND final-hop CLTV delta validated when the operation was accepted.
+    #[serde_as(as = "U64Hex")]
+    pub btc_final_tlc_expiry_delta_blocks: u64,
+    /// Percentage of the collected fee available to the outgoing Fiber payment.
+    #[serde_as(as = "U64Hex")]
+    pub max_outgoing_fee_percentage: u64,
+}
+
+/// Durable intent for creating the Fiber incoming invoice of a `send_btc` order.
+///
+/// The intent is written before the Fiber RPC side effect and atomically removed
+/// when the final [`CchOrder`] is persisted. The BTC payment hash is the
+/// idempotency key for recovering a request whose RPC response was lost.
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CchSendBtcOrderCreation {
+    /// Seconds since epoch when order creation was accepted.
+    #[serde_as(as = "U64Hex")]
+    pub created_at: u64,
+    /// Relative expiry time copied from the CCH configuration at acceptance time.
+    #[serde_as(as = "U64Hex")]
+    pub order_expiry_delta_seconds: u64,
+    /// Original BTC invoice. Exact equality is used to reject conflicting retries.
+    pub btc_pay_req: String,
+    /// Idempotency key shared by the BTC invoice, Fiber invoice, and CCH order.
+    pub payment_hash: Hash256,
+    /// Fiber invoice prepared before the external Fiber call.
+    pub incoming_invoice: CkbInvoice,
+    /// Fee charged by the CCH operator.
+    #[serde_as(as = "U128Hex")]
+    pub fee_sats: u128,
+    /// Wrapped BTC type script included in the Fiber invoice.
+    pub wrapped_btc_type_script: ckb_jsonrpc_types::Script,
+}
+
 impl CchOrder {
+    /// Return the amount required by the incoming invoice, in satoshis.
+    ///
+    /// The persisted `amount_sats` field is used as a compatibility fallback for invoices that do
+    /// not encode an amount. Older ReceiveBTC orders stored the outgoing Fiber principal in that
+    /// field, so deriving the value from the incoming invoice also repairs their public amount
+    /// semantics without changing the serialized order format.
+    pub fn required_incoming_amount_sats(&self) -> u128 {
+        match &self.incoming_invoice {
+            CchInvoice::Fiber(invoice) => invoice.amount(),
+            CchInvoice::Lightning(invoice) => invoice
+                .amount_milli_satoshis()
+                .map(u128::from)
+                .map(|amount_msat| amount_msat.div_ceil(1_000)),
+        }
+        .unwrap_or(self.amount_sats)
+    }
+
+    /// Refresh `amount_sats` from the amount encoded in the incoming invoice when available.
+    pub fn normalize_amount_sats(&mut self) {
+        self.amount_sats = self.required_incoming_amount_sats();
+    }
+
     pub fn is_final(&self) -> bool {
         self.status == CchOrderStatus::Success || self.status == CchOrderStatus::Failed
     }
 
-    /// Check if the order is expired given the current time, and mark it as Failed if expired.
+    /// Check if the order is expired before the outgoing leg starts, and mark it as Failed.
+    ///
+    /// `expiry_delta_seconds` bounds how long a CCH order can wait for the incoming payment.
+    /// Once the incoming payment is accepted, the order is governed by payment tracking and the
+    /// incoming HTLC/TLC expiry budget; timing it out here could cancel funds after the outgoing
+    /// leg has already obtained a preimage.
+    pub fn update_if_expired(&mut self, current_time: u64) -> bool {
+        self.update_if_expired_with_reason(current_time, "Order expired on startup")
+    }
+
+    /// Check if the order is expired before the outgoing leg starts, and mark it as Failed with
+    /// `expired_reason` if expired.
     ///
     /// Returns `true` if the order was expired (and has been marked as Failed).
     /// Updates `status` to `Failed` and sets `failure_reason` when expired.
-    pub fn update_if_expired(&mut self, current_time: u64) -> bool {
+    pub fn update_if_expired_with_reason(
+        &mut self,
+        current_time: u64,
+        expired_reason: &str,
+    ) -> bool {
+        if self.status != CchOrderStatus::Pending {
+            return false;
+        }
+
         let Some(expiry_time) = self.created_at.checked_add(self.expiry_delta_seconds) else {
             self.status = CchOrderStatus::Failed;
             self.failure_reason = Some("Order expiry time overflows".to_string());
             return true;
         };
-        if expiry_time < current_time {
+        if expiry_time <= current_time {
             self.status = CchOrderStatus::Failed;
-            self.failure_reason = Some("Order expired on startup".to_string());
+            self.failure_reason = Some(expired_reason.to_string());
             true
         } else {
             false

@@ -14,6 +14,8 @@ You may refer to the e2e test cases in the `tests/bruno/e2e` directory for examp
 * [RPC Methods](#rpc-methods)
 
 
+    * [Module Admin](#module-admin)
+        * [Method `backup`](#admin-backup)
     * [Module Cch](#module-cch)
         * [Method `send_btc`](#cch-send_btc)
         * [Method `receive_btc`](#cch-receive_btc)
@@ -109,6 +111,27 @@ You may refer to the e2e test cases in the `tests/bruno/e2e` directory for examp
     * [Type `UdtScript`](#type-udtscript)
 
 ## RPC Modules
+
+<a id="admin"></a>
+### Module `Admin`
+The RPC module for node administration.
+
+
+<a id="admin-backup"></a>
+#### Method `backup`
+
+Backup the node information.
+
+##### Params
+* None
+
+##### Returns
+
+* None
+
+---
+
+
 
 <a id="cch"></a>
 ### Module `Cch`
@@ -825,6 +848,7 @@ Sends a payment to a peer.
 ##### Returns
 
 * `payment_hash` - <em>[Hash256](#type-hash256)</em>, The payment hash of the payment
+* `payment_preimage` - <em>Option<[Hash256](#type-hash256)></em>, The preimage learned from a successful payment attempt.
 * `status` - <em>[PaymentStatus](#type-paymentstatus)</em>, The status of the payment
 * `created_at` - <em>`u64`</em>, The time the payment was created at, in milliseconds from UNIX epoch
 * `last_updated_at` - <em>`u64`</em>, The time the payment was last updated at, in milliseconds from UNIX epoch
@@ -854,6 +878,7 @@ Retrieves a payment.
 ##### Returns
 
 * `payment_hash` - <em>[Hash256](#type-hash256)</em>, The payment hash of the payment
+* `payment_preimage` - <em>Option<[Hash256](#type-hash256)></em>, The preimage learned from a successful payment attempt.
 * `status` - <em>[PaymentStatus](#type-paymentstatus)</em>, The status of the payment
 * `created_at` - <em>`u64`</em>, The time the payment was created at, in milliseconds from UNIX epoch
 * `last_updated_at` - <em>`u64`</em>, The time the payment was last updated at, in milliseconds from UNIX epoch
@@ -945,6 +970,7 @@ Sends a payment to a peer with specified router.
 ##### Returns
 
 * `payment_hash` - <em>[Hash256](#type-hash256)</em>, The payment hash of the payment
+* `payment_preimage` - <em>Option<[Hash256](#type-hash256)></em>, The preimage learned from a successful payment attempt.
 * `status` - <em>[PaymentStatus](#type-paymentstatus)</em>, The status of the payment
 * `created_at` - <em>`u64`</em>, The time the payment was created at, in milliseconds from UNIX epoch
 * `last_updated_at` - <em>`u64`</em>, The time the payment was last updated at, in milliseconds from UNIX epoch
@@ -1345,6 +1371,8 @@ The state of a channel.
  now operational.
 * `ShuttingDown` - <em>`ShuttingDownFlags`</em>, We've successfully negotiated a `closing_signed` dance. At this point, the `ChannelManager`
 * `Closed` - <em>`CloseFlags`</em>, This channel is closed.
+* `Stale` - The channel state is potentially outdated (e.g., after a database restore).
+ We must perform a passive audit with the peer before resuming operations.
 ---
 
 <a id="#type-channelupdateinfo"></a>
@@ -1419,6 +1447,7 @@ The result of a get_payment command, which includes the payment hash, status, ti
 #### Fields
 
 * `payment_hash` - <em>[Hash256](#type-hash256)</em>, The payment hash of the payment
+* `payment_preimage` - <em>Option<[Hash256](#type-hash256)></em>, The preimage learned from a successful payment attempt.
 * `status` - <em>[PaymentStatus](#type-paymentstatus)</em>, The status of the payment
 * `created_at` - <em>`u64`</em>, The time the payment was created at, in milliseconds from UNIX epoch
 * `last_updated_at` - <em>`u64`</em>, The time the payment was last updated at, in milliseconds from UNIX epoch

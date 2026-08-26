@@ -112,6 +112,8 @@ bitflags! {
         const FUNDING_ABORTED = 1 << 3;
         const UNCOOPERATIVE_REMOTE = 1 << 4;
         const WAITING_ONCHAIN_SETTLEMENT = 1 << 5;
+        /// The on-chain settlement spend has been confirmed.
+        const ONCHAIN_SETTLEMENT_CONFIRMED = 1 << 6;
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -256,6 +258,9 @@ pub enum ChannelState {
     ShuttingDown(ShuttingDownFlags),
     /// This channel is closed.
     Closed(CloseFlags),
+    /// The channel state is potentially outdated (e.g., after a database restore).
+    /// We must perform a passive audit with the peer before resuming operations.
+    Stale,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -752,7 +757,10 @@ impl TlcState {
 
     pub fn set_received_tlc_removed(&mut self, tlc_id: u64, reason: RemoveTlcReason) -> Hash256 {
         let tlc = self.get_mut(&TLCId::Received(tlc_id)).expect("get tlc");
-        assert_eq!(tlc.inbound_status(), InboundTlcStatus::Committed);
+        assert!(matches!(
+            tlc.inbound_status(),
+            InboundTlcStatus::AnnounceWaitAck | InboundTlcStatus::Committed
+        ));
         tlc.removed_reason = Some(reason);
         tlc.status = TlcStatus::Inbound(InboundTlcStatus::LocalRemoved);
         tlc.payment_hash
@@ -760,7 +768,10 @@ impl TlcState {
 
     pub fn set_offered_tlc_removed(&mut self, tlc_id: u64, reason: RemoveTlcReason) -> Hash256 {
         let tlc = self.get_mut(&TLCId::Offered(tlc_id)).expect("get tlc");
-        assert_eq!(tlc.outbound_status(), OutboundTlcStatus::Committed);
+        assert!(matches!(
+            tlc.outbound_status(),
+            OutboundTlcStatus::LocalAnnounced | OutboundTlcStatus::Committed
+        ));
         tlc.removed_reason = Some(reason);
         tlc.status = TlcStatus::Outbound(OutboundTlcStatus::RemoteRemoved);
         tlc.payment_hash
@@ -1183,13 +1194,32 @@ pub fn derive_private_key(secret: &Privkey, commitment_point: &Pubkey) -> Privke
 }
 
 /// Derive a public key by tweaking a base key with a commitment point.
+#[deprecated(note = "use `try_derive_public_key` instead to avoid panicking on invalid keys")]
 pub fn derive_public_key(base_key: &Pubkey, commitment_point: &Pubkey) -> Pubkey {
     base_key.tweak(get_tweak_by_commitment_point(commitment_point))
 }
 
+/// Fallibly derive a public key by tweaking a base key with a commitment point.
+pub fn try_derive_public_key(
+    base_key: &Pubkey,
+    commitment_point: &Pubkey,
+) -> Result<Pubkey, String> {
+    base_key.try_tweak(get_tweak_by_commitment_point(commitment_point))
+}
+
 /// Derive the TLC public key from a base key and commitment point.
+#[deprecated(note = "use `try_derive_tlc_pubkey` instead to avoid panicking on invalid keys")]
 pub fn derive_tlc_pubkey(base_key: &Pubkey, commitment_point: &Pubkey) -> Pubkey {
+    #[allow(deprecated)]
     derive_public_key(base_key, commitment_point)
+}
+
+/// Fallibly derive the TLC public key from a base key and commitment point.
+pub fn try_derive_tlc_pubkey(
+    base_key: &Pubkey,
+    commitment_point: &Pubkey,
+) -> Result<Pubkey, String> {
+    try_derive_public_key(base_key, commitment_point)
 }
 
 /// Check if the TLC key derivation for a given base key and commitment point

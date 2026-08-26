@@ -2,6 +2,9 @@ use crate::ckb::signer::LocalSigner;
 use crate::fiber::channel::*;
 use crate::fiber::gossip::{get_latest_startup_broadcast_message_cursor, GossipMessageStore};
 use crate::fiber::network::get_chain_hash;
+use crate::fiber::onchain_tlc_reconcile::{
+    LegacyOnChainTlcSettlement, OnChainTlcSettlement, StoredOnChainTlcSettlement,
+};
 use crate::fiber::types::new_channel_update_unsigned;
 use crate::fiber::types::*;
 #[allow(unused)]
@@ -21,6 +24,7 @@ use crate::gen_rand_fiber_public_key;
 use crate::gen_rand_sha256_hash;
 use crate::invoice::*;
 use crate::now_timestamp_as_millis_u64;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::store::open_store;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::store::sample::StoreSample;
@@ -37,10 +41,17 @@ use ckb_types::prelude::*;
 use ckb_types::H256;
 #[cfg(not(target_arch = "wasm32"))]
 use core::cmp::Ordering;
+use fiber_store::backend::StorageBackend;
 use fiber_types::protocol::AnnouncedNodeName;
-use fiber_types::CloseFlags;
+use fiber_types::schema::WATCHTOWER_TLC_SETTLED_PREFIX;
 #[cfg(not(target_arch = "wasm32"))]
-use fiber_types::{SettlementTlc, TLCId};
+use fiber_types::{
+    AddTlcCommand, AppliedFlags, CommitmentNumbers, OutboundTlcStatus, RetryableTlcOperation,
+    SettlementTlc, TLCId, TlcInfo, TlcStatus,
+};
+use fiber_types::{
+    Attempt, AttemptStatus, CloseFlags, HashAlgorithm, PaymentHopData, RouterHop, SessionRoute,
+};
 use musig2::secp::MaybeScalar;
 #[cfg(not(target_arch = "wasm32"))]
 use musig2::CompactSignature;
@@ -486,27 +497,6 @@ fn test_store_watchtower_preimage() {
         "query non exist watch preimage"
     );
 
-    assert!(
-        store
-            .search_preimage(&node_id_a, &payment_hash_c.as_ref()[..20])
-            .is_none(),
-        "search a non exist watch preimage"
-    );
-    // search preimage only returns watch preimage
-    assert_eq!(
-        store
-            .search_preimage(&node_id_a, &payment_hash_a.as_ref()[..20])
-            .unwrap(),
-        preimage_a,
-        "search"
-    );
-    assert!(
-        store
-            .search_preimage(&node_id_b, &payment_hash_a.as_ref()[..20])
-            .is_none(),
-        "search should not cross node scope"
-    );
-
     // delete preimage with wrong node
     store.remove_watch_preimage(node_id_a, payment_hash_b);
     assert!(
@@ -522,43 +512,6 @@ fn test_store_watchtower_preimage() {
             .get_watch_preimage(&node_id_b, &payment_hash_b)
             .is_none(),
         "removed"
-    );
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-fn test_store_watchtower_preimage_search_is_node_scoped_with_same_prefix() {
-    let path = TempDir::new("test-watchtower-store-same-prefix");
-    let store = open_store(path).expect("created store failed");
-
-    let node_id_a = NodeId::from_bytes(PeerId::random().into_bytes());
-    let node_id_b = NodeId::from_bytes(PeerId::random().into_bytes());
-
-    let preimage_a = gen_rand_sha256_hash();
-    let preimage_b = gen_rand_sha256_hash();
-
-    let mut payment_hash_bytes = [7u8; 32];
-    payment_hash_bytes[31] = 1;
-    let payment_hash_a: Hash256 = payment_hash_bytes.into();
-
-    payment_hash_bytes[31] = 2;
-    let payment_hash_b: Hash256 = payment_hash_bytes.into();
-
-    let payment_hash_prefix = &payment_hash_a.as_ref()[..20];
-
-    store.insert_watch_preimage(node_id_b.clone(), payment_hash_b, preimage_b);
-    store.insert_watch_preimage(node_id_a.clone(), payment_hash_a, preimage_a);
-
-    assert_eq!(
-        store.search_preimage(&node_id_a, payment_hash_prefix),
-        Some(preimage_a),
-        "search should skip another node's preimage with the same prefix"
-    );
-    assert_eq!(
-        store.search_preimage(&node_id_b, payment_hash_prefix),
-        Some(preimage_b),
-        "search should still find the matching node's preimage"
     );
 }
 
@@ -610,11 +563,487 @@ fn test_store_watchtower_preimage_gc_waits_for_watched_tlc() {
         "preimage is retained while a watched TLC still references it"
     );
 
-    let payment_hash_prefix: [u8; 20] = payment_hash.as_ref()[..20].try_into().unwrap();
-    store.update_tlc_settled(&channel_id, payment_hash_prefix);
+    store.insert_onchain_tlc_settlement(
+        &node_id,
+        &channel_id,
+        TLCId::Offered(0),
+        OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: None,
+            tx_hash: gen_rand_sha256_hash(),
+            tlc_index: 0,
+        },
+    );
     assert!(
         store.get_watch_preimage(&node_id, &payment_hash).is_none(),
         "watchtower GC removes the preimage after the watched TLC is settled"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_store_watchtower_preimage_gc_waits_for_same_hash_sibling_tlc() {
+    let path = TempDir::new("test-watchtower-preimage-gc-same-hash-sibling");
+    let store = open_store(path).expect("created store failed");
+
+    let node_id = NodeId::local();
+    let channel_id = gen_rand_sha256_hash();
+    let preimage = gen_rand_sha256_hash();
+    let payment_hash = HashAlgorithm::CkbHash.hash(preimage).into();
+    let local_settlement_key = Privkey::from(&[1; 32]);
+    let remote_settlement_key = Privkey::from(&[2; 32]).pubkey();
+    let local_funding_pubkey = Privkey::from(&[3; 32]).pubkey();
+    let remote_funding_pubkey = Privkey::from(&[4; 32]).pubkey();
+    let first_tlc = SettlementTlc {
+        tlc_id: TLCId::Offered(0),
+        hash_algorithm: HashAlgorithm::CkbHash,
+        payment_amount: 21,
+        payment_hash,
+        expiry: now_timestamp_as_millis_u64() + 60_000,
+        local_key: Privkey::from(&[5; 32]),
+        remote_key: Privkey::from(&[6; 32]).pubkey(),
+    };
+    let mut second_tlc = first_tlc.clone();
+    second_tlc.tlc_id = TLCId::Offered(1);
+    second_tlc.local_key = Privkey::from(&[7; 32]);
+    second_tlc.remote_key = Privkey::from(&[8; 32]).pubkey();
+    let settlement_data = SettlementData {
+        local_amount: 100,
+        remote_amount: 200,
+        tlcs: vec![first_tlc, second_tlc],
+    };
+
+    store.insert_watch_channel(
+        node_id.clone(),
+        channel_id,
+        None,
+        local_settlement_key,
+        remote_settlement_key,
+        local_funding_pubkey,
+        remote_funding_pubkey,
+        settlement_data,
+    );
+    store.insert_watch_preimage(node_id.clone(), payment_hash, preimage);
+
+    store.insert_onchain_tlc_settlement(
+        &node_id,
+        &channel_id,
+        TLCId::Offered(0),
+        OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: None,
+            tx_hash: gen_rand_sha256_hash(),
+            tlc_index: 0,
+        },
+    );
+
+    assert_eq!(
+        store.get_watch_preimage(&node_id, &payment_hash),
+        Some(preimage),
+        "the sibling TLC with the same payment hash still needs the preimage"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_store_watchtower_preimage_gc_isolated_between_tenants() {
+    let path = TempDir::new("test-watchtower-preimage-gc-tenant-scope");
+    let store = open_store(path).expect("created store failed");
+
+    let node_id_a = NodeId::from_bytes(PeerId::random().into_bytes());
+    let node_id_b = NodeId::from_bytes(PeerId::random().into_bytes());
+    let channel_id = gen_rand_sha256_hash();
+    let preimage = gen_rand_sha256_hash();
+    let payment_hash: Hash256 = HashAlgorithm::CkbHash.hash(preimage).into();
+    let settlement_data = SettlementData {
+        local_amount: 100,
+        remote_amount: 200,
+        tlcs: vec![SettlementTlc {
+            tlc_id: TLCId::Offered(0),
+            hash_algorithm: HashAlgorithm::CkbHash,
+            payment_amount: 42,
+            payment_hash,
+            expiry: now_timestamp_as_millis_u64() + 60_000,
+            local_key: Privkey::from(&[5; 32]),
+            remote_key: Privkey::from(&[6; 32]).pubkey(),
+        }],
+    };
+
+    for node_id in [&node_id_a, &node_id_b] {
+        store.insert_watch_channel(
+            node_id.clone(),
+            channel_id,
+            None,
+            Privkey::from(&[1; 32]),
+            Privkey::from(&[2; 32]).pubkey(),
+            Privkey::from(&[3; 32]).pubkey(),
+            Privkey::from(&[4; 32]).pubkey(),
+            settlement_data.clone(),
+        );
+        store.insert_watch_preimage(node_id.clone(), payment_hash, preimage);
+    }
+
+    // This settlement belongs to node A's watched channel. Node B still needs its independently
+    // scoped preimage for a TLC with the same endpoint-local identity and complete payment hash.
+    store.insert_onchain_tlc_settlement(
+        &node_id_a,
+        &channel_id,
+        TLCId::Offered(0),
+        OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: None,
+            tx_hash: gen_rand_sha256_hash(),
+            tlc_index: 0,
+        },
+    );
+
+    assert_eq!(store.get_watch_preimage(&node_id_a, &payment_hash), None);
+    assert_eq!(
+        store.get_watch_preimage(&node_id_b, &payment_hash),
+        Some(preimage),
+        "one tenant's settlement must not garbage-collect another tenant's preimage"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_store_watchtower_preimage_gc_ignores_ambiguous_legacy_settlement() {
+    let path = TempDir::new("test-watchtower-preimage-gc-legacy-ambiguous");
+    let store = open_store(path).expect("created store failed");
+
+    let node_id = NodeId::local();
+    let channel_id = gen_rand_sha256_hash();
+    let preimage = gen_rand_sha256_hash();
+    let payment_hash: Hash256 = HashAlgorithm::CkbHash.hash(preimage).into();
+    let settlement_data = SettlementData {
+        local_amount: 100,
+        remote_amount: 200,
+        tlcs: vec![SettlementTlc {
+            tlc_id: TLCId::Offered(0),
+            hash_algorithm: HashAlgorithm::CkbHash,
+            payment_amount: 42,
+            payment_hash,
+            expiry: now_timestamp_as_millis_u64() + 60_000,
+            local_key: Privkey::from(&[5; 32]),
+            remote_key: Privkey::from(&[6; 32]).pubkey(),
+        }],
+    };
+
+    store.insert_watch_channel(
+        node_id.clone(),
+        channel_id,
+        None,
+        Privkey::from(&[1; 32]),
+        Privkey::from(&[2; 32]).pubkey(),
+        Privkey::from(&[3; 32]).pubkey(),
+        Privkey::from(&[4; 32]).pubkey(),
+        settlement_data,
+    );
+    store.insert_watch_preimage(node_id.clone(), payment_hash, preimage);
+
+    let payment_hash_prefix: [u8; 20] = payment_hash.as_ref()[..20]
+        .try_into()
+        .expect("payment hash prefix");
+    let legacy_key = [
+        &[WATCHTOWER_TLC_SETTLED_PREFIX],
+        channel_id.as_ref(),
+        payment_hash_prefix.as_ref(),
+    ]
+    .concat();
+    store.put(legacy_key, []);
+    store.remove_watch_preimage(node_id.clone(), payment_hash);
+
+    assert_eq!(
+        store.get_watch_preimage(&node_id, &payment_hash),
+        Some(preimage),
+        "a prefix-keyed legacy record cannot prove that this TLC no longer needs the preimage"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_onchain_tlc_settlement_roundtrip() {
+    let path = TempDir::new("test-onchain-tlc-settlement-roundtrip");
+    let store = open_store(path).expect("created store failed");
+    let channel_id = Hash256::from([1u8; 32]);
+    let other_channel_id = Hash256::from([2u8; 32]);
+    let payment_hash = Hash256::from([3u8; 32]);
+    let tlc_id = TLCId::Received(42);
+    let node_id = NodeId::local();
+
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        None
+    );
+
+    let settlement = OnChainTlcSettlement {
+        payment_hash,
+        hash_algorithm: HashAlgorithm::Sha256,
+        preimage: Some(Hash256::from([9u8; 32])),
+        tx_hash: Hash256::from([7u8; 32]),
+        tlc_index: 2,
+    };
+    store.insert_onchain_tlc_settlement(&node_id, &channel_id, tlc_id, settlement.clone());
+
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Exact(settlement))
+    );
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &other_channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        None
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_onchain_tlc_settlements_with_shared_prefix_are_independent() {
+    let path = TempDir::new("test-onchain-tlc-settlement-shared-prefix");
+    let store = open_store(path).expect("created store failed");
+    let channel_id = Hash256::from([1u8; 32]);
+    let first_hash = Hash256::from([3u8; 32]);
+    let mut second_hash_bytes = [3u8; 32];
+    second_hash_bytes[31] = 4;
+    let second_hash = Hash256::from(second_hash_bytes);
+    let first_id = TLCId::Offered(0);
+    let second_id = TLCId::Offered(1);
+    let node_id = NodeId::local();
+    let first = OnChainTlcSettlement {
+        payment_hash: first_hash,
+        hash_algorithm: HashAlgorithm::CkbHash,
+        preimage: None,
+        tx_hash: Hash256::from([7u8; 32]),
+        tlc_index: 0,
+    };
+    let second = OnChainTlcSettlement {
+        payment_hash: second_hash,
+        hash_algorithm: HashAlgorithm::CkbHash,
+        preimage: None,
+        tx_hash: Hash256::from([8u8; 32]),
+        tlc_index: 1,
+    };
+
+    store.insert_onchain_tlc_settlement(&node_id, &channel_id, first_id, first.clone());
+    store.insert_onchain_tlc_settlement(&node_id, &channel_id, second_id, second.clone());
+
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &channel_id,
+            first_id,
+            &first_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Exact(first))
+    );
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &channel_id,
+            second_id,
+            &second_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Exact(second))
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_onchain_tlc_settlement_no_preimage_does_not_downgrade() {
+    let path = TempDir::new("test-onchain-tlc-settlement-no-downgrade");
+    let store = open_store(path).expect("created store failed");
+    let channel_id = Hash256::from([1u8; 32]);
+    let payment_hash = Hash256::from([3u8; 32]);
+    let tlc_id = TLCId::Offered(0);
+    let node_id = NodeId::local();
+
+    let with_preimage = OnChainTlcSettlement {
+        payment_hash,
+        hash_algorithm: HashAlgorithm::CkbHash,
+        preimage: Some(Hash256::from([9u8; 32])),
+        tx_hash: Hash256::from([7u8; 32]),
+        tlc_index: 0,
+    };
+    store.insert_onchain_tlc_settlement(&node_id, &channel_id, tlc_id, with_preimage.clone());
+    store.insert_onchain_tlc_settlement(
+        &node_id,
+        &channel_id,
+        tlc_id,
+        OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: None,
+            tx_hash: Hash256::from([8u8; 32]),
+            tlc_index: 0,
+        },
+    );
+
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Exact(with_preimage))
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_onchain_tlc_settlements_are_isolated_between_watchtower_tenants() {
+    let path = TempDir::new("test-onchain-tlc-settlement-tenant-scope");
+    let store = open_store(path).expect("created store failed");
+    let channel_id = Hash256::from([1u8; 32]);
+    let payment_hash = Hash256::from([3u8; 32]);
+    let tlc_id = TLCId::Offered(0);
+    let node_id_a = NodeId::from_bytes(PeerId::random().into_bytes());
+    let node_id_b = NodeId::from_bytes(PeerId::random().into_bytes());
+
+    store.insert_onchain_tlc_settlement(
+        &node_id_a,
+        &channel_id,
+        tlc_id,
+        OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: Some(Hash256::from([9u8; 32])),
+            tx_hash: Hash256::from([7u8; 32]),
+            tlc_index: 0,
+        },
+    );
+    store.insert_onchain_tlc_settlement(
+        &node_id_b,
+        &channel_id,
+        tlc_id,
+        OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: None,
+            tx_hash: Hash256::from([8u8; 32]),
+            tlc_index: 0,
+        },
+    );
+
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id_a,
+            &channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Exact(OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: Some(Hash256::from([9u8; 32])),
+            tx_hash: Hash256::from([7u8; 32]),
+            tlc_index: 0,
+        }))
+    );
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id_b,
+            &channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Exact(OnChainTlcSettlement {
+            payment_hash,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            preimage: None,
+            tx_hash: Hash256::from([8u8; 32]),
+            tlc_index: 0,
+        }))
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_onchain_tlc_settlement_legacy_empty_value() {
+    let path = TempDir::new("test-onchain-tlc-settlement-legacy");
+    let store = open_store(path).expect("created store failed");
+    let channel_id = Hash256::from([1u8; 32]);
+    let payment_hash = Hash256::from([3u8; 32]);
+    let prefix: [u8; 20] = payment_hash.as_ref()[0..20].try_into().unwrap();
+    let key = [
+        &[WATCHTOWER_TLC_SETTLED_PREFIX],
+        channel_id.as_ref(),
+        prefix.as_ref(),
+    ]
+    .concat();
+
+    store.put(key, []);
+    let tlc_id = TLCId::Offered(0);
+    let node_id = NodeId::local();
+
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Legacy(
+            LegacyOnChainTlcSettlement {
+                preimage: None,
+                tx_hash: None,
+                tlc_index: None,
+            }
+        ))
+    );
+
+    let exact = OnChainTlcSettlement {
+        payment_hash,
+        hash_algorithm: HashAlgorithm::CkbHash,
+        preimage: None,
+        tx_hash: Hash256::from([7u8; 32]),
+        tlc_index: 0,
+    };
+    store.insert_onchain_tlc_settlement(&node_id, &channel_id, tlc_id, exact.clone());
+    assert_eq!(
+        WatchtowerStore::get_onchain_tlc_settlement(
+            &store,
+            &node_id,
+            &channel_id,
+            tlc_id,
+            &payment_hash,
+        ),
+        Some(StoredOnChainTlcSettlement::Exact(exact)),
+        "the unified lookup must prefer an exact record over the legacy prefix fallback"
     );
 }
 
@@ -812,6 +1241,7 @@ fn test_channel_actor_state_store() {
         ephemeral_config: Default::default(),
         funding_abort_detail: None,
         private_key: None,
+        needs_backup: false,
     };
 
     let bincode_encoded = bincode::serialize(&state).unwrap();
@@ -952,6 +1382,7 @@ fn sample_channel_actor_state(
         ephemeral_config: Default::default(),
         funding_abort_detail: None,
         private_key: None,
+        needs_backup: false,
     }
 }
 
@@ -1024,6 +1455,142 @@ fn test_store_payment_session() {
     assert_eq!(res.request.max_fee_amount, Some(1000));
     assert_eq!(res.status, PaymentStatus::Created);
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn test_channel_ready_retry_index_handles_created_attempt_channel_ownership() {
+    let (store, _dir) = generate_store();
+    let payment_hash = gen_rand_sha256_hash();
+    let mut channel_state = sample_channel_actor_state(ChannelState::ChannelReady, None);
+    let first_hop_outpoint = channel_state.must_get_funding_transaction_outpoint();
+    let first_hop_funding_tx_hash = first_hop_outpoint.tx_hash().into();
+    let target = gen_rand_fiber_public_key();
+    let first_hop = gen_rand_fiber_public_key();
+    let _payment_data = SendPaymentDataBuilder::new(target, 100, payment_hash)
+        .router(vec![RouterHop {
+            target: first_hop,
+            channel_outpoint: first_hop_outpoint.clone(),
+            amount_received: 100,
+            incoming_tlc_expiry: now_timestamp_as_millis_u64() + DEFAULT_TLC_EXPIRY_DELTA,
+        }])
+        .final_tlc_expiry_delta(DEFAULT_TLC_EXPIRY_DELTA)
+        .tlc_expiry_limit(MAX_PAYMENT_TLC_EXPIRY_LIMIT)
+        .timeout(Some(10))
+        .max_fee_amount(Some(1000))
+        .build()
+        .expect("valid payment_data");
+    let now = now_timestamp_as_millis_u64();
+    let route_hops = vec![PaymentHopData {
+        amount: 100,
+        expiry: now + DEFAULT_TLC_EXPIRY_DELTA,
+        payment_preimage: None,
+        hash_algorithm: HashAlgorithm::CkbHash,
+        funding_tx_hash: first_hop_funding_tx_hash,
+        next_hop: Some(target),
+        custom_records: None,
+    }];
+    let route = SessionRoute::new(first_hop, target, &route_hops);
+    let mut attempt = Attempt {
+        id: 1,
+        hash: payment_hash,
+        try_limit: 10,
+        tried_times: 1,
+        payment_hash,
+        route,
+        route_hops,
+        session_key: [0; 32],
+        preimage: None,
+        created_at: now,
+        last_updated_at: now,
+        last_error: None,
+        status: AttemptStatus::Created,
+    };
+
+    assert_eq!(attempt.status, AttemptStatus::Created);
+    store.insert_attempt(attempt.clone());
+    let orphan_created_attempts =
+        store.get_pending_attempts_by_channel_outpoint(&first_hop_outpoint);
+    assert_eq!(orphan_created_attempts.len(), 1);
+    assert_eq!(orphan_created_attempts[0].id, attempt.id);
+    assert_eq!(orphan_created_attempts[0].status, AttemptStatus::Created);
+
+    channel_state.tlc_state.add_offered_tlc(TlcInfo {
+        status: TlcStatus::Outbound(OutboundTlcStatus::LocalAnnounced),
+        tlc_id: TLCId::Offered(0),
+        amount: 100,
+        payment_hash,
+        total_amount: None,
+        payment_secret: None,
+        attempt_id: Some(attempt.id),
+        expiry: now + DEFAULT_TLC_EXPIRY_DELTA,
+        hash_algorithm: HashAlgorithm::CkbHash,
+        onion_packet: None,
+        shared_secret: [0u8; 32],
+        is_trampoline_hop: false,
+        created_at: CommitmentNumbers::new(),
+        removed_reason: None,
+        forwarding_tlc: None,
+        removed_confirmed_at: None,
+        applied_flags: AppliedFlags::empty(),
+    });
+    store.insert_channel_actor_state(channel_state.clone());
+    assert!(
+        store
+            .get_pending_attempts_by_channel_outpoint(&first_hop_outpoint)
+            .is_empty(),
+        "created attempts already owned by channel TLCs should not be woken"
+    );
+
+    let terminal_tlc = channel_state
+        .tlc_state
+        .offered_tlcs
+        .tlcs
+        .first_mut()
+        .expect("offered TLC exists");
+    terminal_tlc.status = TlcStatus::Outbound(OutboundTlcStatus::RemoveAckConfirmed);
+    terminal_tlc.applied_flags |= AppliedFlags::REMOVE;
+    terminal_tlc.removed_confirmed_at = Some(1);
+    store.insert_channel_actor_state(channel_state.clone());
+    let orphan_created_attempts =
+        store.get_pending_attempts_by_channel_outpoint(&first_hop_outpoint);
+    assert_eq!(
+        orphan_created_attempts.len(),
+        1,
+        "created attempts with terminal channel TLCs should be woken"
+    );
+    assert_eq!(orphan_created_attempts[0].id, attempt.id);
+
+    channel_state.tlc_state = Default::default();
+    channel_state
+        .retryable_tlc_operations
+        .push_back(RetryableTlcOperation::AddTlc(AddTlcCommand {
+            amount: 100,
+            payment_hash,
+            attempt_id: Some(attempt.id),
+            expiry: now + DEFAULT_TLC_EXPIRY_DELTA,
+            hash_algorithm: HashAlgorithm::CkbHash,
+            onion_packet: None,
+            shared_secret: [0u8; 32],
+            is_trampoline_hop: false,
+            previous_tlc: None,
+        }));
+    store.insert_channel_actor_state(channel_state);
+    assert!(
+        store
+            .get_pending_attempts_by_channel_outpoint(&first_hop_outpoint)
+            .is_empty(),
+        "created attempts already owned by queued channel AddTlc should not be woken"
+    );
+
+    attempt.status = AttemptStatus::Retrying;
+    store.insert_attempt(attempt.clone());
+    let retrying_attempts = store.get_pending_attempts_by_channel_outpoint(&first_hop_outpoint);
+    assert_eq!(retrying_attempts.len(), 1);
+    assert_eq!(retrying_attempts[0].id, attempt.id);
+    assert_eq!(retrying_attempts[0].status, AttemptStatus::Retrying);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -1280,6 +1847,29 @@ fn test_store_change_watcher() {
         .insert_invoice(invoice.clone(), Some(preimage))
         .unwrap();
 
+    let payment_data = SendPaymentDataBuilder::new(gen_rand_fiber_public_key(), 100, payment_hash)
+        .final_tlc_expiry_delta(DEFAULT_TLC_EXPIRY_DELTA)
+        .tlc_expiry_limit(MAX_PAYMENT_TLC_EXPIRY_LIMIT)
+        .timeout(Some(10))
+        .max_fee_amount(Some(1000))
+        .build()
+        .expect("valid payment_data");
+    let payment_session = PaymentSession::new_session(&store, payment_data, 10);
+    let source = gen_rand_fiber_public_key();
+    let target = gen_rand_fiber_public_key();
+    let route_hops = vec![PaymentHopData {
+        amount: 100,
+        expiry: DEFAULT_TLC_EXPIRY_DELTA,
+        payment_preimage: None,
+        hash_algorithm: HashAlgorithm::default(),
+        funding_tx_hash: gen_rand_sha256_hash(),
+        next_hop: None,
+        custom_records: None,
+    }];
+    let mut attempt = payment_session.new_attempt(1, source, target, route_hops);
+    attempt.set_inflight_status();
+    store.insert_attempt(attempt);
+
     let changes = saver.changes.read().unwrap();
     assert!(changes.iter().any(
         |e| matches!(e, StoreChange::PutCkbInvoiceStatus { payment_hash: h, invoice_status: CkbInvoiceStatus::Open } if h == &payment_hash)
@@ -1287,6 +1877,39 @@ fn test_store_change_watcher() {
     assert!(changes.iter().any(
         |e| matches!(e, StoreChange::PutPreimage { payment_hash: h, payment_preimage: i } if h == &payment_hash && i == &preimage)
     ));
+    assert!(changes.iter().any(
+        |e| matches!(e, StoreChange::PutAttempt { payment_hash: h, attempt_status: AttemptStatus::Inflight } if h == &payment_hash)
+    ));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_insert_preimage_replay_notifies_watcher() {
+    use crate::store::store_impl::StoreChange;
+    use std::sync::Arc;
+
+    let (mut store, _dir) = generate_store();
+    let saver = Arc::new(StoreChangeSaver::default());
+    let saver_clone = saver.clone();
+    store.set_watcher(Arc::new(move |change: StoreChange| {
+        saver_clone.changes.write().unwrap().push(change);
+    }));
+
+    let payment_hash = gen_rand_sha256_hash();
+    let preimage = gen_rand_sha256_hash();
+
+    store.insert_preimage(payment_hash, preimage);
+    store.insert_preimage(payment_hash, preimage);
+
+    let changes = saver.changes.read().unwrap();
+    let put_preimage_count = changes
+        .iter()
+        .filter(
+            |e| matches!(e, StoreChange::PutPreimage { payment_hash: h, payment_preimage: i } if h == &payment_hash && i == &preimage),
+        )
+        .count();
+    assert_eq!(put_preimage_count, 2);
+    assert_eq!(store.get_preimage(&payment_hash), Some(preimage));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1457,4 +2080,142 @@ fn test_store_get_broadcast_messages_reverse_excludes_cursor() {
     assert!(store
         .get_broadcast_messages_reverse(Some(&first_cursor), 1)
         .is_empty());
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod store_actor_tests {
+    use crate::actors::RootActor;
+    use crate::store::actor::{StoreActor, StoreActorInitializationParameter, StoreActorMessage};
+    use crate::tasks::{new_tokio_cancellation_token, new_tokio_task_tracker};
+    use fiber_store::backend::TakeWhileFn;
+    use fiber_store::{IteratorDirection, KVPair, StorageBackend, StoreError};
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use tokio::time::{advance, sleep};
+
+    struct MockStore {
+        backup_count: Arc<AtomicUsize>,
+    }
+
+    impl StorageBackend for MockStore {
+        type Batch = <fiber_store::Store as StorageBackend>::Batch;
+
+        fn get<K: AsRef<[u8]>>(&self, _key: K) -> Option<Vec<u8>> {
+            todo!()
+        }
+        fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(&self, _key: K, _value: V) {
+            todo!()
+        }
+        fn delete<K: AsRef<[u8]>>(&self, _key: K) {
+            todo!()
+        }
+        fn batch(&self) -> Self::Batch {
+            todo!()
+        }
+        fn collect_iterator(
+            &self,
+            _: Vec<u8>,
+            _: IteratorDirection,
+            _: TakeWhileFn,
+            _: usize,
+        ) -> Vec<KVPair> {
+            todo!()
+        }
+        fn restore(&self, _: &Path, _: &Path) -> Result<(), StoreError> {
+            todo!()
+        }
+
+        fn backup(&self, _path: &std::path::Path) -> Result<(), StoreError> {
+            self.backup_count.fetch_add(1, SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_store_actor_buffered_backup() {
+        let backup_count = Arc::new(AtomicUsize::new(0));
+        let mock_store = MockStore {
+            backup_count: Arc::clone(&backup_count),
+        };
+        let temp_dir = tempdir().unwrap();
+
+        let (tracker, token) = (new_tokio_task_tracker(), new_tokio_cancellation_token());
+        let root_actor = RootActor::start_for_test(tracker, token).await;
+
+        let args = StoreActorInitializationParameter {
+            store: mock_store,
+            backup_path: temp_dir.path().to_path_buf(),
+            ckb_key_path: temp_dir.path().to_path_buf(),
+            fiber_key_path: temp_dir.path().to_path_buf(),
+            backup_interval_hours: 24,
+        };
+
+        let (store_actor, _handle) =
+            ractor::Actor::spawn_linked(None, StoreActor::new(), args, root_actor.get_cell())
+                .await
+                .unwrap();
+
+        // First request should trigger the backup immediately
+        store_actor.cast(StoreActorMessage::RequestBackup).unwrap();
+        tokio::task::yield_now().await;
+        sleep(Duration::from_millis(100)).await;
+
+        advance(Duration::from_secs(61)).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            backup_count.load(SeqCst),
+            1,
+            "The backup request must be executed."
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_store_actor_backup_throttling() {
+        let backup_count = Arc::new(AtomicUsize::new(0));
+        let mock_store = MockStore {
+            backup_count: Arc::clone(&backup_count),
+        };
+        let temp_dir = tempdir().unwrap();
+        let (tracker, token) = (new_tokio_task_tracker(), new_tokio_cancellation_token());
+        let root_actor = RootActor::start_for_test(tracker, token).await;
+
+        let (store_actor, _) = ractor::Actor::spawn_linked(
+            None,
+            StoreActor::new(),
+            StoreActorInitializationParameter {
+                store: mock_store,
+                backup_path: temp_dir.path().to_path_buf(),
+                ckb_key_path: temp_dir.path().to_path_buf(),
+                fiber_key_path: temp_dir.path().to_path_buf(),
+                backup_interval_hours: 24,
+            },
+            root_actor.get_cell(),
+        )
+        .await
+        .unwrap();
+
+        // Trigger initial backup
+        store_actor.cast(StoreActorMessage::RequestBackup).unwrap();
+        tokio::task::yield_now().await;
+
+        // Send multiple requests within the 60-second cooldown period
+        for _ in 0..20 {
+            store_actor.cast(StoreActorMessage::RequestBackup).unwrap();
+        }
+        tokio::task::yield_now().await;
+
+        advance(Duration::from_secs(61)).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            backup_count.load(SeqCst),
+            1,
+            "Requests during cooldown should be throttled and not trigger new backups."
+        );
+    }
 }

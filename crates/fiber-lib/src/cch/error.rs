@@ -14,6 +14,8 @@ pub enum CchStoreError {
 
 #[derive(Error, Debug)]
 pub enum CchError {
+    #[error("CCH startup recovery is still initializing")]
+    StartupRecoveryInProgress,
     #[error("Configuration error: {0}")]
     ConfigError(String),
     #[error("Store error: {0}")]
@@ -22,6 +24,13 @@ pub enum CchError {
     OutgoingInvoiceExpiryTooShort,
     #[error("BTC invoice parse error: {0}")]
     BTCInvoiceParseError(lightning_invoice::ParseOrSemanticError),
+    #[error(
+        "BTC invoice creation timestamp {invoice_created_at} is newer than CCH order creation timestamp {order_created_at}"
+    )]
+    BTCInvoiceCreationTimeInFuture {
+        invoice_created_at: u64,
+        order_created_at: u64,
+    },
     #[error("BTC invoice expired")]
     BTCInvoiceExpired,
     #[error("BTC invoice missing amount")]
@@ -30,6 +39,13 @@ pub enum CchError {
     BTCInvoiceFinalTlcExpiryDeltaTooLarge,
     #[error("CKB invoice error: {0}")]
     CKBInvoiceError(#[from] crate::invoice::InvoiceError),
+    #[error(
+        "CKB invoice creation timestamp {invoice_created_at_ms} is newer than CCH order creation timestamp {order_created_at_ms}"
+    )]
+    CKBInvoiceCreationTimeInFuture {
+        invoice_created_at_ms: u128,
+        order_created_at_ms: u128,
+    },
     #[error("CKB invoice expired")]
     CKBInvoiceExpired,
     #[error("CKB invoice missing amount")]
@@ -67,8 +83,41 @@ pub enum CchError {
     LndChannelError(#[from] lnd_grpc_tonic_client::channel::Error),
     #[error("Lnd RPC error: {0}")]
     LndRpcError(String),
+    #[error("Conflicting receive_btc request for payment hash {0}")]
+    ConflictingReceiveBTCRequest(Hash256),
+    #[error("Conflicting send_btc request for payment hash {0}")]
+    ConflictingSendBTCRequest(Hash256),
+    #[error("receive_btc order creation for payment hash {0} is already being recovered")]
+    ReceiveBTCOrderCreationInProgress(Hash256),
+    #[error("send_btc order creation for payment hash {0} is already being recovered")]
+    SendBTCOrderCreationInProgress(Hash256),
+    #[error("receive_btc order creation for payment hash {0} has expired")]
+    ReceiveBTCOrderCreationExpired(Hash256),
+    #[error("send_btc order creation for payment hash {0} has expired")]
+    SendBTCOrderCreationExpired(Hash256),
+    #[error("LND invoice for payment hash {payment_hash} does not match the CCH order: {reason}")]
+    LndInvoiceMismatch {
+        payment_hash: Hash256,
+        reason: String,
+    },
+    #[error("LND payment tracker error: {0}")]
+    LndPaymentTrackerError(String),
+    #[error("LND payment is already tracked: {0}")]
+    LndPaymentAlreadyTracked(Hash256),
+    #[error("LND payment tracker capacity exceeded (maximum {0})")]
+    LndPaymentTrackerCapacityExceeded(usize),
+    #[error("LND invoice {0} is already being tracked")]
+    LndInvoiceAlreadyTracked(Hash256),
+    #[error("LND invoice tracker capacity exceeded (maximum {0})")]
+    LndInvoiceTrackerCapacityExceeded(usize),
+    #[error("LND invoice tracker error: {0}")]
+    LndInvoiceTrackerError(String),
     #[error("Fiber node error: {0}")]
     FiberNodeError(anyhow::Error),
+    #[error("Fiber invoice already exists: {0}")]
+    FiberInvoiceAlreadyExists(Hash256),
+    #[error("Fiber invoice does not match send_btc creation intent: {0}")]
+    FiberInvoiceMismatch(Hash256),
 }
 
 pub type CchResult<T> = std::result::Result<T, CchError>;
