@@ -116,6 +116,7 @@ pub async fn forward_event_to_client<T: WatchtowerRpcClient + Sync>(
                 .create_preimage(CreatePreimageParams {
                     payment_hash: payment_hash.into(),
                     preimage: preimage.into(),
+                    force: false,
                 })
                 .await
                 .map_err(|e| format!("Failed to create preimage: {e}"))?;
