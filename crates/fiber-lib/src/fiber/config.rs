@@ -611,6 +611,14 @@ impl FiberConfig {
         // TODO: override default features from config settings
         // ...
         let mut fv = FeatureVector::default();
+        // H32V2 attack fixture: one debug binary must act as either
+        // counterparty, so the layout advertisement is selectable. Unset means
+        // the channel stays on the Legacy commitment layout.
+        if std::env::var("FIBER_TEST_DISABLE_FULL_HASH_FEATURE").as_deref() == Ok("1") {
+            fv.unset_onchain_full_payment_hash_required();
+            fv.unset_onchain_full_payment_hash_optional();
+            return fv;
+        }
         // Advertise support for committing the full 32-byte payment hash
         // on-chain; channels are only upgraded to the V1 commitment contract
         // layout when the peer also advertises this feature.

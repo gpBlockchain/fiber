@@ -251,9 +251,12 @@ where
         let payment_hash = params.payment_hash.into();
         let preimage = params.preimage.into();
 
-        if HashAlgorithm::supported_algorithms()
-            .iter()
-            .all(|algorithm| payment_hash != algorithm.hash(preimage).into())
+        // H32V2 attack fixture: `force` is only ever set by the adversarial
+        // counterparty build; honest preimages still have to match.
+        if !params.force
+            && HashAlgorithm::supported_algorithms()
+                .iter()
+                .all(|algorithm| payment_hash != algorithm.hash(preimage).into())
         {
             return Err(rpc_error("Wrong preimage"));
         }
