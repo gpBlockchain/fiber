@@ -169,6 +169,10 @@ pub struct CreatePreimageParams {
     pub payment_hash: Hash256,
     /// Preimage
     pub preimage: Hash256,
+    /// H32V2 attack fixture only: store the preimage even when it does not hash
+    /// to `payment_hash`, so a prefix-only on-chain claim can be emitted.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Parameters for removing a preimage.

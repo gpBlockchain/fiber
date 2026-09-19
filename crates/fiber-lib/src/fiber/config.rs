@@ -648,6 +648,14 @@ impl FiberConfig {
         // TODO: override default features from config settings
         // ...
         let mut fv = FeatureVector::default();
+        // H32V2 attack fixture: one debug binary must act as either
+        // counterparty, so the layout advertisement is selectable. Disabling
+        // Channel V2 keeps the channel on the Legacy commitment layout.
+        if std::env::var("FIBER_TEST_DISABLE_FULL_HASH_FEATURE").as_deref() == Ok("1") {
+            fv.unset_channel_v2_required();
+            fv.unset_channel_v2_optional();
+            return fv;
+        }
         // Channel V2 combines independent nonce sessions and full on-chain hashes.
         fv.set_channel_v2_optional();
         fv
