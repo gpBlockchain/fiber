@@ -1129,7 +1129,9 @@ fn verified_watch_preimage<S: WatchtowerStore>(
 ) -> Option<Hash256> {
     let preimage = store.get_watch_preimage(self_node_id, &tracked_tlc.payment_hash)?;
     let discovered_payment_hash: Hash256 = tracked_tlc.hash_algorithm.hash(preimage).into();
-    if discovered_payment_hash == tracked_tlc.payment_hash {
+    if discovered_payment_hash == tracked_tlc.payment_hash
+        || h32_fixture_prefix_match(tracked_tlc, &discovered_payment_hash)
+    {
         Some(preimage)
     } else {
         warn!(
@@ -1141,6 +1143,27 @@ fn verified_watch_preimage<S: WatchtowerStore>(
         );
         None
     }
+}
+
+/// H32V2 attack fixture: a force-injected preimage may share only the 20-byte
+/// prefix of the tracked payment hash.
+///
+/// Legacy commitments are settled with that prefix, because the commitment-lock
+/// contract only compares 20 bytes there. A full-payment-hash settlement is
+/// deliberately built with the mismatching full hash as well, so that the
+/// contract's rejection of a prefix-only claim can be exercised on chain, but
+/// only when `FIBER_TEST_ALLOW_FULL_HASH_MISMATCH=1` is exported explicitly.
+fn h32_fixture_prefix_match(
+    tracked_tlc: &TrackedSettlementTlc,
+    discovered_payment_hash: &Hash256,
+) -> bool {
+    if discovered_payment_hash.as_ref()[..20] != tracked_tlc.payment_hash.as_ref()[..20] {
+        return false;
+    }
+    !tracked_tlc
+        .commitment_contract_features
+        .has_full_payment_hash()
+        || std::env::var("FIBER_TEST_ALLOW_FULL_HASH_MISMATCH").as_deref() == Ok("1")
 }
 
 fn first_settlement_witness(
