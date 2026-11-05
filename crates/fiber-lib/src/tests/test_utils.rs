@@ -99,7 +99,7 @@ use crate::{
 };
 
 static RETAIN_VAR: &str = "TEST_TEMP_RETAIN";
-pub const MIN_RESERVED_CKB: u128 = 99 * CKB_SHANNONS as u128;
+pub const MIN_RESERVED_CKB: u128 = 100 * CKB_SHANNONS as u128;
 pub const HUGE_CKB_AMOUNT: u128 = MIN_RESERVED_CKB + 1000000 * CKB_SHANNONS as u128;
 const DEFAULT_WAIT_UNTIL_TIME: u64 = 60 * 10; // seconds
 const EVENT_WAIT_TIMEOUT_OVERRIDE_SECS_ENV: &str = "FNN_EVENT_WAIT_TIMEOUT_SECS";
@@ -579,6 +579,45 @@ pub(crate) async fn create_nodes_with_established_channel(
     .await;
 
     (node_a, node_b, channel_id)
+}
+
+/// Explicit zero-feature fixture for tests of the legacy nonce chain / CommitDiff.
+#[cfg(test)]
+pub(crate) async fn create_legacy_nodes_with_established_channel(
+    node_a_funding_amount: u128,
+    node_b_funding_amount: u128,
+    public: bool,
+) -> (NetworkNode, NetworkNode, Hash256) {
+    let mut features = FeatureVector::default();
+    features.unset_channel_v2_optional();
+    features.unset_channel_v2_required();
+    let mut node_a = NetworkNode::new_with_node_name("legacy_a").await;
+    let mut node_b = NetworkNode::new_with_node_name("legacy_b").await;
+    node_a.update_node_features_and_wait(features.clone()).await;
+    node_b.update_node_features_and_wait(features).await;
+    for node in [&node_a, &node_b] {
+        ractor::call!(
+            node.network_actor,
+            |reply| NetworkActorMessage::new_command(NetworkActorCommand::TestEnableLegacyFixture(
+                reply
+            ))
+        )
+        .unwrap();
+    }
+    node_a.connect_to(&mut node_b).await;
+    let (id, _) = establish_channel_between_nodes(
+        &mut node_a,
+        &mut node_b,
+        ChannelParameters {
+            public,
+            node_a_funding_amount,
+            node_b_funding_amount,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(node_a.get_channel_actor_state(id).session_v2.is_none());
+    (node_a, node_b, id)
 }
 
 #[cfg(test)]
@@ -1491,15 +1530,18 @@ impl NetworkNode {
     }
 
     pub async fn disable_channel_stealthy(&self, channel_id: Hash256) {
-        let mut channel_actor_state = self.get_channel_actor_state(channel_id);
-        channel_actor_state.local_tlc_info.enabled = false;
-        self.update_channel_actor_state(
-            channel_actor_state,
-            Some(ReloadParams {
-                notify_changes: false,
-            }),
+        // Mutate the live actor: an external snapshot write can be overwritten before ReloadState.
+        ractor::call_t!(
+            self.network_actor,
+            |reply| NetworkActorMessage::new_command(NetworkActorCommand::ControlFiberChannel(
+                ChannelCommandWithId {
+                    channel_id,
+                    command: ChannelCommand::TestDisableTlc(reply),
+                }
+            )),
+            5000
         )
-        .await;
+        .expect("channel actor durably disables outbound TLCs");
     }
 
     pub async fn handle_shutdown_command_without_check(
@@ -2407,6 +2449,42 @@ async fn test_connect_to_other_node() {
     let mut node_a = NetworkNode::new().await;
     let mut node_b = NetworkNode::new().await;
     node_a.connect_to(&mut node_b).await;
+}
+
+#[tokio::test]
+async fn test_connect_to_other_node_on_additional_listening_address() {
+    let mut node_a = NetworkNode::new().await;
+    let mut node_b = NetworkNode::new_with_config(
+        NetworkNodeConfigBuilder::new()
+            .fiber_config_updater(|config| {
+                config.listening_addr = Some("/ip4/127.0.0.1/tcp/0".to_string());
+                config.listening_addrs = vec!["/ip4/127.0.0.1/tcp/0".to_string()];
+                config.reuse_port_for_websocket = false;
+            })
+            .build(),
+    )
+    .await;
+
+    assert_eq!(node_b.listening_addrs.len(), 2);
+    let peer_addr = node_b.listening_addrs[1].clone();
+
+    call!(node_a.network_actor, |rpc_reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::ConnectPeer(
+            peer_addr,
+            false,
+            crate::fiber::network::PeerConnectSource::Manual,
+            Some(rpc_reply),
+        ))
+    })
+    .expect("node is alive")
+    .expect("connect through the additional listening address");
+    node_a
+        .expect_event(|event| {
+            matches!(event, NetworkServiceEvent::PeerConnected(pubkey, _) if pubkey == &node_b.pubkey)
+        })
+        .await;
+    node_a.expect_debug_event("PeerInit").await;
+    node_b.expect_debug_event("PeerInit").await;
 }
 
 #[tokio::test]

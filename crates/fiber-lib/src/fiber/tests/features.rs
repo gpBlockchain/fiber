@@ -1,5 +1,7 @@
 use crate::fiber::FeatureVector;
-use fiber_types::feature_bits::{GOSSIP_QUERIES_OPTIONAL, GOSSIP_QUERIES_REQUIRED};
+use fiber_types::feature_bits::{
+    CHANNEL_V2_OPTIONAL, CHANNEL_V2_REQUIRED, GOSSIP_QUERIES_OPTIONAL, GOSSIP_QUERIES_REQUIRED,
+};
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
@@ -189,6 +191,50 @@ fn test_feature_compatibility() {
     assert!(vector.compatible_with(&vector2));
     vector2.unset_gossip_queries_required();
     assert!(!vector.compatible_with(&vector2));
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn test_channel_v2_feature_bit() {
+    let mut vector = FeatureVector::default();
+    assert!(!vector.supports_channel_v2());
+    vector.set_channel_v2_optional();
+    assert!(vector.supports_channel_v2());
+    assert!(!vector.requires_channel_v2());
+    vector.set_channel_v2_required();
+    assert!(vector.requires_channel_v2());
+    vector.unset_channel_v2_required();
+    vector.unset_channel_v2_optional();
+    assert!(!vector.supports_channel_v2());
+    assert!(!vector.requires_channel_v2());
+
+    // backward compat: the pre-existing features still work
+    vector.unset_gossip_queries_required();
+    assert!(!vector.supports_feature(GOSSIP_QUERIES_OPTIONAL));
+    vector.set_gossip_queries_optional();
+    assert!(vector.supports_feature(GOSSIP_QUERIES_OPTIONAL));
+    assert_eq!(CHANNEL_V2_OPTIONAL, 7);
+    assert_eq!(CHANNEL_V2_REQUIRED, 6);
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn channel_features_are_validated_bytes() {
+    use fiber_types::ChannelFeatures as Features;
+
+    assert_eq!(Features::LEGACY.bits(), 0);
+    assert_eq!(Features::V2.bits(), 1);
+    assert_eq!(Features::LEGACY.lock_args_len(), 57);
+    assert_eq!(Features::V2.lock_args_len(), 58);
+    assert_eq!(Features::LEGACY.payment_hash_len(), 20);
+    assert_eq!(Features::V2.payment_hash_len(), 32);
+    assert_eq!(bincode::serialize(&Features::V2).unwrap(), vec![1]);
+    assert!(bincode::deserialize::<Features>(&[2]).is_err());
+    assert_eq!(
+        Features::for_negotiated(true, Some(false)),
+        Features::LEGACY
+    );
+    assert_eq!(Features::for_negotiated(true, Some(true)), Features::V2);
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

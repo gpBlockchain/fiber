@@ -34,6 +34,8 @@ use fiber_store::migration::{
     MigrateConfirmFn, MigrateProgressFn, INIT_DB_VERSION, MIGRATION_VERSION_KEY,
 };
 use fiber_types::schema::*;
+#[cfg(feature = "watchtower")]
+use fiber_types::ChannelFeatures;
 use fiber_types::{
     Attempt, AttemptStatus, BroadcastMessage, BroadcastMessageID, ChannelData, ChannelOpenRecord,
     ChannelState, Cursor, Direction, Hash256, PaymentCustomRecords, PaymentSession, PaymentStatus,
@@ -96,9 +98,20 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
+    /// Shut down the browser database after all actors and background writes stop.
+    #[cfg(target_arch = "wasm32")]
+    pub fn shutdown(self) {
+        self.inner.shutdown();
+    }
+
     /// Set a watcher callback that will be invoked on relevant store changes.
     pub fn set_watcher(&mut self, watcher: Arc<dyn Fn(StoreChange) + Send + Sync>) {
         self.watcher = Some(watcher);
+    }
+
+    /// Whether every write waits for the disk, see `FiberConfig::store_sync_writes`.
+    pub fn sync_writes(&self) -> bool {
+        self.inner.sync_writes()
     }
 
     fn notify(&self, change: StoreChange) {
@@ -183,21 +196,51 @@ where
         .unwrap_or_else(|e| panic!("deserialization of {} failed: {}", field_name, e))
 }
 
+fn deserialize_channel_state(bytes: &[u8]) -> ChannelActorState {
+    fiber_types::channel_v2_validation::decode_channel_actor_data(bytes)
+        .unwrap_or_else(|e| panic!("deserialization of ChannelActorState failed: {e}"))
+        .into()
+}
+
 /// Open a store at `path`, running auto-migration with auto-confirm.
 /// Use this when no user interaction is needed (e.g. tests, simple setups).
 pub fn open_store<P: AsRef<Path>>(path: P) -> Result<Store, String> {
-    open_store_with_migration(path, Box::new(|_| true), Box::new(|_| {}))
+    open_store_with_migration(path, false, Box::new(|_| true), Box::new(|_| {}))
 }
 
 /// Open a store at `path`, running auto-migration with custom confirm/progress callbacks.
 /// Use this when user interaction is required (e.g. CLI, WASM).
+///
+/// `sync_writes` (`FiberConfig::store_sync_writes`) is set before the migrations run, so their
+/// writes wait for the disk too. The browser store has no such setting and ignores it.
 pub fn open_store_with_migration<P: AsRef<Path>>(
     path: P,
+    sync_writes: bool,
     confirm_fn: MigrateConfirmFn,
     progress_fn: MigrateProgressFn,
 ) -> Result<Store, String> {
-    let db = fiber_store::Store::open_db(path.as_ref())?;
-    run_auto_migrate(&db, confirm_fn, progress_fn)?;
+    let mut migrate = DbMigrate::new();
+    fiber_store::migrations::register_all_migrations(&mut migrate);
+    open_store_with_migrations(path, sync_writes, migrate, confirm_fn, progress_fn)
+}
+
+/// `open_store_with_migration` with the migrations given, for tests.
+pub(crate) fn open_store_with_migrations<P: AsRef<Path>>(
+    path: P,
+    sync_writes: bool,
+    migrate: DbMigrate,
+    confirm_fn: MigrateConfirmFn,
+    progress_fn: MigrateProgressFn,
+) -> Result<Store, String> {
+    #[allow(unused_mut)]
+    let mut db = fiber_store::Store::open_db(path.as_ref())?;
+    #[cfg(not(target_arch = "wasm32"))]
+    db.set_sync_writes(sync_writes);
+    #[cfg(target_arch = "wasm32")]
+    let _ = sync_writes;
+    migrate
+        .auto_migrate(&db, confirm_fn, progress_fn)
+        .map_err(|e| e.to_string())?;
     Ok(Store {
         inner: db,
         watcher: None,
@@ -206,18 +249,6 @@ pub fn open_store_with_migration<P: AsRef<Path>>(
         #[cfg(feature = "watchtower")]
         onchain_tlc_settlement_write_lock: Arc::new(parking_lot::Mutex::new(())),
     })
-}
-
-fn run_auto_migrate(
-    db: &fiber_store::Store,
-    confirm_fn: MigrateConfirmFn,
-    progress_fn: MigrateProgressFn,
-) -> Result<(), String> {
-    let mut migrate = DbMigrate::new();
-    fiber_store::migrations::register_all_migrations(&mut migrate);
-    migrate
-        .auto_migrate(db, confirm_fn, progress_fn)
-        .map_err(|e| e.to_string())
 }
 
 pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
@@ -250,11 +281,15 @@ pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
 
         match key[0] {
             CHANNEL_ACTOR_STATE_PREFIX => {
-                check_deserialization::<ChannelActorState>(
-                    &value,
-                    "CHANNEL_ACTOR_STATE_PREFIX",
-                    &mut errors,
-                );
+                if let Err(e) =
+                    fiber_types::channel_v2_validation::decode_and_validate_channel_actor_data(
+                        &value,
+                    )
+                {
+                    errors.insert(format!(
+                        "Failed to deserialize CHANNEL_ACTOR_STATE_PREFIX: {e}"
+                    ));
+                }
             }
             PUBLIC_KEY_NETWORK_ACTOR_STATE_PREFIX => {
                 check_deserialization::<PersistentNetworkActorState>(
@@ -275,6 +310,9 @@ pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
                     "CKB_INVOICE_STATUS_PREFIX",
                     &mut errors,
                 );
+            }
+            INVOICE_PREIMAGE_PREFIX => {
+                check_deserialization::<()>(&value, "INVOICE_PREIMAGE_PREFIX", &mut errors);
             }
             PUBKEY_CHANNEL_ID_PREFIX => {}
             CHANNEL_OUTPOINT_CHANNEL_ID_PREFIX => {
@@ -484,6 +522,43 @@ pub enum StoreChange {
         payment_hash: Hash256,
         attempt_status: AttemptStatus,
     },
+}
+
+/// Delivers each store change to every subscriber, in the order the store made them.
+///
+/// ractor's `OutputPort` holds at most 16 messages between a sender and each subscriber's
+/// forwarding task, and drops a subscriber for good once its task falls further behind. The
+/// store can send more changes than that in a row (#1717), so this port hands each change
+/// straight to the subscriber's mailbox instead, keeping no queue of its own. A subscriber
+/// that has stopped is removed.
+#[derive(Default)]
+pub struct StoreChangePort {
+    subscribers: parking_lot::Mutex<Vec<StoreChangeDelivery>>,
+}
+
+/// Hands a change to one subscriber; false once the subscriber has stopped.
+type StoreChangeDelivery = Box<dyn Fn(StoreChange) -> bool + Send>;
+
+impl StoreChangePort {
+    pub fn subscribe<M>(&self, receiver: ractor::ActorRef<M>)
+    where
+        M: ractor::Message + From<StoreChange>,
+    {
+        self.subscribers.lock().push(Box::new(move |change| {
+            receiver.cast(M::from(change)).is_ok()
+        }));
+    }
+
+    pub fn send(&self, change: StoreChange) {
+        self.subscribers
+            .lock()
+            .retain(|deliver| deliver(change.clone()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscriber_count(&self) -> usize {
+        self.subscribers.lock().len()
+    }
 }
 
 pub trait StoreKeyValue {
@@ -938,10 +1013,24 @@ impl NetworkActorStateStore for Store {
 }
 
 impl ChannelActorStateStore for Store {
+    fn has_trampoline_payment_for_tlc(
+        &self,
+        payment_hash: Hash256,
+        channel_id: Hash256,
+        tlc_id: u64,
+    ) -> bool {
+        self.get_payment_session(payment_hash)
+            .and_then(|session| session.request.trampoline_context)
+            .is_some_and(|context| {
+                context.previous_tlcs.iter().any(|previous| {
+                    previous.prev_channel_id == channel_id && previous.prev_tlc_id == tlc_id
+                })
+            })
+    }
+
     fn get_channel_actor_state(&self, id: &Hash256) -> Option<ChannelActorState> {
         let key = [&[CHANNEL_ACTOR_STATE_PREFIX], id.as_ref()].concat();
-        self.get(key)
-            .map(|v| deserialize_from(v.as_ref(), "ChannelActorState"))
+        self.get(key).map(|v| deserialize_channel_state(v.as_ref()))
     }
 
     fn insert_channel_actor_state(&self, state: ChannelActorState) {
@@ -1086,7 +1175,7 @@ impl ChannelActorStateStore for Store {
         let prefix = &[CHANNEL_ACTOR_STATE_PREFIX];
         self.collect_by_prefix(prefix)
             .into_iter()
-            .map(|kv| deserialize_from(kv.value.as_ref(), "ChannelActorState"))
+            .map(|kv| deserialize_channel_state(kv.value.as_ref()))
             .collect()
     }
 
@@ -1287,6 +1376,10 @@ impl InvoiceStore for Store {
         if let Some(preimage) = preimage {
             let kv = KeyValue::Preimage(payment_hash, preimage);
             batch.put(kv.key(), kv.value());
+            batch.put(
+                [&[INVOICE_PREIMAGE_PREFIX], payment_hash.as_ref()].concat(),
+                serialize_to_vec(&(), "invoice preimage marker"),
+            );
         }
         batch.commit();
         self.notify(StoreChange::PutCkbInvoiceStatus {
@@ -1323,6 +1416,11 @@ impl InvoiceStore for Store {
         let key = [&[CKB_INVOICE_STATUS_PREFIX], id.as_ref()].concat();
         self.get(key)
             .map(|v| deserialize_from(v.as_ref(), "CkbInvoiceStatus"))
+    }
+
+    fn has_invoice_preimage(&self, id: &Hash256) -> bool {
+        let key = [&[INVOICE_PREIMAGE_PREFIX], id.as_ref()].concat();
+        self.get(key).is_some()
     }
 }
 
@@ -1361,6 +1459,7 @@ impl PreimageStore for Store {
     fn remove_preimage(&self, payment_hash: &Hash256) {
         let mut batch = self.batch();
         batch.delete([&[PREIMAGE_PREFIX], payment_hash.as_ref()].concat());
+        batch.delete([&[INVOICE_PREIMAGE_PREFIX], payment_hash.as_ref()].concat());
         batch.commit();
     }
 
@@ -1411,8 +1510,13 @@ impl NetworkGraphStateStore for Store {
             .into_iter()
             .filter_map(|kv| {
                 let session: PaymentSession = deserialize_from(kv.value.as_ref(), "PaymentSession");
+                // Loading attempts cannot change a persisted terminal status.
+                if session.status.is_final() && session.status != status {
+                    return None;
+                }
+                let session = session.init_attempts(self);
                 if session.status == status {
-                    Some(session.init_attempts(self))
+                    Some(session)
                 } else {
                     None
                 }
@@ -1435,9 +1539,13 @@ impl NetworkGraphStateStore for Store {
 
         iter.filter_map(|(_key, value)| {
             let session: PaymentSession = deserialize_from(&value, "PaymentSession");
+            if session.status.is_final() && status.is_some_and(|s| session.status != s) {
+                return None;
+            }
+            let session = session.init_attempts(self);
             match status {
                 Some(ref s) if session.status != *s => None,
-                _ => Some(session.init_attempts(self)),
+                _ => Some(session),
             }
         })
         .take(limit)
@@ -1682,6 +1790,31 @@ impl WatchtowerStore for Store {
         remote_funding_pubkey: Pubkey,
         settlement_data: SettlementData,
     ) {
+        self.insert_watch_channel_with_features(
+            node_id,
+            channel_id,
+            funding_udt_type_script,
+            local_settlement_key,
+            remote_settlement_key,
+            local_funding_pubkey,
+            remote_funding_pubkey,
+            settlement_data,
+            ChannelFeatures::LEGACY,
+        );
+    }
+
+    fn insert_watch_channel_with_features(
+        &self,
+        node_id: NodeId,
+        channel_id: Hash256,
+        funding_udt_type_script: Option<Script>,
+        local_settlement_key: Privkey,
+        remote_settlement_key: Pubkey,
+        local_funding_pubkey: Pubkey,
+        remote_funding_pubkey: Pubkey,
+        settlement_data: SettlementData,
+        channel_features: ChannelFeatures,
+    ) {
         let lock = self.watchtower_write_lock(&node_id);
         let _guard = lock.lock();
         let key = [
@@ -1690,6 +1823,11 @@ impl WatchtowerStore for Store {
             channel_id.as_ref(),
         ]
         .concat();
+        // Registration is at-least-once across channel actor crashes. Never reset
+        // an already monitored channel's usable settlement/revocation snapshots.
+        if self.get(&key).is_some() {
+            return;
+        }
         let value = serialize_to_vec(
             &ChannelData {
                 channel_id,
@@ -1702,6 +1840,7 @@ impl WatchtowerStore for Store {
                 remote_settlement_data: settlement_data.clone(),
                 local_settlement_data: settlement_data.clone(),
                 revocation_data: None,
+                channel_features,
             },
             "ChannelData",
         );
@@ -1764,6 +1903,15 @@ impl WatchtowerStore for Store {
             .get(key)
             .map(|v| deserialize_from::<ChannelData>(v.as_ref(), "ChannelData"))
         {
+            // Recovery replays exact durable snapshots. An older queued delivery
+            // must not replace a newer revocation (or its settlement snapshot).
+            if channel_data
+                .revocation_data
+                .as_ref()
+                .is_some_and(|old| old.commitment_number >= revocation_data.commitment_number)
+            {
+                return;
+            }
             channel_data.remote_settlement_data = remote_settlement_data;
             channel_data.revocation_data = Some(revocation_data);
             let mut batch = self.batch();

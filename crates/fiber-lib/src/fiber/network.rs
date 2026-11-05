@@ -90,8 +90,9 @@ use crate::fiber::gossip::{GossipConfig, GossipService, SubscribableGossipMessag
 use crate::fiber::onchain_tlc_reconcile::{
     collect_onchain_confirmed_payer_tlcs, collect_onchain_excluded_tlcs,
     collect_onchain_fulfilled_tlcs, collect_onchain_received_timeout_settled_tlcs,
-    collect_onchain_timeout_settled_tlcs, has_unresolved_onchain_tlcs, onchain_fulfilled_preimage,
-    recover_shutdown_settlement_data, verify_and_select_settlement_data, OnChainTimeoutTlcRole,
+    collect_onchain_timeout_settled_tlcs, confirm_onchain_payer_fulfill,
+    has_unresolved_onchain_tlcs, onchain_fulfilled_preimage, recover_shutdown_settlement_data,
+    verify_and_select_settlement_data, OnChainTimeoutTlcRole,
 };
 use crate::fiber::payment::{
     PaymentActor, PaymentActorArguments, PaymentActorMessage, PaymentTlcRemoveContext,
@@ -107,8 +108,8 @@ use crate::fiber::{
     SettleTlcSetCommand,
 };
 use crate::invoice::{
-    CancelInvoiceError, CkbInvoice, CkbInvoiceStatus, InvoiceError, InvoiceStore, PreimageStore,
-    SettleInvoiceError,
+    CancelInvoiceError, CkbInvoice, CkbInvoiceStatus, Currency, InvoiceError, InvoiceStore,
+    PreimageStore, SettleInvoiceError,
 };
 use crate::utils::actor::ActorHandleLogGuard;
 use crate::{now_timestamp_as_millis_u64, Error};
@@ -117,13 +118,14 @@ pub use fiber_types::HopRequire;
 #[cfg(any(debug_assertions, test, feature = "bench"))]
 use fiber_types::SessionRoute;
 use fiber_types::{
-    blake2b_hash_with_salt, AddTlcCommand, AwaitingTxSignaturesFlags, ChannelOpenRecord,
-    ChannelOpeningStatus, ChannelState, ChannelTlcInfo, CloseFlags, EcdsaSignature, EntityHex,
-    FeatureVector, Hash256, NodeAnnouncement, PaymentCustomRecords, PaymentStatus,
-    PeeledPaymentOnionPacket, PersistentNetworkActorState, PrevTlcInfo, Privkey, Pubkey,
-    PublicChannelInfo, RemoveTlcFulfill, RemoveTlcReason, RetryableTlcOperation, RevocationData,
-    RouterHop, SettlementData, ShutdownSettlementRecord, ShuttingDownFlags, TLCId, TlcErr,
-    TlcErrPacket, TlcErrorCode, TrampolineContext, UdtCfgInfos, NO_SHARED_SECRET,
+    blake2b_hash_with_salt, AddTlcCommand, AppliedFlags, AwaitingTxSignaturesFlags,
+    ChannelFeatures, ChannelOpenRecord, ChannelOpeningStatus, ChannelState, ChannelTlcInfo,
+    CloseFlags, EcdsaSignature, EntityHex, FeatureVector, Hash256, NodeAnnouncement,
+    PaymentCustomRecords, PaymentStatus, PeeledPaymentOnionPacket, PersistentNetworkActorState,
+    PrevTlcInfo, Privkey, Pubkey, PublicChannelInfo, RemoveTlcFulfill, RemoveTlcReason,
+    RetryableTlcOperation, RevocationData, RouterHop, SettlementData, ShutdownSettlementRecord,
+    ShuttingDownFlags, TLCId, TlcErr, TlcErrPacket, TlcErrorCode, TrampolineContext, UdtCfgInfos,
+    NO_SHARED_SECRET,
 };
 
 pub const FIBER_PROTOCOL_ID: ProtocolId = ProtocolId::new(42);
@@ -823,9 +825,14 @@ pub struct SendOnionPacketCommand {
 #[cfg(test)]
 #[derive(Debug)]
 pub enum TestFiberMessageKind {
+    TxSignatures,
     AddTlc,
     CommitmentSigned,
     RevokeAndAck,
+    ClosingSigned,
+    Shutdown,
+    /// Preserve the CS/RAA stream order when simulating a lost response.
+    CommitmentOrAck,
 }
 
 #[cfg(test)]
@@ -851,14 +858,32 @@ impl TestFiberMessageHold {
         }
         matches!(
             (&self.kind, channel_message),
-            (TestFiberMessageKind::AddTlc, FiberChannelMessage::AddTlc(_))
+            (
+                TestFiberMessageKind::CommitmentOrAck,
+                FiberChannelMessage::CommitmentSigned(_)
+                    | FiberChannelMessage::CommitmentSignedV2(_)
+                    | FiberChannelMessage::RevokeAndAck(_)
+                    | FiberChannelMessage::RevokeAndAckV2(_)
+            ) | (
+                TestFiberMessageKind::TxSignatures,
+                FiberChannelMessage::TxSignatures(_)
+            ) | (TestFiberMessageKind::AddTlc, FiberChannelMessage::AddTlc(_))
                 | (
                     TestFiberMessageKind::CommitmentSigned,
                     FiberChannelMessage::CommitmentSigned(_)
+                        | FiberChannelMessage::CommitmentSignedV2(_)
                 )
                 | (
                     TestFiberMessageKind::RevokeAndAck,
-                    FiberChannelMessage::RevokeAndAck(_)
+                    FiberChannelMessage::RevokeAndAck(_) | FiberChannelMessage::RevokeAndAckV2(_)
+                )
+                | (
+                    TestFiberMessageKind::Shutdown,
+                    FiberChannelMessage::Shutdown(_) | FiberChannelMessage::ShutdownV2(_)
+                )
+                | (
+                    TestFiberMessageKind::ClosingSigned,
+                    FiberChannelMessage::ClosingSigned(_) | FiberChannelMessage::ClosingSignedV2(_)
                 )
         )
     }
@@ -921,6 +946,7 @@ fn fiber_message_kind(message: &FiberMessage) -> String {
     match message {
         FiberMessage::Init(_) => "Init".to_string(),
         FiberMessage::ChannelInitialization(_) => "OpenChannel".to_string(),
+        FiberMessage::ChannelInitializationV2(_) => "OpenChannelV2".to_string(),
         FiberMessage::ChannelNormalOperation(msg) => fiber_channel_kind(msg),
     }
 }
@@ -1130,6 +1156,23 @@ pub enum OnChainTlcRemoveCompletion {
 /// an optional RpcReplyPort in the of the definition of this message.
 #[derive(Debug, AsRefStr)]
 pub enum NetworkActorCommand {
+    /// Explicit legacy-only test fixture; unavailable in production builds.
+    #[cfg(test)]
+    TestEnableLegacyFixture(RpcReplyPort<()>),
+    /// Complete a closed channel's queued local Add after the payment outcome is saved.
+    CompleteClosedLocalAdd {
+        channel_id: Hash256,
+        command: Box<AddTlcCommand>,
+        reply: RpcReplyPort<Result<(), String>>,
+    },
+    /// Bind a durable V2 payer effect to the current payment execution.
+    GetV2PaymentExecution(Hash256, Option<u64>, RpcReplyPort<Option<u32>>),
+    /// Deliver an offered-TLC outbox record, acknowledging after durable receipt.
+    RelayV2RemoveEffect {
+        channel_id: Hash256,
+        tlc: Box<fiber_types::TlcInfo>,
+        execution: Option<u32>,
+    },
     /// Network commands
     // Connect to a peer, and optionally also save the peer to the peer store.
     ConnectPeer(
@@ -1487,6 +1530,7 @@ pub enum NetworkServiceEvent {
         Pubkey,
         Pubkey,
         SettlementData,
+        ChannelFeatures,
     ),
     // The channel is ready to use (with funding transaction confirmed
     // and both parties sent ChannelReady messages).
@@ -1611,6 +1655,8 @@ pub enum NetworkActorEvent {
 
     // A payment need to retry
     RetrySendPayment(Hash256, Option<u64>),
+    /// Restart recovery without duplicating an attempt's live callback/timer work.
+    ResumePaymentAfterClosedChannel(Hash256, u64),
 
     // AddTlc result from peer (payment_hash, attempt_id, add_tlc_result, (previous_channel_id, previous_tlc_id))
     AddTlcResult(
@@ -1911,7 +1957,39 @@ where
         peer_pubkey: Pubkey,
         message: FiberMessage,
     ) -> crate::Result<()> {
+        let message = match message {
+            FiberMessage::ChannelInitializationV2(open) => {
+                if open.channel_features != 1
+                    || !state
+                        .negotiated_channel_features(&peer_pubkey)
+                        .has_full_payment_hash()
+                {
+                    return Err(ProcessingChannelError::InvalidState(
+                        "OpenChannelV2 requires explicit negotiated features=1".to_owned(),
+                    )
+                    .into());
+                }
+                FiberMessage::ChannelInitialization(super::session_v2::open_parameters(open))
+            }
+            FiberMessage::ChannelInitialization(_)
+                if state
+                    .negotiated_channel_features(&peer_pubkey)
+                    .has_full_payment_hash() =>
+            {
+                return Err(ProcessingChannelError::InvalidState(
+                    "V1 opening cannot select a V2 channel".to_owned(),
+                )
+                .into());
+            }
+            other => other,
+        };
         match message {
+            FiberMessage::ChannelInitializationV2(_) => {
+                return Err(ProcessingChannelError::InvalidState(
+                    "Received OpenChannelV2 before V2 actor integration".to_string(),
+                )
+                .into());
+            }
             FiberMessage::Init(init_message) => {
                 state.on_init_msg(myself, peer_pubkey, init_message).await?;
             }
@@ -2225,6 +2303,13 @@ where
                 state.abort_funding(Either::Right(outpoint)).await;
             }
             NetworkActorEvent::ClosingTransactionPending(channel_id, pubkey, tx, force) => {
+                if state
+                    .store
+                    .get_channel_actor_state(&channel_id)
+                    .is_some_and(|channel| channel.ensure_v2_not_quarantined().is_err())
+                {
+                    return Ok(());
+                }
                 state
                     .on_closing_transaction_pending(channel_id, pubkey, tx.clone(), force)
                     .await;
@@ -2350,6 +2435,15 @@ where
                         );
                     }
                 }
+            }
+            NetworkActorEvent::ResumePaymentAfterClosedChannel(payment_hash, attempt_id) => {
+                self.resume_payment_actor_and_send_command(
+                    myself,
+                    state,
+                    payment_hash,
+                    PaymentActorMessage::ResumeAfterClosedChannel(attempt_id),
+                )
+                .await;
             }
             NetworkActorEvent::RetrySendPayment(payment_hash, attempt_id) => {
                 self.resume_payment_actor_and_send_command(
@@ -2721,6 +2815,9 @@ where
                     )),
                     FiberMessage::ChannelInitialization(open_channel) => {
                         Some((open_channel.channel_id, "OpenChannel".to_string()))
+                    }
+                    FiberMessage::ChannelInitializationV2(open_channel) => {
+                        Some((open_channel.channel_id, "OpenChannelV2".to_string()))
                     }
                     FiberMessage::Init(_) => None,
                 };
@@ -3233,6 +3330,141 @@ where
                 }
                 let _ = reply.send(result);
             }
+            NetworkActorCommand::CompleteClosedLocalAdd {
+                channel_id,
+                command,
+                reply,
+            } => {
+                let Some(source) = self.store.get_channel_actor_state(&channel_id) else {
+                    let _ = reply.send(Err("Closed Add source not found".to_owned()));
+                    return Ok(());
+                };
+                if !matches!(source.state, ChannelState::Closed(_))
+                    || command.previous_tlc.is_some()
+                    || command.attempt_id.is_none()
+                    || !source
+                        .retryable_tlc_operations
+                        .contains(&RetryableTlcOperation::AddTlc(*command.clone()))
+                {
+                    let _ = reply.send(Err("Closed Add source identity mismatch".to_owned()));
+                    return Ok(());
+                }
+                if source
+                    .tlc_state
+                    .offered_tlcs
+                    .tlcs
+                    .iter()
+                    .chain(
+                        source
+                            .session_v2
+                            .iter()
+                            .flat_map(|session| session.remove_effects.iter().map(|(tlc, _)| tlc)),
+                    )
+                    .any(|tlc| {
+                        tlc.payment_hash == command.payment_hash
+                            && tlc.attempt_id == command.attempt_id
+                            && tlc.onion_packet == command.onion_packet
+                            && tlc.amount == command.amount
+                            && tlc.expiry == command.expiry
+                    })
+                {
+                    let _ = reply.send(Ok(()));
+                    return Ok(());
+                }
+                let Some(channel_outpoint) = source.get_funding_transaction_outpoint() else {
+                    let _ = reply.send(Err("Closed Add source has no funding outpoint".to_owned()));
+                    return Ok(());
+                };
+                self.resume_payment_actor_and_send_command(
+                    myself,
+                    state,
+                    command.payment_hash,
+                    PaymentActorMessage::CompleteClosedLocalAdd {
+                        channel_id,
+                        channel_outpoint,
+                        command,
+                        reply,
+                    },
+                )
+                .await;
+            }
+            NetworkActorCommand::GetV2PaymentExecution(hash, attempt_id, reply) => {
+                let execution = attempt_id
+                    .and_then(|id| self.store.get_attempt(hash, id))
+                    .map(|attempt| attempt.tried_times);
+                let _ = reply.send(execution);
+            }
+            #[cfg(test)]
+            NetworkActorCommand::TestEnableLegacyFixture(reply) => {
+                state.to_be_accepted_channels.test_allow_legacy = true;
+                let _ = reply.send(());
+            }
+            NetworkActorCommand::RelayV2RemoveEffect {
+                channel_id,
+                tlc,
+                execution,
+            } => {
+                let Some(reason) = tlc.removed_reason.clone() else {
+                    return Ok(());
+                };
+                // Validate against the durable source outbox rather than the volatile sender.
+                let Some(source) = self.store.get_channel_actor_state(&channel_id) else {
+                    return Ok(());
+                };
+                if !source.session_v2.as_ref().is_some_and(|session| {
+                    session.remove_effects.iter().any(|(pending, bound)| {
+                        pending.tlc_id == tlc.tlc_id
+                            && pending.payment_hash == tlc.payment_hash
+                            && pending.removed_reason == tlc.removed_reason
+                            && *bound == execution
+                    })
+                }) {
+                    return Ok(());
+                }
+                if let Some((upstream, upstream_tlc)) = tlc.forwarding_tlc {
+                    let Ok(backward) = reason.backward(&tlc.shared_secret) else {
+                        return Ok(());
+                    };
+                    self.forward_onchain_tlc_remove_upstream(
+                        myself,
+                        state,
+                        channel_id,
+                        tlc.tlc_id,
+                        upstream,
+                        upstream_tlc,
+                        tlc.payment_hash,
+                        backward,
+                    );
+                } else if let (Some(_), Some(execution), Some(outpoint)) = (
+                    tlc.attempt_id,
+                    execution,
+                    source.get_funding_transaction_outpoint(),
+                ) {
+                    self.on_remove_tlc_event(
+                        myself,
+                        state,
+                        tlc.payment_hash,
+                        tlc.attempt_id,
+                        reason,
+                        None,
+                        Some(PaymentTlcRemoveContext {
+                            channel_id,
+                            tlc_id: tlc.tlc_id,
+                            channel_outpoint: outpoint,
+                            tried_times: execution,
+                        }),
+                    )
+                    .await;
+                } else if tlc.attempt_id.is_none() {
+                    self.confirm_onchain_tlc_remove_relay(
+                        state,
+                        channel_id,
+                        tlc.tlc_id,
+                        tlc.payment_hash,
+                        reason,
+                    );
+                }
+            }
             NetworkActorCommand::RelayOnChainTlcRemove {
                 downstream_channel_id,
                 downstream_tlc_id,
@@ -3264,6 +3496,15 @@ where
                         .store
                         .get_channel_actor_state(&downstream_channel_id)
                         .is_some_and(|source| {
+                            if source.session_v2.as_ref().is_some_and(|session| {
+                                session.remove_effects.iter().any(|(tlc, _)| {
+                                    tlc.tlc_id == downstream_tlc_id
+                                        && tlc.payment_hash == payment_hash
+                                        && tlc.removed_reason.as_ref() == Some(&reason)
+                                })
+                            }) {
+                                return true;
+                            }
                             collect_onchain_excluded_tlcs(&source, &self.store)
                                 .iter()
                                 .any(|tlc| {
@@ -3610,7 +3851,8 @@ where
                 }
             }
             NetworkActorCommand::SendPayment(payment_request, reply) => {
-                let payment_request = match payment_request.build_send_payment_data() {
+                let payment_request = match payment_request.build_send_payment_data(state.currency)
+                {
                     Ok(payment) => payment,
                     Err(err) => {
                         error!("Failed to build payment from command: {:?}", err);
@@ -3630,14 +3872,15 @@ where
             }
             NetworkActorCommand::SendPaymentWithRouter(payment_request, reply) => {
                 let source = self.network_graph.read().await.get_source_pubkey();
-                let payment_request = match payment_request.build_send_payment_data(source) {
-                    Ok(payment) => payment,
-                    Err(err) => {
-                        error!("Failed to build payment from command: {:?}", err);
-                        let _ = reply.send(Err(err.to_string()));
-                        return Ok(());
-                    }
-                };
+                let payment_request =
+                    match payment_request.build_send_payment_data(source, state.currency) {
+                        Ok(payment) => payment,
+                        Err(err) => {
+                            error!("Failed to build payment from command: {:?}", err);
+                            let _ = reply.send(Err(err.to_string()));
+                            return Ok(());
+                        }
+                    };
                 let _ = self
                     .start_payment_actor(
                         myself,
@@ -3722,11 +3965,14 @@ where
                     .map
                     .iter()
                     .map(
-                        |(channel_id, (pubkey, open_channel))| PendingAcceptChannel {
+                        |(channel_id, (pubkey, pending_open))| PendingAcceptChannel {
                             channel_id: *channel_id,
                             pubkey: *pubkey,
-                            funding_amount: open_channel.funding_amount,
-                            udt_type_script: open_channel.funding_udt_type_script.clone(),
+                            funding_amount: pending_open.open_channel.funding_amount,
+                            udt_type_script: pending_open
+                                .open_channel
+                                .funding_udt_type_script
+                                .clone(),
                             created_at: state
                                 .store
                                 .get_channel_open_record(channel_id)
@@ -3963,6 +4209,38 @@ where
         payment_hash: Hash256,
         reason: RemoveTlcReason,
     ) {
+        if self
+            .store
+            .get_channel_actor_state(&downstream_channel_id)
+            .is_some_and(|source| {
+                source.session_v2.as_ref().is_some_and(|session| {
+                    !session.remove_effects.iter().any(|(tlc, _)| {
+                        tlc.tlc_id == downstream_tlc_id && tlc.payment_hash == payment_hash
+                    }) && source.tlc_state.get(&downstream_tlc_id).is_none()
+                })
+            })
+        {
+            // A duplicate receipt for a drained V2 outbox is a no-op, including
+            // preimage lifecycle effects. On-chain sources retain their TLC record.
+            return;
+        }
+        // A forwarded failure has been wrapped for the upstream hop. Receipt
+        // identity is the downstream TLC; acknowledge its original stored reason.
+        let reason = self
+            .store
+            .get_channel_actor_state(&downstream_channel_id)
+            .and_then(|source| {
+                source.session_v2.as_ref().and_then(|session| {
+                    session
+                        .remove_effects
+                        .iter()
+                        .find(|(tlc, _)| {
+                            tlc.tlc_id == downstream_tlc_id && tlc.payment_hash == payment_hash
+                        })
+                        .and_then(|(tlc, _)| tlc.removed_reason.clone())
+                })
+            })
+            .unwrap_or(reason);
         if let RemoveTlcReason::RemoveTlcFulfill(RemoveTlcFulfill { payment_preimage }) = &reason {
             self.store.insert_preimage(payment_hash, *payment_preimage);
         }
@@ -3978,13 +4256,39 @@ where
             if let Some(mut channel_state) =
                 self.store.get_channel_actor_state(&downstream_channel_id)
             {
+                if let Some(session) = &mut channel_state.session_v2 {
+                    let before = session.remove_effects.len();
+                    session.remove_effects.retain(|(tlc, _)| {
+                        tlc.tlc_id != downstream_tlc_id || tlc.payment_hash != payment_hash
+                    });
+                    if session.remove_effects.len() != before {
+                        self.store.insert_channel_actor_state(channel_state);
+                        // Receipt completes delivery, not the source's balance
+                        // transition. A crash before source application leaves a
+                        // TLC which must still be applied once on actor restore.
+                        return;
+                    }
+                }
                 if let TLCId::Offered(id) = downstream_tlc_id {
                     if channel_state
                         .tlc_state
                         .get(&downstream_tlc_id)
                         .is_some_and(|tlc| tlc.removed_reason.is_none())
                     {
-                        channel_state.tlc_state.set_offered_tlc_removed(id, reason);
+                        channel_state
+                            .tlc_state
+                            .set_offered_tlc_removed(id, reason.clone());
+                    }
+                    if let Some(tlc) = channel_state.tlc_state.get_mut(&downstream_tlc_id) {
+                        if tlc.removed_confirmed_at.is_none()
+                            && !tlc.applied_flags.contains(AppliedFlags::REMOVE)
+                        {
+                            // The delivered chain outcome supersedes an uncommitted peer reason.
+                            tlc.removed_reason = Some(reason);
+                        }
+                        // Persist relay completion even when a peer fulfill already set the
+                        // removal reason before the channel closed.
+                        tlc.applied_flags.insert(AppliedFlags::REMOVE);
                         self.store.insert_channel_actor_state(channel_state);
                     }
                 }
@@ -4220,6 +4524,9 @@ where
                     tlc.tlc_id, channel_id, err
                 );
                 payer_effects_applied = false;
+            } else if confirm_onchain_payer_fulfill(actor_state, tlc) {
+                self.store.insert_preimage(tlc.payment_hash, tlc.preimage);
+                actor_state_changed = true;
             }
         }
         invoice_hashes.extend(self.already_fulfilled_onchain_invoice_hashes(actor_state));
@@ -4299,7 +4606,10 @@ where
 
         // Keep waiting while any TLC outcome is still unknown. Once the settlement was confirmed
         // and every TLC is terminal, clear the close flags and drop the funding-script cache entry.
-        if !payer_effects_applied || has_unresolved_onchain_tlcs(actor_state, &self.store) {
+        if !payer_effects_applied
+            || has_unresolved_onchain_tlcs(actor_state, &self.store)
+            || actor_state.has_pending_tlc_delivery()
+        {
             if mark_settlement_confirmed {
                 info!(
                     "Channel {channel_id:?} on-chain reconciliation incomplete; CheckChannels will retry"
@@ -4457,6 +4767,25 @@ where
         state: &mut NetworkActorState<S, C>,
         payment_hash: Hash256,
     ) {
+        // Recover the overlap after a channel's durable queue write but before
+        // RemoveTlcResult removed the hold. These TLCs are intentionally excluded
+        // by can_auto_fulfill_received_tlc: recomputing a settlement would replace
+        // the already selected outcome. Complete only the ownership handoff.
+        for hold in self.store.get_payment_hold_tlcs(payment_hash) {
+            let Some(channel) = self.store.get_channel_actor_state(&hold.channel_id) else {
+                continue;
+            };
+            let id = TLCId::Received(hold.tlc_id);
+            if channel.tlc_state.get(&id).is_some_and(|tlc| {
+                tlc.payment_hash == payment_hash
+                    && (tlc.removed_reason.is_some()
+                        || channel.retryable_tlc_operations.iter().any(|op| {
+                            matches!(op, fiber_types::RetryableTlcOperation::RemoveTlc(queued, _) if *queued == id)
+                        }))
+            }) {
+                self.store.remove_payment_hold_tlc(&payment_hash, &hold.channel_id, hold.tlc_id);
+            }
+        }
         let settlements =
             SettleTlcSetCommand::new_received_hold_tlc_set(payment_hash, &self.store).run();
         self.apply_tlc_settlements(myself, state, settlements, Some(payment_hash));
@@ -5044,6 +5373,18 @@ where
                 if prev_tlc_info.payment_hash != payment_hash {
                     return Err(TlcErr::new_node_fail(
                         TlcErrorCode::TemporaryNodeFailure,
+                        state.get_public_key(),
+                    ));
+                }
+                // Enforce the same hash-algorithm invariant that the outer onion
+                // path enforces at the channel boundary.
+                if prev_tlc_info.hash_algorithm != hash_algorithm {
+                    error!(
+                        "Trampoline forwarding rejected: inner hash_algorithm {:?} does not match upstream TLC hash_algorithm {:?}",
+                        hash_algorithm, prev_tlc_info.hash_algorithm
+                    );
+                    return Err(TlcErr::new_node_fail(
+                        TlcErrorCode::InvalidOnionPayload,
                         state.get_public_key(),
                     ));
                 }
@@ -5763,6 +6104,8 @@ where
 
 pub struct NetworkActorState<S, C> {
     store: S,
+    // Keep the configured network available when validating outgoing invoices.
+    currency: Currency,
     state_to_be_persisted: PersistentNetworkActorState,
     store_actor: Option<ActorRef<StoreActorMessage>>,
     // The name of the node to be announced to the network, may be empty.
@@ -6207,6 +6550,7 @@ where
         } = open_channel;
         let remote_pubkey = pubkey;
         self.check_feature_compatibility(&remote_pubkey)?;
+        let channel_features = self.required_new_channel_features(&remote_pubkey)?;
 
         if public && one_way {
             return Err(ProcessingChannelError::InvalidParameter(
@@ -6251,7 +6595,6 @@ where
 
         let shutdown_script =
             shutdown_script.unwrap_or_else(|| self.default_shutdown_script.clone());
-
         let seed = self.generate_channel_seed();
         let (tx, rx) = oneshot::channel::<Hash256>();
         let channel = Actor::spawn_linked(
@@ -6289,6 +6632,7 @@ where
                         .unwrap_or(DEFAULT_MAX_TLC_VALUE_IN_FLIGHT),
                     max_tlc_number_in_flight: max_tlc_number_in_flight
                         .unwrap_or(MAX_TLC_NUMBER_IN_FLIGHT),
+                    channel_features,
                 }),
                 ephemeral_config: self.channel_ephemeral_config.clone(),
                 private_key: self.private_key.clone(),
@@ -6302,7 +6646,12 @@ where
         self.on_channel_created(temp_channel_id, remote_pubkey, channel.clone());
 
         // Record the channel opening attempt so it can be queried via RPC.
-        let record = ChannelOpenRecord::new(temp_channel_id, remote_pubkey, funding_amount);
+        let record = ChannelOpenRecord::new_with_features(
+            temp_channel_id,
+            remote_pubkey,
+            funding_amount,
+            channel_features,
+        );
         self.store.insert_channel_open_record(record);
 
         Ok((channel, temp_channel_id))
@@ -6345,6 +6694,7 @@ where
             )))?;
 
         self.check_feature_compatibility(&remote_pubkey)?;
+        let channel_features = self.required_new_channel_features(&remote_pubkey)?;
 
         if let Some(udt_type_script) = funding_udt_type_script.as_ref() {
             if !check_udt_script(udt_type_script) {
@@ -6408,6 +6758,7 @@ where
                             .unwrap_or(DEFAULT_MAX_TLC_VALUE_IN_FLIGHT),
                         max_tlc_number_in_flight: max_tlc_number_in_flight
                             .unwrap_or(MAX_TLC_NUMBER_IN_FLIGHT),
+                        channel_features,
                     },
                 ),
                 ephemeral_config: self.channel_ephemeral_config.clone(),
@@ -6423,7 +6774,12 @@ where
 
         // Record the external-funding opening attempt under the temporary id.
         // It will be re-keyed once the peer accepts and the final channel id is known.
-        let record = ChannelOpenRecord::new(temp_channel_id, remote_pubkey, funding_amount);
+        let record = ChannelOpenRecord::new_with_features(
+            temp_channel_id,
+            remote_pubkey,
+            funding_amount,
+            channel_features,
+        );
         self.store.insert_channel_open_record(record);
 
         Ok((channel, temp_channel_id))
@@ -6445,7 +6801,10 @@ where
             tlc_expiry_delta,
         } = accept_channel;
 
-        let (remote_pubkey, open_channel) = self
+        self.to_be_accepted_channels
+            .require_channel_v2(&temp_channel_id)?;
+
+        let (remote_pubkey, pending_open) = self
             .to_be_accepted_channels
             .remove(&temp_channel_id)
             .ok_or(ProcessingChannelError::InvalidParameter(
@@ -6457,11 +6816,12 @@ where
         let (funding_amount, reserved_ckb_amount) = get_funding_and_reserved_amount(
             funding_amount,
             &shutdown_script,
-            &open_channel.funding_udt_type_script,
+            &pending_open.open_channel.funding_udt_type_script,
+            pending_open.channel_features,
         )?;
 
         let network = self.network.clone();
-        let id = open_channel.channel_id;
+        let id = pending_open.open_channel.channel_id;
         if let Some(channel) = self.channels.get(&id) {
             warn!("A channel of id {:?} is already created, returning it", &id);
             return Ok((channel.clone(), temp_channel_id, id));
@@ -6492,16 +6852,18 @@ where
                             .unwrap_or(self.tlc_fee_proportional_millionths),
                         now_timestamp_as_millis_u64(),
                     ),
-                    public_channel_info: open_channel
+                    public_channel_info: pending_open
+                        .open_channel
                         .is_public()
                         .then_some(PublicChannelInfo::new()),
                     seed,
-                    open_channel,
+                    open_channel: pending_open.open_channel,
                     shutdown_script,
                     channel_id_sender: Some(tx),
                     max_tlc_number_in_flight: max_tlc_number_in_flight
                         .unwrap_or(MAX_TLC_NUMBER_IN_FLIGHT),
                     max_tlc_value_in_flight: max_tlc_value_in_flight.unwrap_or(u128::MAX),
+                    channel_features: pending_open.channel_features,
                 }),
                 ephemeral_config: self.channel_ephemeral_config.clone(),
                 private_key: self.private_key.clone(),
@@ -6573,6 +6935,35 @@ where
             )));
         }
         Ok(())
+    }
+
+    /// Select the commitment-lock features for a new channel from both peers'
+    /// advertised feature vectors.
+    fn negotiated_channel_features(&self, peer_pubkey: &Pubkey) -> ChannelFeatures {
+        let peer_supports = self
+            .peer_session_map
+            .get(peer_pubkey)
+            .and_then(|peer| peer.features.as_ref())
+            .map(|features| features.supports_channel_v2());
+        ChannelFeatures::for_negotiated(self.features.supports_channel_v2(), peer_supports)
+    }
+
+    fn required_new_channel_features(
+        &self,
+        peer_pubkey: &Pubkey,
+    ) -> Result<ChannelFeatures, ProcessingChannelError> {
+        let features = self.negotiated_channel_features(peer_pubkey);
+        #[cfg(test)]
+        if self.to_be_accepted_channels.test_allow_legacy {
+            return Ok(features);
+        }
+        if !features.is_v2() {
+            return Err(ProcessingChannelError::InvalidParameter(format!(
+                "Cannot open channel with peer {:?}: CHANNEL_V2 is required",
+                peer_pubkey,
+            )));
+        }
+        Ok(features)
     }
 
     pub async fn trace_tx(
@@ -7100,6 +7491,23 @@ where
                         .await
                         .map_err(|err| err.to_string())?;
                 }
+                FiberMessage::ChannelInitializationV2(open_channel) => {
+                    if open_channel.channel_features != 1
+                        || !self
+                            .negotiated_channel_features(&captured.peer)
+                            .has_full_payment_hash()
+                    {
+                        return Err(
+                            "OpenChannelV2 requires explicit negotiated features=1".to_string()
+                        );
+                    }
+                    self.on_open_channel_msg(
+                        captured.peer,
+                        super::session_v2::open_parameters(open_channel),
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?;
+                }
                 FiberMessage::Init(_) => {}
             }
         }
@@ -7392,6 +7800,48 @@ where
             let Some(channel_actor_state) = self.store.get_channel_actor_state(&channel_id) else {
                 continue;
             };
+            if channel_actor_state.channel_features.is_v2()
+                && matches!(channel_actor_state.state, ChannelState::Closed(_))
+            {
+                // A receipt can retire the source before a persisted payment retry's timer runs.
+                if let Some(outpoint) = channel_actor_state.get_funding_transaction_outpoint() {
+                    let attempts = self
+                        .store
+                        .get_pending_attempts_by_channel_outpoint(&outpoint);
+                    if !attempts.is_empty() {
+                        if let Err(error) = fiber_types::channel_v2_validation::validate_channel_v2(
+                            &channel_actor_state.core,
+                        ) {
+                            warn!(
+                                ?channel_id,
+                                ?error,
+                                "Not resuming payments from invalid closed signing history"
+                            );
+                            continue;
+                        }
+                    }
+                    for attempt in attempts {
+                        // The index retains the original hop; the payer rechecks the current route's owner.
+                        let owned = attempt.first_hop_channel_outpoint_eq(&outpoint)
+                            && (channel_actor_state
+                                .owns_payment_attempt(attempt.payment_hash, attempt.id)
+                                || channel_actor_state.session_v2.iter().any(|session| {
+                                    session.remove_effects.iter().any(|(tlc, _)| {
+                                        tlc.payment_hash == attempt.payment_hash
+                                            && tlc.attempt_id == Some(attempt.id)
+                                    })
+                                }));
+                        if !owned {
+                            let _ = self.network.send_message(NetworkActorMessage::new_event(
+                                NetworkActorEvent::ResumePaymentAfterClosedChannel(
+                                    attempt.payment_hash,
+                                    attempt.id,
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
             if channel_actor_state.offline_restore_mode().is_none() {
                 continue;
             }
@@ -7690,11 +8140,8 @@ where
                         .await
                     {
                         Ok(_) => {
-                            let should_restore_onchain_settlement_actor = matches!(
-                                state.state,
-                                ChannelState::Closed(flags)
-                                    if flags.contains(CloseFlags::WAITING_ONCHAIN_SETTLEMENT)
-                            );
+                            let should_restore_onchain_settlement_actor =
+                                state.can_restore_offline_actor();
                             self.store.insert_channel_actor_state(state);
                             if should_restore_onchain_settlement_actor {
                                 if let Err(err) =
@@ -7875,28 +8322,43 @@ where
             )));
         }
 
-        let result = check_open_channel_parameters(
-            &open_channel.funding_udt_type_script,
-            &open_channel.shutdown_script,
-            open_channel.reserved_ckb_amount,
-            open_channel.funding_fee_rate,
-            open_channel.commitment_fee_rate,
-            open_channel.commitment_delay_epoch,
-            open_channel.max_tlc_number_in_flight,
-        )
-        .and_then(|_| {
-            if !self.to_be_accepted_channels.map.contains_key(&id) {
-                self.check_pending_channel_limit(peer_pubkey)?;
-            }
-            self.to_be_accepted_channels
-                .try_insert(id, peer_pubkey, open_channel)
-        });
+        let channel_features = self.negotiated_channel_features(&peer_pubkey);
+        let result = self
+            .required_new_channel_features(&peer_pubkey)
+            .and_then(|_| {
+                check_open_channel_parameters(
+                    &open_channel.funding_udt_type_script,
+                    &open_channel.shutdown_script,
+                    open_channel.reserved_ckb_amount,
+                    open_channel.funding_fee_rate,
+                    open_channel.commitment_fee_rate,
+                    channel_features,
+                    open_channel.commitment_delay_epoch,
+                    open_channel.max_tlc_number_in_flight,
+                )
+            })
+            .and_then(|_| {
+                if !self.to_be_accepted_channels.map.contains_key(&id) {
+                    self.check_pending_channel_limit(peer_pubkey)?;
+                }
+                self.to_be_accepted_channels.try_insert(
+                    id,
+                    peer_pubkey,
+                    open_channel,
+                    channel_features,
+                )
+            });
 
         match result {
             Ok(_) => {
                 // Create a persistent record so the accepting side can see this pending channel
                 // via list_channels(only_pending=true) and across node restarts.
-                let record = ChannelOpenRecord::new_inbound(id, peer_pubkey, remote_funding_amount);
+                let record = ChannelOpenRecord::new_inbound_with_features(
+                    id,
+                    peer_pubkey,
+                    remote_funding_amount,
+                    channel_features,
+                );
                 self.store.insert_channel_open_record(record);
 
                 // Notify outside observers.
@@ -8312,8 +8774,11 @@ where
 
         #[cfg(not(target_arch = "wasm32"))]
         let listening_addr = {
-            let mut addresses_to_listen = vec![MultiAddr::from_str(config.listening_addr())
-                .expect("valid tentacle listening address")];
+            let mut addresses_to_listen = config
+                .listening_addrs()
+                .into_iter()
+                .map(|addr| MultiAddr::from_str(addr).expect("valid tentacle listening address"))
+                .collect::<Vec<_>>();
             if config.reuse_port_for_websocket {
                 // Re-use the same port for websocket
                 let ws_listens = addresses_to_listen
@@ -8435,7 +8900,7 @@ where
             debug!("Tentacle service stopped");
         });
         #[cfg(target_arch = "wasm32")]
-        ractor::concurrency::spawn(async move {
+        crate::tasks::spawn(async move {
             service.run().await;
             debug!("Tentacle service stopped");
         });
@@ -8449,6 +8914,7 @@ where
 
         let mut state = NetworkActorState {
             store: self.store.clone(),
+            currency: config.currency(),
             state_to_be_persisted,
             store_actor: self.store_actor.clone(),
             node_name: config.announced_node_name,
@@ -8614,8 +9080,6 @@ where
         myself: ActorRef<Self::Msg>,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        state.persist_live_channels_offline_for_shutdown();
-
         // Cancel the onion service background task if running
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(token) = state.onion_service_token.take() {
@@ -8626,6 +9090,9 @@ where
             .get_cell()
             .stop_children_and_wait(Some("Network actor stopped".to_string()), None)
             .await;
+
+        // Re-read only after channel writers stop, so an older snapshot cannot overwrite progress.
+        state.persist_live_channels_offline_for_shutdown();
 
         if let Err(err) = state.control.close().await {
             error!("Failed to close tentacle service: {}", err);
@@ -9005,14 +9472,24 @@ fn target_default_transport_matches(addr: &Multiaddr) -> bool {
 }
 
 struct ToBeAcceptedChannels {
+    #[cfg(test)]
+    test_allow_legacy: bool,
     total_number_limit: usize,
     total_bytes_limit: usize,
-    map: HashMap<Hash256, (Pubkey, OpenChannel)>,
+    map: HashMap<Hash256, (Pubkey, PendingOpenChannel)>,
+}
+
+#[derive(Debug)]
+struct PendingOpenChannel {
+    open_channel: OpenChannel,
+    channel_features: ChannelFeatures,
 }
 
 impl Default for ToBeAcceptedChannels {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            test_allow_legacy: false,
             total_number_limit: usize::MAX,
             total_bytes_limit: usize::MAX,
             map: HashMap::default(),
@@ -9028,8 +9505,27 @@ const DEFAULT_TO_BE_ACCEPTED_CHANNELS_BYTES_LIMIT: usize = 51200;
 const DEFAULT_PENDING_CHANNELS_NUMBER_LIMIT: usize = 100;
 
 impl ToBeAcceptedChannels {
+    fn require_channel_v2(&self, id: &Hash256) -> ProcessingChannelResult {
+        #[cfg(test)]
+        if self.test_allow_legacy {
+            return Ok(());
+        }
+        if self
+            .map
+            .get(id)
+            .is_some_and(|(_, pending)| !pending.channel_features.is_v2())
+        {
+            return Err(ProcessingChannelError::InvalidParameter(
+                "Cannot accept Legacy channel: CHANNEL_V2 is required".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn new_with_config(config: &FiberConfig) -> Self {
         Self {
+            #[cfg(test)]
+            test_allow_legacy: false,
             total_number_limit: config
                 .to_be_accepted_channels_number_limit
                 .unwrap_or(DEFAULT_TO_BE_ACCEPTED_CHANNELS_NUMBER_LIMIT),
@@ -9040,7 +9536,7 @@ impl ToBeAcceptedChannels {
         }
     }
 
-    fn remove(&mut self, id: &Hash256) -> Option<(Pubkey, OpenChannel)> {
+    fn remove(&mut self, id: &Hash256) -> Option<(Pubkey, PendingOpenChannel)> {
         self.map.remove(id)
     }
 
@@ -9057,6 +9553,7 @@ impl ToBeAcceptedChannels {
         id: Hash256,
         pubkey: Pubkey,
         open_channel: OpenChannel,
+        channel_features: ChannelFeatures,
     ) -> ProcessingChannelResult {
         if let Some(existing_value) = self.map.get(&id) {
             let err_message = format!(
@@ -9076,7 +9573,7 @@ impl ToBeAcceptedChannels {
             .fold(
                 (1, open_channel.mem_size()),
                 |(count, size), (_, saved_open_channel)| {
-                    (count + 1, size + saved_open_channel.mem_size())
+                    (count + 1, size + saved_open_channel.open_channel.mem_size())
                 },
             );
 
@@ -9095,7 +9592,65 @@ impl ToBeAcceptedChannels {
             "Channel from {:?} of id {:?} is now awaiting to be accepted: {:?}",
             &pubkey, &id, &open_channel
         );
-        self.map.insert(id, (pubkey, open_channel));
+        self.map.insert(
+            id,
+            (
+                pubkey,
+                PendingOpenChannel {
+                    open_channel,
+                    channel_features,
+                },
+            ),
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pending_open_tests {
+    use super::*;
+    use musig2::SecNonce;
+
+    #[test]
+    fn pending_open_retains_contract_features_selected_at_receipt() {
+        let mut pending = ToBeAcceptedChannels::default();
+        let channel_id = [1u8; 32].into();
+        let peer = Privkey::from_slice(&[2u8; 32]).pubkey();
+        let open_channel = OpenChannel {
+            chain_hash: get_chain_hash(),
+            channel_id,
+            funding_udt_type_script: None,
+            funding_amount: 1,
+            shutdown_script: Default::default(),
+            reserved_ckb_amount: 0,
+            funding_fee_rate: 0,
+            commitment_fee_rate: 0,
+            commitment_delay_epoch: 0,
+            max_tlc_value_in_flight: 0,
+            max_tlc_number_in_flight: 0,
+            channel_flags: fiber_types::ChannelFlags::empty(),
+            first_per_commitment_point: peer,
+            second_per_commitment_point: peer,
+            funding_pubkey: peer,
+            tlc_basepoint: peer,
+            next_commitment_nonce: SecNonce::build([3u8; 32]).build().public_nonce(),
+            next_revocation_nonce: SecNonce::build([4u8; 32]).build().public_nonce(),
+            channel_announcement_nonce: None,
+        };
+
+        pending
+            .try_insert(channel_id, peer, open_channel.clone(), ChannelFeatures::V2)
+            .expect("pending open should be inserted");
+
+        let legacy_id = [5u8; 32].into();
+        pending
+            .try_insert(legacy_id, peer, open_channel, ChannelFeatures::LEGACY)
+            .expect("legacy pending fixture");
+        assert!(pending.require_channel_v2(&legacy_id).is_err());
+        assert!(pending.map.contains_key(&legacy_id));
+        assert!(pending.require_channel_v2(&channel_id).is_ok());
+
+        let (_, pending_open) = pending.remove(&channel_id).expect("pending open exists");
+        assert_eq!(pending_open.channel_features, ChannelFeatures::V2);
     }
 }

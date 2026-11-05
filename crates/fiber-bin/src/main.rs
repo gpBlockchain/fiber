@@ -25,7 +25,7 @@ use fnn::ExitMessage;
 use fnn::{start_network, CchActor, Config, NetworkServiceEvent};
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue};
-use ractor::{port::OutputPortSubscriberTrait as _, Actor, ActorRef, OutputPort};
+use ractor::{Actor, ActorRef};
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
 use std::io::Write;
@@ -165,12 +165,17 @@ async fn run() -> Result<(), ExitMessage> {
 
     // Derive store_path: prefer fiber config, fall back to base_dir/fiber/store
     let store_path = parsed_fiber_config.store_path();
-    let raw_store =
-        open_store_with_migration(store_path, Box::new(cli_confirm), Box::new(cli_progress))
-            .map_err(|err| ExitMessage(err.to_string()))?;
+    let raw_store = open_store_with_migration(
+        store_path,
+        parsed_fiber_config.store_sync_writes(),
+        Box::new(cli_confirm),
+        Box::new(cli_progress),
+    )
+    .map_err(|err| ExitMessage(err.to_string()))?;
+    info!("Store sync writes: {}", raw_store.sync_writes());
 
     if config.cch.is_some() || config.rpc.is_some() {
-        let port = Arc::new(OutputPort::default());
+        let port = Arc::new(fnn::store::store_impl::StoreChangePort::default());
         let port_clone = port.clone();
         let mut store = raw_store;
         store.set_watcher(Arc::new(move |change| port_clone.send(change)));
@@ -182,7 +187,7 @@ async fn run() -> Result<(), ExitMessage> {
 
 async fn run_node(
     store: fnn::store::Store,
-    store_change_port: Option<Arc<OutputPort<fnn::store::store_impl::StoreChange>>>,
+    store_change_port: Option<Arc<fnn::store::store_impl::StoreChangePort>>,
     config: Config,
 ) -> Result<(), ExitMessage> {
     let tracker = new_tokio_task_tracker();
@@ -503,7 +508,7 @@ async fn run_node(
                     // In-process mode: subscribe CCH actor to store change port for change notifications
                     if network_actor.is_some() {
                         if let Some(ref port) = store_change_port {
-                            actor.subscribe_to_port(port);
+                            port.subscribe(actor.clone());
                         }
                     }
                     // In separate service mode, the WebSocket subscription is set up in the actor's pre_start
@@ -572,6 +577,7 @@ fn forward_event_to_actor(
             local_funding_pubkey,
             remote_funding_pubkey,
             remote_settlement_data,
+            channel_features,
         ) => {
             watchtower_actor
                 .send_message(WatchtowerMessage::CreateChannel(
@@ -582,6 +588,7 @@ fn forward_event_to_actor(
                     local_funding_pubkey,
                     remote_funding_pubkey,
                     remote_settlement_data,
+                    channel_features,
                 ))
                 .expect(ASSUME_WATCHTOWER_ACTOR_ALIVE);
         }

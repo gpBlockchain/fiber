@@ -35,6 +35,7 @@ impl StoreSample for ChannelData {
                     tlcs: vec![],
                 },
                 revocation_data: None,
+                channel_features: Default::default(),
             },
             // Channel with TLCs and revocation data
             ChannelData {
@@ -68,6 +69,7 @@ impl StoreSample for ChannelData {
                     tlcs: vec![],
                 },
                 revocation_data: None, // Skip RevocationData with CompactSignature for simplicity
+                channel_features: Default::default(),
             },
         ]
     }

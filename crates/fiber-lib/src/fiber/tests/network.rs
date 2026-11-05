@@ -18,7 +18,8 @@ use crate::{
         graph::ChannelUpdateInfo,
         network::{
             select_connect_peer_address, AcceptChannelCommand, DebugEvent, FiberMessageWithTarget,
-            NetworkActorStateStore, OpenChannelCommand, PeerDisconnectReason, TestFiberMessageKind,
+            NetworkActorStateStore, OpenChannelCommand, OpenChannelWithExternalFundingCommand,
+            PeerDisconnectReason, TestFiberMessageKind,
         },
         payment::{SendPaymentCommand, SendPaymentDataExt},
         types::{
@@ -31,7 +32,7 @@ use crate::{
         Pubkey, SendPaymentData,
     },
     gen_rand_fiber_public_key, gen_rand_secp256k1_keypair_tuple, gen_rand_sha256_hash,
-    invoice::InvoiceBuilder,
+    invoice::{Currency, InvoiceBuilder},
     now_timestamp_as_millis_u64, ChannelTestContext, NetworkServiceEvent,
 };
 use crate::{
@@ -63,6 +64,174 @@ fn get_test_priv_key() -> Privkey {
 
 fn get_test_pub_key() -> Pubkey {
     get_test_priv_key().pubkey()
+}
+
+#[tokio::test]
+async fn test_reject_legacy_channel_open_without_channel_v2_feature() {
+    let mut node_a = NetworkNode::new().await;
+    let mut legacy_peer = NetworkNode::new().await;
+    let mut features = legacy_peer.node_info().await.features;
+    features.unset_channel_v2_optional();
+    legacy_peer.update_node_features_and_wait(features).await;
+    node_a.connect_to(&mut legacy_peer).await;
+
+    let result = call!(node_a.network_actor, |reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::OpenChannel(
+            OpenChannelCommand {
+                pubkey: legacy_peer.pubkey,
+                public: false,
+                one_way: false,
+                shutdown_script: None,
+                funding_amount: 10_000_000_000,
+                funding_udt_type_script: None,
+                commitment_fee_rate: None,
+                commitment_delay_epoch: None,
+                funding_fee_rate: None,
+                tlc_expiry_delta: None,
+                tlc_min_value: None,
+                tlc_fee_proportional_millionths: None,
+                max_tlc_number_in_flight: None,
+                max_tlc_value_in_flight: None,
+            },
+            reply,
+        ))
+    })
+    .expect("network actor alive");
+
+    assert!(result.is_err(), "new Legacy channel must be rejected");
+    assert_eq!(node_a.store.get_channel_open_records().len(), 0);
+}
+
+#[tokio::test]
+async fn test_reject_legacy_external_funding_channel_open() {
+    let mut node = NetworkNode::new().await;
+    let mut legacy_peer = NetworkNode::new().await;
+    let mut features = legacy_peer.node_info().await.features;
+    features.unset_channel_v2_optional();
+    legacy_peer.update_node_features_and_wait(features).await;
+    node.connect_to(&mut legacy_peer).await;
+
+    let result = call!(node.network_actor, |reply| {
+        NetworkActorMessage::Command(NetworkActorCommand::OpenChannelWithExternalFunding(
+            OpenChannelWithExternalFundingCommand {
+                pubkey: legacy_peer.pubkey,
+                funding_amount: 10_000_000_000,
+                public: false,
+                shutdown_script: ckb_types::packed::Script::default(),
+                funding_lock_script: ckb_types::packed::Script::default(),
+                funding_lock_script_cell_deps: vec![],
+                funding_udt_type_script: None,
+                commitment_fee_rate: None,
+                commitment_delay_epoch: None,
+                funding_fee_rate: None,
+                tlc_expiry_delta: None,
+                tlc_min_value: None,
+                tlc_fee_proportional_millionths: None,
+                max_tlc_value_in_flight: None,
+                max_tlc_number_in_flight: None,
+            },
+            reply,
+        ))
+    })
+    .expect("network actor alive");
+
+    assert!(
+        result.is_err(),
+        "external funding must not open a Legacy channel"
+    );
+    assert!(node.store.get_channel_open_records().is_empty());
+}
+
+#[tokio::test]
+async fn test_reject_legacy_inbound_open_before_creating_pending_record() {
+    let mut node = NetworkNode::new().await;
+    let mut legacy_peer = NetworkNode::new().await;
+    let mut features = legacy_peer.node_info().await.features;
+    features.unset_channel_v2_optional();
+    legacy_peer.update_node_features_and_wait(features).await;
+    node.connect_to(&mut legacy_peer).await;
+
+    let privkey = gen_rand_fiber_private_key();
+    let nonce = SecNonce::build(privkey.as_ref()).build().public_nonce();
+    let open_channel = OpenChannel {
+        chain_hash: get_chain_hash(),
+        channel_id: gen_rand_sha256_hash(),
+        funding_udt_type_script: None,
+        funding_amount: 10_000_000_000,
+        shutdown_script: Default::default(),
+        reserved_ckb_amount: 10_000_000_000,
+        funding_fee_rate: DEFAULT_FEE_RATE,
+        commitment_fee_rate: DEFAULT_COMMITMENT_FEE_RATE,
+        commitment_delay_epoch: EpochNumberWithFraction::new(MIN_COMMITMENT_DELAY_EPOCHS, 0, 1)
+            .full_value(),
+        max_tlc_value_in_flight: 0,
+        max_tlc_number_in_flight: MAX_TLC_NUMBER_IN_FLIGHT,
+        channel_flags: ChannelFlags::empty(),
+        first_per_commitment_point: privkey.pubkey(),
+        second_per_commitment_point: privkey.pubkey(),
+        funding_pubkey: privkey.pubkey(),
+        tlc_basepoint: privkey.pubkey(),
+        next_commitment_nonce: nonce.clone(),
+        next_revocation_nonce: nonce,
+        channel_announcement_nonce: None,
+    };
+
+    node.network_actor
+        .send_message(NetworkActorMessage::Event(NetworkActorEvent::FiberMessage(
+            legacy_peer.pubkey,
+            FiberMessage::ChannelInitialization(open_channel),
+            None,
+        )))
+        .expect("network actor alive");
+    node.expect_debug_event("ChannelPendingToBeRejected").await;
+    assert!(node.store.get_channel_open_records().is_empty());
+}
+
+#[tokio::test]
+async fn test_existing_channel_reestablishes_when_peer_drops_channel_v2_feature() {
+    let (mut node, mut peer, channel_id, _) =
+        NetworkNode::new_2_nodes_with_established_channel(100_000_000_000, 100_000_000_000, false)
+            .await;
+    assert_eq!(
+        node.get_channel_actor_state(channel_id).channel_features,
+        fiber_types::ChannelFeatures::V2
+    );
+
+    let before_restart = node.send_payment_keysend(&peer, 1_000, true).await;
+    assert!(
+        before_restart.is_ok(),
+        "baseline payment: {before_restart:?}"
+    );
+
+    let mut features = peer.node_info().await.features;
+    features.unset_channel_v2_optional();
+    peer.update_node_features_and_wait(features).await;
+    node.restart().await;
+    node.connect_to(&mut peer).await;
+
+    for _ in 0..100 {
+        let state = node.get_channel_actor_state(channel_id);
+        if !state.reestablishing
+            && state.connectivity_state == fiber_types::ChannelConnectivityState::Online
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let state_after = node.get_channel_actor_state(channel_id);
+    assert_eq!(
+        state_after.channel_features,
+        fiber_types::ChannelFeatures::V2
+    );
+    let payment = node.send_payment_keysend(&peer, 1_000, true).await;
+    assert!(
+        payment.is_ok(),
+        "existing channel payment: {payment:?}; state: {:?}; online: {:?}; reestablishing: {}",
+        state_after.state,
+        state_after.connectivity_state,
+        state_after.reestablishing
+    );
 }
 
 fn get_fake_peer_id_and_address() -> (PeerId, MultiAddr) {
@@ -575,10 +744,13 @@ fn test_send_payment_data_trampoline_hops_validation_errors() {
     };
 
     // Provided but empty.
-    let err = SendPaymentData::new(SendPaymentCommand {
-        trampoline_hops: Some(vec![]),
-        ..base.clone()
-    })
+    let err = SendPaymentData::new(
+        SendPaymentCommand {
+            trampoline_hops: Some(vec![]),
+            ..base.clone()
+        },
+        Currency::Fibd,
+    )
     .unwrap_err();
     assert!(err.contains("trampoline_hops must be non-empty"), "{err}");
 
@@ -587,29 +759,134 @@ fn test_send_payment_data_trampoline_hops_validation_errors() {
     let too_many = (0..6)
         .map(|_| gen_rand_fiber_public_key())
         .collect::<Vec<_>>();
-    let err = SendPaymentData::new(SendPaymentCommand {
-        trampoline_hops: Some(too_many),
-        ..base.clone()
-    })
+    let err = SendPaymentData::new(
+        SendPaymentCommand {
+            trampoline_hops: Some(too_many),
+            ..base.clone()
+        },
+        Currency::Fibd,
+    )
     .unwrap_err();
     assert!(err.contains("too many trampoline_hops"), "{err}");
 
     // Must not contain target.
-    let err = SendPaymentData::new(SendPaymentCommand {
-        trampoline_hops: Some(vec![target]),
-        ..base.clone()
-    })
+    let err = SendPaymentData::new(
+        SendPaymentCommand {
+            trampoline_hops: Some(vec![target]),
+            ..base.clone()
+        },
+        Currency::Fibd,
+    )
     .unwrap_err();
     assert!(err.contains("must not contain target_pubkey"), "{err}");
 
     // No duplicates.
     let hop = gen_rand_fiber_public_key();
-    let err = SendPaymentData::new(SendPaymentCommand {
-        trampoline_hops: Some(vec![hop, hop]),
-        ..base
-    })
+    let err = SendPaymentData::new(
+        SendPaymentCommand {
+            trampoline_hops: Some(vec![hop, hop]),
+            ..base
+        },
+        Currency::Fibd,
+    )
     .unwrap_err();
     assert!(err.contains("must not contain duplicates"), "{err}");
+}
+
+#[tokio::test]
+async fn test_network_shutdown_marks_channels_offline_after_final_child_write() {
+    use crate::fiber::channel::{ChannelActorState, ChannelActorStateStore};
+    use crate::fiber::ChannelConnectivityState;
+    use crate::store::Store;
+    use tokio::sync::oneshot;
+
+    struct FinalChannelWriter;
+    struct FinalWriteState {
+        channel: ractor::ActorCell,
+        store: Store,
+        snapshot: Option<ChannelActorState>,
+        started: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Actor for FinalChannelWriter {
+        type Msg = ();
+        type State = FinalWriteState;
+        type Arguments = FinalWriteState;
+
+        async fn pre_start(
+            &self,
+            _: ActorRef<Self::Msg>,
+            state: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(state)
+        }
+
+        async fn post_stop(
+            &self,
+            _: ActorRef<Self::Msg>,
+            state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            state
+                .channel
+                .wait(Some(Duration::from_secs(5)))
+                .await
+                .unwrap();
+            state.started.take().unwrap().send(()).unwrap();
+            state.release.take().unwrap().await.unwrap();
+            state
+                .store
+                .insert_channel_actor_state(state.snapshot.take().unwrap());
+            Ok(())
+        }
+    }
+
+    let (node, _peer, id) =
+        create_nodes_with_established_channel(100000000000, 11800000000, false).await;
+    let mut latest = node.get_channel_actor_state(id);
+    assert_eq!(latest.connectivity_state, ChannelConnectivityState::Online);
+    latest.tlc_state.offered_tlcs.next_tlc_id = 1765;
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (_writer, writer_task) = Actor::spawn_linked(
+        None,
+        FinalChannelWriter,
+        FinalWriteState {
+            channel: node.get_channel_actor(id).await.unwrap().get_cell(),
+            store: node.store.clone(),
+            snapshot: Some(latest),
+            started: Some(started_tx),
+            release: Some(release_rx),
+        },
+        node.network_actor.get_cell(),
+    )
+    .await
+    .unwrap();
+    let network = node.network_actor.clone();
+    let shutdown = tokio::spawn(async move { network.stop_and_wait(None, None).await.unwrap() });
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let before_final_write = node.get_channel_actor_state(id);
+    let marked_offline_early =
+        before_final_write.connectivity_state == ChannelConnectivityState::Offline;
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    writer_task.await.unwrap();
+
+    assert!(
+        !marked_offline_early,
+        "do not race the channel's final write"
+    );
+    let stored = node.get_channel_actor_state(id);
+    assert_eq!(stored.tlc_state.offered_tlcs.next_tlc_id, 1765);
+    assert_eq!(stored.connectivity_state, ChannelConnectivityState::Offline);
+    assert!(stored.reestablishing);
 }
 
 #[tokio::test]
@@ -1978,7 +2255,7 @@ async fn test_inbound_peer_with_only_closed_channels_consumes_no_channel_peer_bu
 async fn test_new_inbound_peer_can_open_channel_after_replacing_oldest_no_channel_peer() {
     init_tracing();
 
-    let funding_amount = 9_900_000_000u128;
+    let funding_amount = 10_000_000_000u128;
     let open_channel_auto_accept_min_ckb_funding_amount = Some(funding_amount as u64 + 1);
 
     let mut target = NetworkNode::new_with_config(
@@ -2399,7 +2676,7 @@ fn test_send_payment_validate_payment_hash() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibd);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("payment_hash is missing"));
 }
@@ -2412,7 +2689,7 @@ fn test_send_payment_validate_amount() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibd);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("amount is missing"));
 }
@@ -2421,7 +2698,6 @@ fn test_send_payment_validate_amount() {
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn test_send_payment_validate_invoice() {
     use crate::invoice::Attribute;
-    use crate::invoice::Currency;
     use secp256k1::Secp256k1;
 
     let gen_payment_hash = gen_rand_sha256_hash();
@@ -2444,7 +2720,7 @@ fn test_send_payment_validate_invoice() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibb);
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
@@ -2457,7 +2733,7 @@ fn test_send_payment_validate_invoice() {
     };
 
     // keysend is set with invoice, should be error
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibb);
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
@@ -2469,7 +2745,7 @@ fn test_send_payment_validate_invoice() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibb);
     assert!(result.is_err());
 
     // normal invoice send payment
@@ -2478,7 +2754,7 @@ fn test_send_payment_validate_invoice() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibb);
     assert!(result.is_ok());
 
     // normal keysend send payment
@@ -2489,7 +2765,7 @@ fn test_send_payment_validate_invoice() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibb);
     assert!(result.is_ok());
 
     // When the invoice does not specify a final TLC delta, an explicit command
@@ -2501,7 +2777,7 @@ fn test_send_payment_validate_invoice() {
         ..Default::default()
     };
 
-    let err = SendPaymentData::new(send_command).unwrap_err();
+    let err = SendPaymentData::new(send_command, Currency::Fibb).unwrap_err();
     assert!(err.contains("final_tlc_expiry_delta is below the invoice minimum"));
 
     // Callers may still request a longer final-hop delta.
@@ -2512,7 +2788,7 @@ fn test_send_payment_validate_invoice() {
         ..Default::default()
     };
 
-    let payment_data = SendPaymentData::new(send_command).unwrap();
+    let payment_data = SendPaymentData::new(send_command, Currency::Fibb).unwrap();
     assert_eq!(payment_data.final_tlc_expiry_delta, longer_delta);
 
     // invoice with invalid final_tlc_expiry_delta
@@ -2532,7 +2808,7 @@ fn test_send_payment_validate_invoice() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibb);
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
@@ -2550,7 +2826,7 @@ fn test_send_payment_validate_htlc_expiry_delta() {
         ..Default::default()
     };
 
-    let result = SendPaymentData::new(send_command);
+    let result = SendPaymentData::new(send_command, Currency::Fibb);
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
@@ -2561,7 +2837,7 @@ fn test_send_payment_validate_htlc_expiry_delta() {
 async fn test_abort_funding_on_building_funding_tx() {
     init_tracing();
 
-    let funding_amount_a = 9_900_000_000u128;
+    let funding_amount_a = 10_000_000_000u128;
     let funding_amount_b: u128 = u64::MAX as u128 + 1 - funding_amount_a;
     let mut node_a = NetworkNode::new().await;
     let mut node_b = NetworkNode::new().await;
@@ -2681,7 +2957,7 @@ impl MockChainActorMiddleware for SignFundingTxFailureMockMiddleware {
 
 #[tokio::test]
 async fn test_abort_funding_on_committing_funding_tx_on_chain() {
-    let funding_amount_a = 9_900_000_000u128;
+    let funding_amount_a = 10_000_000_000u128;
     let funding_amount_b: u128 = funding_amount_a;
     let middleware = Box::new(CkbTxFailureMockMiddleware);
     let mut node_a = NetworkNode::new_with_config(
@@ -2771,7 +3047,7 @@ async fn test_abort_funding_on_committing_funding_tx_on_chain() {
 
 #[tokio::test]
 async fn test_abort_funding_on_sign_funding_tx_failure() {
-    let funding_amount_a = 9_900_000_000u128;
+    let funding_amount_a = 10_000_000_000u128;
     let funding_amount_b: u128 = funding_amount_a;
     // Put middleware on both nodes since either one might trigger signing
     let middleware = Box::new(SignFundingTxFailureMockMiddleware);
@@ -2922,7 +3198,7 @@ async fn test_abort_funding_on_sign_funding_tx_failure() {
 
 #[tokio::test]
 async fn test_to_be_accepted_channels_number_limit() {
-    let funding_amount = 9_900_000_000u128;
+    let funding_amount = 10_000_000_000u128;
     let open_channel_auto_accept_min_ckb_funding_amount = Some(funding_amount as u64 + 1);
     let mut node = NetworkNode::new_with_config(
         NetworkNodeConfigBuilder::new()
@@ -3133,14 +3409,14 @@ async fn test_malicious_open_channel_reserved_overflow_rejected_before_pending_a
         funding_pubkey: gen_rand_fiber_public_key(),
         tlc_basepoint: gen_rand_fiber_public_key(),
         next_commitment_nonce: rand_nonce.clone(),
-        next_revocation_nonce: rand_nonce,
+        next_revocation_nonce: rand_nonce.clone(),
         channel_announcement_nonce: None,
     };
 
     node.network_actor
         .send_message(NetworkActorMessage::Event(NetworkActorEvent::FiberMessage(
             peer.pubkey,
-            FiberMessage::ChannelInitialization(open_channel),
+            crate::fiber::session_v2::opening_message(open_channel, rand_nonce),
             None,
         )))
         .expect("network actor alive");
@@ -3195,7 +3471,7 @@ async fn test_to_be_accepted_channels_bytes_limit() {
         single_open_channel_size
     );
 
-    let funding_amount = 9_900_000_000u128;
+    let funding_amount = 10_000_000_000u128;
     let open_channel_auto_accept_min_ckb_funding_amount = Some(funding_amount as u64 + 1);
     let mut node = NetworkNode::new_with_config(
         NetworkNodeConfigBuilder::new()
