@@ -801,6 +801,7 @@ fn captured_fiber_message_from(captured: CapturedInboundFiberMessage) -> Capture
             Some(JsonHash256(message.get_channel_id().into()))
         }
         FiberMessage::ChannelInitialization(open) => Some(JsonHash256(open.channel_id.into())),
+        FiberMessage::ChannelInitializationV2(open) => Some(JsonHash256(open.channel_id.into())),
         _ => None,
     };
     match &captured.message {
@@ -836,7 +837,7 @@ fn captured_fiber_message_from(captured: CapturedInboundFiberMessage) -> Capture
         FiberMessage::ChannelNormalOperation(other) => {
             kind = other.to_string();
         }
-        FiberMessage::ChannelInitialization(_) => {
+        FiberMessage::ChannelInitialization(_) | FiberMessage::ChannelInitializationV2(_) => {
             kind = "OpenChannel".to_string();
         }
         FiberMessage::Init(_) => {

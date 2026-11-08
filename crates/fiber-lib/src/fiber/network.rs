@@ -967,7 +967,9 @@ fn fiber_channel_kind(message: &FiberChannelMessage) -> String {
 fn fiber_message_kind(message: &FiberMessage) -> String {
     match message {
         FiberMessage::Init(_) => "Init".to_string(),
-        FiberMessage::ChannelInitialization(_) => "OpenChannel".to_string(),
+        FiberMessage::ChannelInitialization(_) | FiberMessage::ChannelInitializationV2(_) => {
+            "OpenChannel".to_string()
+        }
         FiberMessage::ChannelNormalOperation(msg) => fiber_channel_kind(msg),
     }
 }
@@ -1970,6 +1972,7 @@ where
         peer_pubkey: Pubkey,
         message: FiberMessage,
     ) -> crate::Result<()> {
+        let mut original_open_v2 = None;
         let message = match message {
             FiberMessage::ChannelInitializationV2(open) => {
                 if open.channel_features != 1
@@ -1982,6 +1985,8 @@ where
                     )
                     .into());
                 }
+                // Keep the wire payload for the tap before normalizing V2 opening parameters.
+                original_open_v2 = Some(open.clone());
                 FiberMessage::ChannelInitialization(super::session_v2::open_parameters(open))
             }
             FiberMessage::ChannelInitialization(_)
@@ -2022,7 +2027,9 @@ where
                         state.captured_inbound_fiber_messages.push_back(
                             CapturedInboundFiberMessage {
                                 peer: peer_pubkey,
-                                message: FiberMessage::ChannelInitialization(open_channel),
+                                message: original_open_v2
+                                    .map(FiberMessage::ChannelInitializationV2)
+                                    .unwrap_or(FiberMessage::ChannelInitialization(open_channel)),
                             },
                         );
                         return Ok(());
@@ -2839,6 +2846,9 @@ where
                         fiber_channel_kind(channel_message),
                     )),
                     FiberMessage::ChannelInitialization(open_channel) => {
+                        Some((open_channel.channel_id, "OpenChannel".to_string()))
+                    }
+                    FiberMessage::ChannelInitializationV2(open_channel) => {
                         Some((open_channel.channel_id, "OpenChannel".to_string()))
                     }
                     FiberMessage::Init(_) => None,
@@ -6981,6 +6991,11 @@ where
         if self.to_be_accepted_channels.test_allow_legacy {
             return Ok(features);
         }
+        // Preserve the explicit Legacy counterparty mode of the debug fixture.
+        #[cfg(debug_assertions)]
+        if std::env::var("FIBER_TEST_DISABLE_FULL_HASH_FEATURE").as_deref() == Ok("1") {
+            return Ok(features);
+        }
         if !features.is_v2() {
             return Err(ProcessingChannelError::InvalidParameter(format!(
                 "Cannot open channel with peer {:?}: CHANNEL_V2 is required",
@@ -7524,6 +7539,14 @@ where
                     self.on_open_channel_msg(captured.peer, open_channel)
                         .await
                         .map_err(|err| err.to_string())?;
+                }
+                FiberMessage::ChannelInitializationV2(open_channel) => {
+                    self.on_open_channel_msg(
+                        captured.peer,
+                        super::session_v2::open_parameters(open_channel),
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?;
                 }
                 FiberMessage::Init(_) => {}
             }
@@ -9542,6 +9565,10 @@ impl ToBeAcceptedChannels {
     fn require_channel_v2(&self, id: &Hash256) -> ProcessingChannelResult {
         #[cfg(test)]
         if self.test_allow_legacy {
+            return Ok(());
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var("FIBER_TEST_DISABLE_FULL_HASH_FEATURE").as_deref() == Ok("1") {
             return Ok(());
         }
         if self
