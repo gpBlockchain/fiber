@@ -1192,9 +1192,7 @@ fn h32_fixture_prefix_match(
     if discovered_payment_hash.as_ref()[..20] != tracked_tlc.payment_hash.as_ref()[..20] {
         return false;
     }
-    !tracked_tlc
-        .commitment_contract_features
-        .has_full_payment_hash()
+    !tracked_tlc.channel_features.has_full_payment_hash()
         || std::env::var("FIBER_TEST_ALLOW_FULL_HASH_MISMATCH").as_deref() == Ok("1")
 }
 

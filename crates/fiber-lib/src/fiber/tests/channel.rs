@@ -8483,9 +8483,9 @@ async fn test_fbr_2026_0062_full_protocol_evidence_empty_cs_then_closing_signed(
     test_only_set_secnonce_tracking(false);
     test_only_set_funding_sign_log(true);
 
-    let (mut node_a, node_b, channel_id, _) =
-        NetworkNode::new_2_nodes_with_established_channel(HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT, true)
-            .await;
+    // This evidence fixture targets the legacy nonce chain; V2 uses independent sessions.
+    let (mut node_a, node_b, channel_id) =
+        create_legacy_nodes_with_established_channel(HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT, true).await;
 
     let state_b0 = node_b.get_channel_actor_state(channel_id);
     assert!(
