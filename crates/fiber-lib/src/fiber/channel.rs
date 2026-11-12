@@ -107,13 +107,10 @@ use std::iter;
 mod v2;
 
 #[cfg(test)]
-use std::{
-    backtrace::Backtrace,
-    sync::{LazyLock, Mutex},
-};
+use std::backtrace::Backtrace;
 use std::{
     fmt::{self, Debug, Display},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
 };
 use strum::AsRefStr;
 use tentacle::secio::PeerId;
@@ -13311,6 +13308,8 @@ mod tests {
             tlc.removed_reason = Some(fail);
             assert!(state.pending_received_tlc_claim_preimage(&tlc).is_none());
         }
+    }
+
     // -------------------------------------------------------------------------
     // FBR-2026-0062 defensive PoC (nonce reuse — no key extraction)
     //
