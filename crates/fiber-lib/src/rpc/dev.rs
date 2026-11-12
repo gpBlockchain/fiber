@@ -14,7 +14,7 @@ use crate::rpc::utils::rpc_error;
 use ckb_sdk::util::blake160;
 use ckb_types::core::TransactionView;
 use ckb_types::prelude::{Entity, Unpack};
-use fiber_json_types::serde_utils::Hash256 as JsonHash256;
+use fiber_json_types::serde_utils::{Hash256 as JsonHash256, U64Hex};
 use fiber_types::{
     AddTlcCommand, Hash256, HashAlgorithm, RemoveTlcFulfill, TlcErr, TlcErrPacket, TlcErrorCode,
     NO_SHARED_SECRET,
@@ -23,6 +23,8 @@ use fiber_types::{
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use musig2::BinaryEncoding;
+use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 
 use ractor::call;
 use std::str::FromStr;
@@ -48,6 +50,31 @@ pub use fiber_json_types::{
     TakeCapturedFiberMessagesResult,
 };
 
+/// Parameters for listing cached signed commitment transactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListCommitmentTransactionsParams {
+    /// Channel ID whose cached transactions should be returned.
+    pub channel_id: JsonHash256,
+}
+
+/// Metadata identifying a cached transaction accepted from the peer.
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitmentTransactionMetadata {
+    /// Commitment number accepted by `submit_commitment_transaction`.
+    #[serde_as(as = "U64Hex")]
+    pub commitment_number: u64,
+    /// Hash of the exact cached transaction used by `submit_commitment_transaction`.
+    pub tx_hash: JsonHash256,
+}
+
+/// A snapshot of this process's cached signed commitments for one channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListCommitmentTransactionsResult {
+    /// Cached transactions, ordered by ascending commitment number.
+    pub transactions: Vec<CommitmentTransactionMetadata>,
+}
+
 /// RPC module for development purposes, this module is not intended to be used in production.
 /// This module will be disabled in release build.
 #[cfg(not(target_arch = "wasm32"))]
@@ -67,6 +94,18 @@ trait DevRpc {
     /// Removes a TLC from a channel.
     #[method(name = "remove_tlc")]
     async fn remove_tlc(&self, params: RemoveTlcParams) -> Result<(), ErrorObjectOwned>;
+
+    /// List signed commitments currently cached for a channel, in ascending number order.
+    ///
+    /// This is a read-only snapshot of the same process-local cache used by
+    /// `submit_commitment_transaction`, populated asynchronously from accepted peer
+    /// commitments. Unknown channels and empty caches return an empty list. Entries
+    /// are not persisted across restarts, and listing does not sign or submit anything.
+    #[method(name = "list_commitment_transactions")]
+    async fn list_commitment_transactions(
+        &self,
+        params: ListCommitmentTransactionsParams,
+    ) -> Result<ListCommitmentTransactionsResult, ErrorObjectOwned>;
 
     /// Submit a commitment transaction to the chain
     #[method(name = "submit_commitment_transaction")]
@@ -195,6 +234,13 @@ impl DevRpcServer for DevRpcServerImpl {
     /// Removes a TLC from a channel.
     async fn remove_tlc(&self, params: RemoveTlcParams) -> Result<(), ErrorObjectOwned> {
         self.remove_tlc(params).await
+    }
+
+    async fn list_commitment_transactions(
+        &self,
+        params: ListCommitmentTransactionsParams,
+    ) -> Result<ListCommitmentTransactionsResult, ErrorObjectOwned> {
+        self.list_commitment_transactions(params).await
     }
 
     /// Submit a commitment transaction to the chain
@@ -367,6 +413,20 @@ impl DevRpcServerImpl {
         };
 
         handle_actor_call!(self.network_actor, message, params)
+    }
+
+    /// Read the cached commitment metadata without altering channel or chain state.
+    pub async fn list_commitment_transactions(
+        &self,
+        params: ListCommitmentTransactionsParams,
+    ) -> Result<ListCommitmentTransactionsResult, ErrorObjectOwned> {
+        let commitment_txs = self.commitment_txs.read().await;
+        Ok(ListCommitmentTransactionsResult {
+            transactions: commitment_transaction_metadata(
+                &commitment_txs,
+                params.channel_id.into(),
+            ),
+        })
     }
 
     pub async fn submit_commitment_transaction(
@@ -781,6 +841,24 @@ impl DevRpcServerImpl {
     }
 }
 
+fn commitment_transaction_metadata(
+    commitment_txs: &HashMap<(Hash256, u64), TransactionView>,
+    channel_id: Hash256,
+) -> Vec<CommitmentTransactionMetadata> {
+    let mut transactions: Vec<_> = commitment_txs
+        .iter()
+        .filter(|((cached_channel_id, _), _)| *cached_channel_id == channel_id)
+        .map(
+            |((_, commitment_number), tx)| CommitmentTransactionMetadata {
+                commitment_number: *commitment_number,
+                tx_hash: JsonHash256(tx.hash().as_slice().try_into().expect("Byte32 is 32 bytes")),
+            },
+        )
+        .collect();
+    transactions.sort_unstable_by_key(|tx| tx.commitment_number);
+    transactions
+}
+
 fn hex_0x(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
@@ -858,5 +936,95 @@ fn captured_fiber_message_from(captured: CapturedInboundFiberMessage) -> Capture
         payment_hash,
         local_commitment_number,
         remote_commitment_number,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use ckb_types::core::TransactionBuilder;
+    use ckb_types::prelude::Entity;
+    use fiber_json_types::serde_utils::Hash256 as JsonHash256;
+    use fiber_types::Hash256;
+
+    use super::{
+        commitment_transaction_metadata, CommitmentTransactionMetadata,
+        ListCommitmentTransactionsParams, ListCommitmentTransactionsResult,
+        SubmitCommitmentTransactionParams,
+    };
+
+    #[test]
+    fn test_commitment_transaction_metadata_filters_sorts_and_preserves_hashes() {
+        let channel_id = Hash256::from([1; 32]);
+        let other_channel_id = Hash256::from([2; 32]);
+        let tx_a = TransactionBuilder::default().version(1_u32).build();
+        let tx_b = TransactionBuilder::default().version(2_u32).build();
+        let cache = HashMap::from([
+            ((channel_id, 16), tx_b.clone()),
+            ((other_channel_id, 0), tx_b.clone()),
+            ((channel_id, 2), tx_a.clone()),
+        ]);
+
+        let transactions = commitment_transaction_metadata(&cache, channel_id);
+
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[0].commitment_number, 2);
+        assert_eq!(transactions[1].commitment_number, 16);
+        assert_eq!(transactions[0].tx_hash.0.as_slice(), tx_a.hash().as_slice());
+        assert_eq!(transactions[1].tx_hash.0.as_slice(), tx_b.hash().as_slice());
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn test_commitment_transaction_metadata_empty_or_unknown_channel() {
+        let channel_id = Hash256::from([1; 32]);
+        assert!(commitment_transaction_metadata(&HashMap::new(), channel_id).is_empty());
+        let cache = HashMap::from([(
+            (Hash256::from([2; 32]), 0),
+            TransactionBuilder::default().build(),
+        )]);
+        assert!(commitment_transaction_metadata(&cache, channel_id).is_empty());
+    }
+
+    #[test]
+    fn test_commitment_transaction_metadata_snapshot_does_not_follow_new_commitments() {
+        let channel_id = Hash256::from([1; 32]);
+        let tx = TransactionBuilder::default().build();
+        let mut cache = HashMap::from([((channel_id, 0), tx.clone())]);
+        let snapshot = commitment_transaction_metadata(&cache, channel_id);
+
+        cache.insert((channel_id, 1), tx);
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].commitment_number, 0);
+        assert_eq!(commitment_transaction_metadata(&cache, channel_id).len(), 2);
+    }
+
+    #[test]
+    fn test_list_commitment_transactions_json_uses_submission_identifiers() {
+        let channel_id = JsonHash256([1; 32]);
+        let params: ListCommitmentTransactionsParams =
+            serde_json::from_value(serde_json::json!({"channel_id": channel_id})).unwrap();
+        assert_eq!(params.channel_id, channel_id);
+        let result = ListCommitmentTransactionsResult {
+            transactions: vec![CommitmentTransactionMetadata {
+                commitment_number: 16,
+                tx_hash: JsonHash256([2; 32]),
+            }],
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["transactions"][0]["commitment_number"], "0x10");
+        assert_eq!(
+            json["transactions"][0]["tx_hash"],
+            format!("0x{}", "02".repeat(32))
+        );
+        let submit: SubmitCommitmentTransactionParams = serde_json::from_value(serde_json::json!({
+            "channel_id": channel_id,
+            "commitment_number": json["transactions"][0]["commitment_number"],
+        }))
+        .unwrap();
+        assert_eq!(submit.commitment_number, 16);
+        assert_eq!(submit.channel_id, channel_id);
     }
 }
