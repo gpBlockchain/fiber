@@ -368,6 +368,19 @@ async fn run_node(
                 }
             }
 
+            // Attack fixture: the dev commitment cache is process-local, so a node
+            // restarted in place (e.g. Legacy -> current upgrade) would lose the
+            // peer-signed commitment it already holds. Seed it from the persisted
+            // channel states so `submit_commitment_transaction` can still publish it.
+            #[cfg(debug_assertions)]
+            if let Some(cache) = rpc_dev_module_commitment_txs.as_ref() {
+                let seeded = fnn::rpc::dev::seed_commitment_txs_from_store(&store, cache).await;
+                info!(
+                    "seeded {} persisted commitment(s) into the dev commitment cache",
+                    seeded
+                );
+            }
+
             #[cfg(debug_assertions)]
             let rpc_dev_module_commitment_txs_clone = rpc_dev_module_commitment_txs.clone();
             new_tokio_task_tracker().spawn(async move {

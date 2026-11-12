@@ -944,7 +944,8 @@ impl FiberMessageIntercept {
     }
 
     fn should_drop_outbound(&self, kind: &str) -> bool {
-        (self.suppress_outbound_revoke_and_ack && kind_name_eq(kind, "RevokeAndAck"))
+        (self.suppress_outbound_revoke_and_ack
+            && (kind_name_eq(kind, "RevokeAndAck") || kind_name_eq(kind, "RevokeAndAckV2")))
             || Self::kind_matches(&self.outbound_drop_kinds, kind)
     }
 
@@ -1070,9 +1071,16 @@ fn channel_musig2_public_from_state(
         .signer
         .derive_musig2_nonce(local_commitment_number, Musig2Context::Commitment)
         .public_nonce();
+    // Channel V2 clears the V1 slot and keeps the peer commitment nonce in its session.
     let last_committed_remote_nonce = state
         .last_committed_remote_nonce
         .clone()
+        .or_else(|| {
+            state
+                .session_v2
+                .as_ref()
+                .and_then(|session| session.remote_nonce.clone())
+        })
         .ok_or_else(|| "missing last committed remote nonce".to_string())?;
     let own_commitment_message = compute_tx_message(
         &state
@@ -1112,6 +1120,14 @@ fn sign_commitment_signed(
     use fiber_types::Musig2Context;
     use musig2::{sign_partial, AggNonce, KeyAggContext};
 
+    // The raw V1 CommitmentSigned path signs with the V1 nonce slot. Channel V2 leaves it
+    // empty, and the honest signer would panic the network actor instead of failing the RPC.
+    if state.last_committed_remote_nonce.is_none() {
+        return Err(
+            "raw commitment_signed is V1-only; this channel uses Channel V2 session nonces"
+                .to_string(),
+        );
+    }
     let next_commitment_nonce = state.get_next_commitment_nonce();
     let Some(nonce_cn) = nonce_commitment_number else {
         let (partial, _, _) = state

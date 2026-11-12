@@ -841,6 +841,65 @@ impl DevRpcServerImpl {
     }
 }
 
+/// Attack fixture: seed the process-local commitment cache from persisted channel
+/// states. A node restarted in place (e.g. Legacy -> current upgrade) otherwise
+/// loses the peer-signed commitment it already holds, so
+/// `submit_commitment_transaction` could not publish it.
+pub async fn seed_commitment_txs_from_store<S: crate::fiber::channel::ChannelActorStateStore>(
+    store: &S,
+    commitment_txs: &RwLock<HashMap<(Hash256, u64), TransactionView>>,
+) -> usize {
+    use ckb_types::prelude::IntoTransactionView;
+    let mut seeded = 0usize;
+    for (_peer, channel_id, _state) in store.get_channel_states(None) {
+        let Some(state) = store.get_channel_actor_state(&channel_id) else {
+            continue;
+        };
+        let Some(tx) = state.latest_commitment_transaction.clone() else {
+            continue;
+        };
+        let tx = tx.into_view();
+        let Some(output) = tx.outputs().get(0) else {
+            continue;
+        };
+        let lock_args = output.lock().args().raw_data();
+        if lock_args.len() < 36 {
+            continue;
+        }
+        let version = u64::from_be_bytes(
+            lock_args[28..36]
+                .try_into()
+                .expect("8-byte commitment number"),
+        );
+        match crate::ckb::contracts::get_cell_deps(
+            vec![crate::ckb::contracts::Contract::FundingLock],
+            &output.type_().to_opt(),
+        )
+        .await
+        {
+            Ok(cell_deps) => {
+                let tx = tx
+                    .as_advanced_builder()
+                    .set_cell_deps(cell_deps.into_iter().collect())
+                    .build();
+                commitment_txs
+                    .write()
+                    .await
+                    .entry((channel_id, version))
+                    .or_insert(tx);
+                seeded += 1;
+            }
+            Err(err) => {
+                tracing::error!(
+                    "Failed to get cell deps for persisted commitment tx: {}",
+                    err
+                );
+            }
+        }
+    }
+    seeded
+}
+
 fn commitment_transaction_metadata(
     commitment_txs: &HashMap<(Hash256, u64), TransactionView>,
     channel_id: Hash256,
