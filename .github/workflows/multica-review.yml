@@ -50,6 +50,11 @@ jobs:
           number = os.environ["ISSUE_NUMBER"]
           repo = os.environ["REPO"]
           marker = "<!-- multica-review-active -->"
+          # The review reply is posted by the same GitHub user that can trigger
+          # a review. This marker stops that reply from starting another run.
+          if "<!-- multica-review-result -->" in body:
+              print("Review result comment. Skipping.")
+              sys.exit(0)
           start = re.match(r"^\s*/multica-review\b", body) is not None
 
           comments = json.loads(gh(f"repos/{repo}/issues/{number}/comments", "--paginate"))
